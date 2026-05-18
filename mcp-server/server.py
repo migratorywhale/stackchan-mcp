@@ -124,6 +124,7 @@ def tts_fish(text: str, lang: str = "zh") -> Path:
 
     subprocess.run([
         "ffmpeg", "-y", "-i", str(raw_path),
+        "-af", "volume=0.6,acompressor=threshold=-20dB:ratio=4:attack=5:release=50",
         "-ar", "24000", "-ac", "1", "-sample_fmt", "s16",
         str(wav_path),
     ], check=True, capture_output=True)
@@ -201,6 +202,14 @@ def stackchan_set_face(face: str) -> dict:
 
 def stackchan_snapshot() -> tuple[bytes | None, int]:
     """Capture JPEG from Stack-chan's camera."""
+    # Flush the stale frame sitting in the DMA buffer (CAMERA_GRAB_WHEN_EMPTY keeps
+    # one pre-captured frame ready; it may be minutes old). The firmware fix in
+    # captureJpeg() also handles this, but this MCP-side call guards against old
+    # firmware that hasn't been reflashed yet.
+    try:
+        requests.get(f"http://{STACKCHAN_IP}:{STACKCHAN_PORT}/snapshot", timeout=5)
+    except Exception:
+        pass
     resp = requests.get(
         f"http://{STACKCHAN_IP}:{STACKCHAN_PORT}/snapshot",
         timeout=10,

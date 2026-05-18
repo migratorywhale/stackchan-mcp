@@ -80,6 +80,16 @@ bool captureJpeg(uint8_t** outBuf, size_t* outLen, int quality) {
         return false;
     }
 
+    // With CAMERA_GRAB_WHEN_EMPTY, the driver captures one frame immediately after
+    // esp_camera_fb_return(). That frame sits in the DMA buffer until the next
+    // fb_get() — potentially minutes later. Discard it to force a fresh capture.
+    camera_fb_t* stale = esp_camera_fb_get();
+    if (!stale) {
+        Serial.println("[CAM] Stale flush failed");
+        return false;
+    }
+    esp_camera_fb_return(stale);
+
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
         Serial.println("[CAM] Capture failed");
