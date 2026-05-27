@@ -17,6 +17,9 @@ import subprocess
 import sys as _sys
 import threading
 import time
+import uuid
+import wave
+from contextlib import suppress
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
@@ -35,6 +38,10 @@ EDGE_TTS_BIN = os.environ.get("EDGE_TTS_BIN", "/Users/Isa/Kokoro-TTS-Local/venv/
 FISH_AUDIO_KEY = os.environ.get("FISH_AUDIO_KEY", "")
 FISH_AUDIO_MODEL_ZH = os.environ.get("FISH_AUDIO_MODEL_ZH", "411d04608a3a498192e16724689e7993")  # 夏以昼
 FISH_AUDIO_MODEL_EN = os.environ.get("FISH_AUDIO_MODEL_EN", "a1e3e14176b0496c84e6009d672c23f8")  # Nick Valentine
+PCM_SAMPLE_RATE = 24000
+PCM_CHANNELS = 1
+PCM_SAMPLE_WIDTH = 2
+PCM_CONTENT_TYPE = "audio/x-raw;format=s16le;rate=24000;channels=1"
 
 # Voice mapping for edge-tts
 EDGE_VOICES = {
@@ -45,6 +52,8 @@ EDGE_VOICES = {
 # Audio directory (fixed path so both stdio & HTTP instances share it)
 AUDIO_DIR = Path("/tmp/stackchan_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
+TEMP_AUDIO_DIR = AUDIO_DIR / ".tmp"
+TEMP_AUDIO_DIR.mkdir(exist_ok=True)
 
 # ── Audio HTTP Server (serves WAV files to M5Stack) ───────
 class QuietHandler(SimpleHTTPRequestHandler):
@@ -72,65 +81,118 @@ def audio_url(filename: str) -> str:
     return f"http://{MAC_IP}:{AUDIO_SERVE_PORT}/{filename}"
 
 # ── TTS Functions ─────────────────────────────────────────
+def _new_tts_stem() -> str:
+    return f"tts_{int(time.time() * 1000)}_{uuid.uuid4().hex}"
+
+
+def validate_playback_wav(wav_path: Path) -> None:
+    """Validate the WAV contract expected by Stack-chan playback."""
+    try:
+        with wave.open(str(wav_path), "rb") as wav:
+            channels = wav.getnchannels()
+            sample_rate = wav.getframerate()
+            sample_width = wav.getsampwidth()
+            compression = wav.getcomptype()
+            frame_count = wav.getnframes()
+
+            if (
+                compression != "NONE"
+                or channels != 1
+                or sample_rate != 24000
+                or sample_width != 2
+            ):
+                raise ValueError(
+                    "unsupported WAV format: "
+                    f"compression={compression} channels={channels} "
+                    f"rate={sample_rate} width={sample_width}"
+                )
+            if frame_count <= 0:
+                raise ValueError("WAV has no audio frames")
+
+            pcm = wav.readframes(frame_count)
+            expected_bytes = frame_count * channels * sample_width
+            if len(pcm) != expected_bytes:
+                raise ValueError(
+                    f"truncated WAV data: got={len(pcm)} expected={expected_bytes}"
+                )
+    except (EOFError, wave.Error) as exc:
+        raise ValueError(f"invalid WAV file: {exc}") from exc
+
+
+def publish_validated_wav(temp_wav_path: Path, final_stem: str) -> Path:
+    validate_playback_wav(temp_wav_path)
+    final_path = AUDIO_DIR / f"{final_stem}.wav"
+    os.replace(temp_wav_path, final_path)
+    return final_path
+
+
 def tts_edge(text: str, lang: str = "zh") -> Path:
     """Generate WAV using edge-tts."""
     voice = EDGE_VOICES.get(lang, EDGE_VOICES["zh"])
-    mp3_path = AUDIO_DIR / f"tts_{int(time.time()*1000)}.mp3"
-    wav_path = mp3_path.with_suffix(".wav")
+    stem = _new_tts_stem()
+    mp3_path = TEMP_AUDIO_DIR / f"{stem}.mp3"
+    temp_wav_path = TEMP_AUDIO_DIR / f"{stem}.wav"
 
-    # Generate MP3
-    subprocess.run([
-        EDGE_TTS_BIN, "--voice", voice,
-        "--text", text,
-        "--write-media", str(mp3_path),
-    ], check=True, capture_output=True)
+    try:
+        # Generate MP3
+        subprocess.run([
+            EDGE_TTS_BIN, "--voice", voice,
+            "--text", text,
+            "--write-media", str(mp3_path),
+        ], check=True, capture_output=True)
 
-    # Convert to WAV (24kHz 16-bit mono for M5Stack)
-    subprocess.run([
-        "ffmpeg", "-y", "-i", str(mp3_path),
-        "-ar", "24000", "-ac", "1", "-sample_fmt", "s16",
-        str(wav_path),
-    ], check=True, capture_output=True)
+        # Convert to WAV (24kHz 16-bit mono for M5Stack)
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(mp3_path),
+            "-ar", "24000", "-ac", "1", "-sample_fmt", "s16",
+            str(temp_wav_path),
+        ], check=True, capture_output=True)
 
-    mp3_path.unlink(missing_ok=True)
-    return wav_path
+        return publish_validated_wav(temp_wav_path, stem)
+    finally:
+        mp3_path.unlink(missing_ok=True)
+        temp_wav_path.unlink(missing_ok=True)
 
 
 def tts_fish(text: str, lang: str = "zh") -> Path:
     """Generate WAV using Fish Audio API."""
     model_id = FISH_AUDIO_MODEL_ZH if lang == "zh" else FISH_AUDIO_MODEL_EN
-    wav_path = AUDIO_DIR / f"tts_{int(time.time()*1000)}.wav"
+    stem = _new_tts_stem()
+    raw_path = TEMP_AUDIO_DIR / f"{stem}_raw.wav"
+    temp_wav_path = TEMP_AUDIO_DIR / f"{stem}.wav"
 
-    # Call Fish Audio API
-    resp = requests.post(
-        "https://api.fish.audio/v1/tts",
-        headers={
-            "Authorization": f"Bearer {FISH_AUDIO_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "text": text,
-            "reference_id": model_id,
-            "format": "wav",
-            "sample_rate": 24000,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
+    try:
+        # Call Fish Audio API
+        resp = requests.post(
+            "https://api.fish.audio/v1/tts",
+            headers={
+                "Authorization": f"Bearer {FISH_AUDIO_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "text": text,
+                "reference_id": model_id,
+                "format": "wav",
+                "sample_rate": 24000,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
 
-    # Fish Audio might return different sample rates, ensure 24kHz mono
-    raw_path = wav_path.with_name(wav_path.stem + "_raw.wav")
-    raw_path.write_bytes(resp.content)
+        # Fish Audio might return different sample rates, ensure 24kHz mono
+        raw_path.write_bytes(resp.content)
 
-    subprocess.run([
-        "ffmpeg", "-y", "-i", str(raw_path),
-        "-af", "loudnorm=I=-16:TP=-3:LRA=11,alimiter=limit=0.9:attack=0.1:release=50",
-        "-ar", "24000", "-ac", "1", "-sample_fmt", "s16",
-        str(wav_path),
-    ], check=True, capture_output=True)
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(raw_path),
+            "-af", "loudnorm=I=-16:TP=-3:LRA=11,alimiter=limit=0.9:attack=0.1:release=50",
+            "-ar", "24000", "-ac", "1", "-sample_fmt", "s16",
+            str(temp_wav_path),
+        ], check=True, capture_output=True)
 
-    raw_path.unlink(missing_ok=True)
-    return wav_path
+        return publish_validated_wav(temp_wav_path, stem)
+    finally:
+        raw_path.unlink(missing_ok=True)
+        temp_wav_path.unlink(missing_ok=True)
 
 
 def generate_tts(text: str, lang: str = "zh") -> Path:
@@ -140,6 +202,50 @@ def generate_tts(text: str, lang: str = "zh") -> Path:
     return tts_edge(text, lang)
 
 
+def validate_pcm_contract(sample_rate: int, channels: int, sample_width: int) -> None:
+    """Validate the raw PCM contract accepted by firmware /play/pcm."""
+    if (
+        sample_rate != PCM_SAMPLE_RATE
+        or channels != PCM_CHANNELS
+        or sample_width != PCM_SAMPLE_WIDTH
+    ):
+        raise ValueError(
+            "unsupported PCM format: "
+            f"rate={sample_rate} channels={channels} width={sample_width}"
+        )
+
+
+def iter_fish_pcm_stream(text: str, lang: str = "zh"):
+    """Yield Fish Audio TTS as 24kHz mono s16le PCM chunks."""
+    validate_pcm_contract(PCM_SAMPLE_RATE, PCM_CHANNELS, PCM_SAMPLE_WIDTH)
+    model_id = FISH_AUDIO_MODEL_ZH if lang == "zh" else FISH_AUDIO_MODEL_EN
+    resp = requests.post(
+        "https://api.fish.audio/v1/tts",
+        headers={
+            "Authorization": f"Bearer {FISH_AUDIO_KEY}",
+            "Content-Type": "application/json",
+            "Accept": PCM_CONTENT_TYPE,
+        },
+        json={
+            "text": text,
+            "reference_id": model_id,
+            "format": "pcm",
+            "sample_rate": PCM_SAMPLE_RATE,
+        },
+        stream=True,
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+    for chunk in resp.iter_content(chunk_size=4096):
+        if chunk:
+            yield chunk
+
+
+def can_stream_pcm() -> bool:
+    return TTS_ENGINE == "fish-audio" and bool(FISH_AUDIO_KEY)
+
+
 # ── M5Stack Communication ────────────────────────────────
 def stackchan_play(wav_url: str) -> dict:
     """Push audio URL to Stack-chan for playback."""
@@ -147,6 +253,21 @@ def stackchan_play(wav_url: str) -> dict:
         f"http://{STACKCHAN_IP}:{STACKCHAN_PORT}/play",
         json={"voice_url": wav_url},
         timeout=5,
+    )
+    return resp.json()
+
+
+def stackchan_play_pcm(pcm_chunks) -> dict:
+    """Push raw 24kHz mono s16le PCM to Stack-chan for playback."""
+    pcm = b"".join(pcm_chunks)
+    if not pcm or len(pcm) % PCM_SAMPLE_WIDTH != 0:
+        raise ValueError(f"invalid PCM payload size: {len(pcm)}")
+
+    resp = requests.post(
+        f"http://{STACKCHAN_IP}:{STACKCHAN_PORT}/play/pcm",
+        data=pcm,
+        headers={"Content-Type": PCM_CONTENT_TYPE},
+        timeout=30,
     )
     return resp.json()
 
@@ -206,10 +327,8 @@ def stackchan_snapshot() -> tuple[bytes | None, int]:
     # one pre-captured frame ready; it may be minutes old). The firmware fix in
     # captureJpeg() also handles this, but this MCP-side call guards against old
     # firmware that hasn't been reflashed yet.
-    try:
+    with suppress(Exception):
         requests.get(f"http://{STACKCHAN_IP}:{STACKCHAN_PORT}/snapshot", timeout=5)
-    except Exception:
-        pass
     resp = requests.get(
         f"http://{STACKCHAN_IP}:{STACKCHAN_PORT}/snapshot",
         timeout=10,
@@ -259,7 +378,18 @@ def stackchan_say(text: str, lang: str = "zh") -> str:
     start_audio_server()
 
     try:
+        if can_stream_pcm():
+            try:
+                result = stackchan_play_pcm(iter_fish_pcm_stream(text, lang))
+                if result.get("success"):
+                    return f"🗣️ Stack-chan is saying: \"{text[:60]}{'…' if len(text)>60 else ''}\" [Fish Audio PCM/{lang}]"
+            except Exception:
+                # Keep the stable WAV path as a fallback when streaming is unavailable
+                # or firmware rejects the PCM endpoint.
+                pass
+
         wav_path = generate_tts(text, lang)
+        validate_playback_wav(wav_path)
         url = audio_url(wav_path.name)
         result = stackchan_play(url)
 
