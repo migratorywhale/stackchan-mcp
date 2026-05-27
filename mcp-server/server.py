@@ -124,7 +124,7 @@ def tts_fish(text: str, lang: str = "zh") -> Path:
 
     subprocess.run([
         "ffmpeg", "-y", "-i", str(raw_path),
-        "-af", "volume=0.6,acompressor=threshold=-20dB:ratio=4:attack=5:release=50",
+        "-af", "loudnorm=I=-16:TP=-3:LRA=11,alimiter=limit=0.9:attack=0.1:release=50",
         "-ar", "24000", "-ac", "1", "-sample_fmt", "s16",
         str(wav_path),
     ], check=True, capture_output=True)
