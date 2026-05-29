@@ -16,7 +16,7 @@ fi
 
 STACKCHAN_PORT="${STACKCHAN_PORT:-8002}"
 MCP_PYTHON="${MCP_PYTHON:-}"
-MCP_SCRIPT="${MCP_SCRIPT:-$SCRIPT_DIR/mcp-server/server.py}"
+MCP_MODULE="${MCP_MODULE:-mcp_server.server}"
 STACKCHAN_PUBLIC_MCP_URL="${STACKCHAN_PUBLIC_MCP_URL:-https://stackchan.migratorybird.xyz/mcp}"
 STACKCHAN_LOG_DIR="${STACKCHAN_LOG_DIR:-/tmp}"
 MCP_LOG="$STACKCHAN_LOG_DIR/stackchan_mcp_http.log"
@@ -39,10 +39,11 @@ fi
 
 echo "🐋 Starting Stack-chan MCP HTTP server on port $STACKCHAN_PORT..."
 if [ -n "$MCP_PYTHON" ]; then
-    nohup "$MCP_PYTHON" "$MCP_SCRIPT" --http --port "$STACKCHAN_PORT" > "$MCP_LOG" 2>&1 &
+    cd "$SCRIPT_DIR" || exit 1
+    nohup "$MCP_PYTHON" -m "$MCP_MODULE" --http --port "$STACKCHAN_PORT" > "$MCP_LOG" 2>&1 &
 else
     cd "$SCRIPT_DIR" || exit 1
-    nohup uv run python "$MCP_SCRIPT" --http --port "$STACKCHAN_PORT" > "$MCP_LOG" 2>&1 &
+    nohup uv run python -m "$MCP_MODULE" --http --port "$STACKCHAN_PORT" > "$MCP_LOG" 2>&1 &
 fi
 echo "   PID=$!"
 

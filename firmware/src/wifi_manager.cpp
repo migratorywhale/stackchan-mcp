@@ -3,19 +3,17 @@
 #include <M5Unified.h>
 #include <WiFi.h>
 #include "wifi_manager.h"
-#include "globals.h"
 #include "config.h"
 
 // ネットワーク定義（config.h の定数を配列にまとめる）
 struct NetworkConfig {
     const char* ssid;
     const char* password;
-    const char* server_url;
 };
 
 static const NetworkConfig NETWORKS[WIFI_NETWORK_COUNT] = {
-    { WIFI_SSID_0, WIFI_PASSWORD_0, SERVER_URL_0 },
-    { WIFI_SSID_1, WIFI_PASSWORD_1, SERVER_URL_1 },
+    { WIFI_SSID_0, WIFI_PASSWORD_0 },
+    { WIFI_SSID_1, WIFI_PASSWORD_1 },
 };
 
 #define WIFI_RECONNECT_INTERVAL_MS 5000
@@ -37,12 +35,8 @@ void connectWiFi() {
         }
 
         if (WiFi.status() == WL_CONNECTED) {
-            // 接続成功 → このネットワークのサーバーURLをセット
-            serverUrl = String(NETWORKS[i].server_url);
-
             Serial.printf("\n[WIFI] 接続成功: %s\n", NETWORKS[i].ssid);
             Serial.printf("[WIFI] IP: %s\n", WiFi.localIP().toString().c_str());
-            Serial.printf("[WIFI] サーバー: %s\n", serverUrl.c_str());
 
             return;
         }

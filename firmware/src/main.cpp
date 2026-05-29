@@ -6,13 +6,9 @@
 #include "http_server.h"
 #include "types.h"
 #include "config.h"
-#include "globals.h"
-#include "queue_manager.h"
 #include "mic_service.h"
 #include "wifi_manager.h"
-#include "notification_service.h"
 #include "playback_service.h"
-#include "chat_service.h"
 #include "face_service.h"
 #include "servo_service.h"
 #include "camera_service.h"
@@ -45,15 +41,8 @@ void setup() {
     }
 
     connectWiFi();
-    syncServerHour();
-    checkAndEnqueueNotification();
     initPlayback();
     initHttpServer();
-
-#ifdef TEST_MODE
-    delay(3000);
-    testChat("おはよう！");
-#endif
 }
 void loop() {
     M5StackChan.update();
@@ -61,26 +50,12 @@ void loop() {
     serviceWiFi();
     updateServoGesture();
 
-    checkPendingPlayback();
-    updateLipSync();
+    updatePlayback();
     updateMicrophone();
 
-        // 再生完了検知（マイク再開より後に置く）
-    if (isPlaying &&
-        (millis() - playbackStartMs > 1000) &&
-        (!M5.Speaker.isPlaying() ||
-        (playbackDeadlineMs != 0 && millis() > playbackDeadlineMs))) {
-        if (playbackDeadlineMs != 0 && millis() > playbackDeadlineMs) {
-            Serial.println("[PLAY] Playback timeout -> force stop");
-            M5.Speaker.stop();
-            clearQueuedPcmPlayback();
-        }
-        notifyPlaybackFinished();
-    }
-
     // マイク再開（完了検知より前に置く）
-    if (micResumeRequested && !isPlaying) {
-        micResumeRequested = false;
+    if (shouldResumeMic()) {
+        clearMicResumeRequest();
         if (!M5.Mic.isRunning()) {
             if (initMicrophone()) {
                 Serial.println("[MIC] Mic resumed after playback");
@@ -88,12 +63,6 @@ void loop() {
                 Serial.println("[MIC] Mic resume failed");
             }
         }
-    }
-
-    static unsigned long lastCheck = 0;
-    if (millis() - lastCheck > NOTIFICATION_CHECK_INTERVAL) {
-        checkAndEnqueueNotification();
-        lastCheck = millis();
     }
 
     delay(50);

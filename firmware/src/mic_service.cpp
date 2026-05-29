@@ -1,16 +1,12 @@
 #include <M5Unified.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
 
 #include "mic_service.h"
-#include "queue_manager.h"
-#include "globals.h"
 #include "config.h"
 #include "types.h"
-#include "chat_service.h"
 #include "face_service.h"
 #include "http_server.h"
+#include "recording_store.h"
+#include "playback_service.h"
 
 enum MicState {
     MIC_IDLE = 0,
@@ -48,15 +44,6 @@ static uint32_t silence_start_ms = 0;
 static int16_t pre_trigger_buf[PRE_TRIGGER_BUFFER_SAMPLES];
 static size_t  pre_buf_write = 0;
 static bool    pre_buf_full  = false;
-static unsigned long micResumedAtMs = 0;
-
-struct SpeechUpload {
-    uint8_t* wav;
-    size_t size;
-};
-
-static QueueHandle_t speechQueue = nullptr;
-
 static inline float calcRmsNorm(const int16_t* data, size_t n) {
     if (n == 0) return 0.0f;
     float sum = 0.0f; 
@@ -67,21 +54,7 @@ static inline float calcRmsNorm(const int16_t* data, size_t n) {
     return sqrtf(sum / (float)n);       
 }
 
-static bool sendAudioToServer(int16_t* audio_data, size_t sample_count);
-static bool processSpeechUpload(uint8_t* wav, size_t wav_size);
-
-static void speechWorkerTask(void* arg) {
-    SpeechUpload upload;
-    for (;;) {
-        if (xQueueReceive(speechQueue, &upload, portMAX_DELAY) != pdTRUE) continue;
-        bool ok = processSpeechUpload(upload.wav, upload.size);
-        free(upload.wav);
-        Serial.printf("[MIC] Async STT/chat result=%s\n", ok ? "OK" : "NG");
-        if (!ok) {
-            setFaceExpression(FACE_IDLE);
-        }
-    }
-}
+static bool storeRecordingForMcp(int16_t* audio_data, size_t sample_count);
 
 const char* getMicStateName() {
     switch (mic_state) {
@@ -155,24 +128,6 @@ bool initMicrophone() {
         return false;
     }
 
-    if (!speechQueue) {
-        speechQueue = xQueueCreate(2, sizeof(SpeechUpload));
-        if (!speechQueue) {
-            Serial.println("[MIC] Failed to create speech queue");
-            return false;
-        }
-        xTaskCreatePinnedToCore(
-            speechWorkerTask,
-            "speechWorker",
-            8192,
-            nullptr,
-            1,
-            nullptr,
-            1
-        );
-        Serial.println("[MIC] Speech worker started");
-    }
-    
     // 初回のみ確保（再開時はスキップ）
     if (!record_buffer) {
         record_buffer = (int16_t*)ps_malloc(max_samples * sizeof(int16_t));
@@ -191,7 +146,7 @@ bool initMicrophone() {
 
 void updateMicrophone() {
     if (!M5.Mic.isEnabled()) return;
-    if (isPlaying) return;
+    if (isPlaybackActive()) return;
 
     static int16_t frame[MIC_FRAME_SAMPLES];
     if (!M5.Mic.record(frame, MIC_FRAME_SAMPLES, MIC_SAMPLE_RATE)) return;
@@ -270,8 +225,8 @@ void updateMicrophone() {
                               (unsigned)recorded_samples, maxed ? "max" : "silence");
                 setFaceExpression(FACE_THINKING);
 
-                bool ok = sendAudioToServer(record_buffer, recorded_samples);
-                Serial.printf("[MIC] Send/Process result=%s\n", ok ? "OK" : "NG");
+                bool ok = storeRecordingForMcp(record_buffer, recorded_samples);
+                Serial.printf("[MIC] Store recording result=%s\n", ok ? "OK" : "NG");
                 if (!ok) setFaceExpression(FACE_IDLE);
                 mic_state = MIC_IDLE;
             }
@@ -283,11 +238,7 @@ void updateMicrophone() {
     }
 }
 
-static bool sendAudioToServer(int16_t* audio_data, size_t sample_count) {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[MIC] WiFi disconnected");
-        return false;
-    }
+static bool storeRecordingForMcp(int16_t* audio_data, size_t sample_count) {
     if (!isValidAudio(audio_data, sample_count)) return false;
 
     size_t wav_size = 0;
@@ -298,63 +249,7 @@ static bool sendAudioToServer(int16_t* audio_data, size_t sample_count) {
                   (unsigned)sample_count, (unsigned)wav_size, (unsigned)MIC_SAMPLE_RATE);
 
     storeLastRecording(wav, wav_size);
-    if (isMcpMode()) {
-        Serial.println("[MIC] MCP mode: stored, skip transcribe");
-        free(wav);
-        setFaceExpression(FACE_IDLE);
-        return true;
-    }
-
-    if (!speechQueue) {
-        Serial.println("[MIC] Speech queue not initialized");
-        free(wav);
-        return false;
-    }
-
-    SpeechUpload upload = {wav, wav_size};
-    if (xQueueSend(speechQueue, &upload, 0) != pdTRUE) {
-        Serial.println("[MIC] Speech queue full");
-        free(wav);
-        return false;
-    }
-
-    Serial.println("[MIC] Queued async STT/chat upload");
-    return true;
-}
-
-static bool processSpeechUpload(uint8_t* wav, size_t wav_size) {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[MIC] WiFi disconnected before async STT");
-        return false;
-    }
-
-    HTTPClient http;
-    http.begin(serverUrl + "/speech/transcribe");
-    http.addHeader("Content-Type", "audio/wav");
-    http.setTimeout(HTTP_TIMEOUT_STT);
-
-    int code = http.sendRequest("POST", wav, wav_size);
-
-    if (code != HTTP_CODE_OK) {
-        Serial.printf("[MIC] /speech/transcribe HTTP=%d body=%s\n",
-                      code, http.getString().c_str());
-        http.end();
-        return false;
-    }
-
-    String payload = http.getString();
-    http.end();
-
-    JsonDocument doc;
-    if (deserializeJson(doc, payload) != DeserializationError::Ok) {
-        Serial.println("[MIC] STT JSON parse error");
-        return false;
-    }
-
-    const char* transcript = doc["transcript"] | "";
-    if (!doc["success"] || strlen(transcript) == 0) return false;
-
-    Serial.printf("[MIC] Transcript: %s\n", transcript);
-    sendChatRequest(transcript);
+    free(wav);
+    setFaceExpression(FACE_IDLE);
     return true;
 }

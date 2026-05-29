@@ -1,24 +1,36 @@
 #include <M5Unified.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
 #include <math.h>
 #include <queue>
 #include "playback_service.h"
-#include "globals.h"
+#include "audio_download.h"
 #include "config.h"
 #include "face_service.h"
+#include "wav_parser.h"
 
-static size_t lipSyncOffset = 0;
-static unsigned long lastLipMs = 0;
-static size_t currentPcmOffset = 0;
-static size_t currentPcmSize = 0;
-static uint32_t currentSampleRate = 24000;
-static uint16_t currentBytesPerFrame = 2;
+struct PlaybackRuntimeState {
+    size_t lipSyncOffset = 0;
+    unsigned long lastLipMs = 0;
+    size_t pcmOffset = 0;
+    size_t pcmSize = 0;
+    uint32_t sampleRate = 24000;
+    uint16_t bytesPerFrame = 2;
+    bool currentIsPcm = false;
+    String pcmSessionId = "";
+    bool pcmFinalSegment = false;
+};
+
+static PlaybackRuntimeState s_playbackState;
+static std::priority_queue<AudioTask> s_audioQueue;
+static bool s_isPlaying = false;
+static uint8_t* s_currentAudioData = nullptr;
+static size_t s_currentAudioSize = 0;
+static unsigned long s_playbackDeadlineMs = 0;
+static unsigned long s_playbackStartMs = 0;
+static bool s_micResumeRequested = false;
+static String s_lastPlayedVoiceId = "";
 
 #define LIPSYNC_INTERVAL_MS   50
 #define LIPSYNC_CHUNK_SAMPLES 1024
-#define DOWNLOAD_TIMEOUT_MS   10000
-#define MAX_WAV_BYTES         (4 * 1024 * 1024)
 #define PCM_SAMPLE_RATE       24000
 #define PCM_BYTES_PER_SAMPLE  2
 #define MAX_PCM_BYTES         (2 * 1024 * 1024)
@@ -43,102 +55,9 @@ struct DownloadedAudio {
 
 static std::queue<PcmBuffer> s_pcmQueue;
 static size_t s_pcmQueuedBytes = 0;
-static bool s_currentPlaybackIsPcm = false;
-static String s_currentPcmSessionId = "";
-static bool s_currentPcmFinalSegment = false;
 static QueueHandle_t s_downloadCompleteQueue = nullptr;
 static uint8_t* s_retiredPlaybackData = nullptr;
 static size_t s_retiredPlaybackSize = 0;
-
-struct WavInfo {
-    size_t dataOffset;
-    size_t dataSize;
-    uint32_t sampleRate;
-    uint16_t channels;
-    uint16_t bitsPerSample;
-};
-
-static uint16_t readLe16(const uint8_t* p) {
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-
-static uint32_t readLe32(const uint8_t* p) {
-    return (uint32_t)p[0] |
-           ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
-}
-
-static bool parseWavInfo(const uint8_t* data, size_t size, WavInfo* info) {
-    if (!data || !info || size < 12) {
-        Serial.println("[WAV] Invalid: too small");
-        return false;
-    }
-    if (memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) {
-        Serial.println("[WAV] Invalid: missing RIFF/WAVE");
-        return false;
-    }
-
-    bool foundFmt = false;
-    bool foundData = false;
-    uint16_t audioFormat = 0;
-    WavInfo parsed = {};
-
-    size_t offset = 12;
-    while (offset + 8 <= size) {
-        const uint8_t* chunk = data + offset;
-        uint32_t chunkSize = readLe32(chunk + 4);
-        size_t payloadOffset = offset + 8;
-        size_t nextOffset = payloadOffset + chunkSize + (chunkSize & 1);
-
-        if (payloadOffset > size || chunkSize > size - payloadOffset) {
-            Serial.printf("[WAV] Invalid: chunk overflow at %u size=%u\n",
-                          (unsigned)offset, (unsigned)chunkSize);
-            return false;
-        }
-
-        if (memcmp(chunk, "fmt ", 4) == 0) {
-            if (chunkSize < 16) {
-                Serial.println("[WAV] Invalid: fmt chunk too small");
-                return false;
-            }
-            audioFormat = readLe16(data + payloadOffset);
-            parsed.channels = readLe16(data + payloadOffset + 2);
-            parsed.sampleRate = readLe32(data + payloadOffset + 4);
-            parsed.bitsPerSample = readLe16(data + payloadOffset + 14);
-            foundFmt = true;
-        } else if (memcmp(chunk, "data", 4) == 0) {
-            parsed.dataOffset = payloadOffset;
-            parsed.dataSize = chunkSize;
-            foundData = true;
-        }
-
-        if (nextOffset <= offset) {
-            Serial.println("[WAV] Invalid: chunk offset overflow");
-            return false;
-        }
-        offset = nextOffset;
-    }
-
-    if (!foundFmt || !foundData) {
-        Serial.println("[WAV] Invalid: missing fmt or data chunk");
-        return false;
-    }
-    if (audioFormat != 1 || parsed.channels != 1 ||
-        parsed.sampleRate != 24000 || parsed.bitsPerSample != 16) {
-        Serial.printf("[WAV] Unsupported: format=%u channels=%u rate=%u bits=%u\n",
-                      audioFormat, parsed.channels,
-                      (unsigned)parsed.sampleRate, parsed.bitsPerSample);
-        return false;
-    }
-    if (parsed.dataSize == 0 || parsed.dataOffset + parsed.dataSize > size) {
-        Serial.println("[WAV] Invalid: bad data chunk");
-        return false;
-    }
-
-    *info = parsed;
-    return true;
-}
 
 void clearQueuedPcmPlayback() {
     while (!s_pcmQueue.empty()) {
@@ -174,18 +93,18 @@ static void releaseRetiredPlaybackBuffer() {
     s_retiredPlaybackSize = 0;
 }
 
-void retireCurrentPlaybackBuffer() {
+static void retireCurrentPlaybackBuffer() {
     releaseRetiredPlaybackBuffer();
-    if (!currentWavData) {
+    if (!s_currentAudioData) {
         return;
     }
     Serial.printf("[PLAY] Retiring playback buffer: bytes=%u speakerPlaying=%s\n",
-                  (unsigned)currentWavSize,
+                  (unsigned)s_currentAudioSize,
                   M5.Speaker.isPlaying() ? "true" : "false");
-    s_retiredPlaybackData = currentWavData;
-    s_retiredPlaybackSize = currentWavSize;
-    currentWavData = nullptr;
-    currentWavSize = 0;
+    s_retiredPlaybackData = s_currentAudioData;
+    s_retiredPlaybackSize = s_currentAudioSize;
+    s_currentAudioData = nullptr;
+    s_currentAudioSize = 0;
 }
 
 // ════════════════════════════════════════
@@ -242,7 +161,7 @@ void initPlayback() {
 //  再生リクエスト受付（ノンブロッキング）
 //  enqueueAudioTask()から呼ばれる
 // ════════════════════════════════════════
-void startPlayback(const AudioTask& task) {
+static void startPlayback(const AudioTask& task) {
     if (!s_downloadQueue) {
         Serial.println("[PLAY] Queue not initialized!");
         return;
@@ -271,17 +190,17 @@ static bool startDownloadedWavPlayback(uint8_t* wavData, size_t wavSize) {
     }
 
     retireCurrentPlaybackBuffer();
-    currentWavData = wavData;
-    currentWavSize = wavSize;
-    currentPcmOffset = wavInfo.dataOffset;
-    currentPcmSize = wavInfo.dataSize;
-    currentSampleRate = wavInfo.sampleRate;
-    currentBytesPerFrame = (wavInfo.channels * wavInfo.bitsPerSample) / 8;
+    s_currentAudioData = wavData;
+    s_currentAudioSize = wavSize;
+    s_playbackState.pcmOffset = wavInfo.dataOffset;
+    s_playbackState.pcmSize = wavInfo.dataSize;
+    s_playbackState.sampleRate = wavInfo.sampleRate;
+    s_playbackState.bytesPerFrame = (wavInfo.channels * wavInfo.bitsPerSample) / 8;
 
     // 再生時間 + 2秒のデッドライン
-    const float bytes_per_sec = (float)currentSampleRate * (float)currentBytesPerFrame;
-    playbackDeadlineMs = millis() +
-        (unsigned long)((currentPcmSize / bytes_per_sec) * 1000.0f) + 2000;
+    const float bytes_per_sec = (float)s_playbackState.sampleRate * (float)s_playbackState.bytesPerFrame;
+    s_playbackDeadlineMs = millis() +
+        (unsigned long)((s_playbackState.pcmSize / bytes_per_sec) * 1000.0f) + 2000;
 
     // マイク停止 → スピーカー起動
     if (M5.Mic.isRunning()) {
@@ -294,30 +213,30 @@ static bool startDownloadedWavPlayback(uint8_t* wavData, size_t wavSize) {
 
     Serial.println("[PLAY] Mic stopped");
     M5.Speaker.setVolume(SPEAKER_VOLUME);
-    bool ok = M5.Speaker.playWav(currentWavData, currentWavSize);
+    bool ok = M5.Speaker.playWav(s_currentAudioData, s_currentAudioSize);
     if (!ok) {
         Serial.println("[PLAY] Speaker rejected playWav");
         retireCurrentPlaybackBuffer();
         setFaceExpression(FACE_IDLE);
-        micResumeRequested = true;
+        s_micResumeRequested = true;
         return false;
     }
     setFaceExpression(FACE_PLAYING);
 
-    lipSyncOffset = currentPcmOffset;
-    lastLipMs     = 0;
-    isPlaying     = true;
-    s_currentPlaybackIsPcm = false;
-    s_currentPcmSessionId = "";
-    s_currentPcmFinalSegment = false;
+    s_playbackState.lipSyncOffset = s_playbackState.pcmOffset;
+    s_playbackState.lastLipMs     = 0;
+    s_isPlaying     = true;
+    s_playbackState.currentIsPcm = false;
+    s_playbackState.pcmSessionId = "";
+    s_playbackState.pcmFinalSegment = false;
     clearQueuedPcmPlayback();
-    playbackStartMs  = millis();
+    s_playbackStartMs  = millis();
     Serial.println("[PLAY] Speaker started");
     return true;
 }
 
-void checkPendingPlayback() {
-    if (isPlaying || !s_downloadCompleteQueue) {
+static void checkPendingPlayback() {
+    if (s_isPlaying || !s_downloadCompleteQueue) {
         return;
     }
 
@@ -341,13 +260,13 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
         Serial.printf("[PCM] Invalid size: %u\n", (unsigned)pcmSize);
         return PCM_PLAYBACK_INVALID;
     }
-    if (isPlaying || M5.Speaker.isPlaying()) {
-        if (s_currentPlaybackIsPcm && sessionId == s_currentPcmSessionId &&
+    if (s_isPlaying || M5.Speaker.isPlaying()) {
+        if (s_playbackState.currentIsPcm && sessionId == s_playbackState.pcmSessionId &&
             enqueuePcmBuffer(pcmData, pcmSize, sessionId, finalSegment)) {
             return PCM_PLAYBACK_QUEUED;
         }
         Serial.printf("[PCM] Busy; refusing segment session=%s current=%s\n",
-                      sessionId.c_str(), s_currentPcmSessionId.c_str());
+                      sessionId.c_str(), s_playbackState.pcmSessionId.c_str());
         return PCM_PLAYBACK_BUSY;
     }
 
@@ -357,15 +276,15 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
 
     retireCurrentPlaybackBuffer();
 
-    currentWavData = pcmData;
-    currentWavSize = pcmSize;
-    currentPcmOffset = 0;
-    currentPcmSize = pcmSize;
-    currentSampleRate = PCM_SAMPLE_RATE;
-    currentBytesPerFrame = PCM_BYTES_PER_SAMPLE;
+    s_currentAudioData = pcmData;
+    s_currentAudioSize = pcmSize;
+    s_playbackState.pcmOffset = 0;
+    s_playbackState.pcmSize = pcmSize;
+    s_playbackState.sampleRate = PCM_SAMPLE_RATE;
+    s_playbackState.bytesPerFrame = PCM_BYTES_PER_SAMPLE;
 
     const float bytes_per_sec = (float)PCM_SAMPLE_RATE * (float)PCM_BYTES_PER_SAMPLE;
-    playbackDeadlineMs = millis() +
+    s_playbackDeadlineMs = millis() +
         (unsigned long)((pcmSize / bytes_per_sec) * 1000.0f) + 2000;
 
     if (M5.Mic.isRunning()) {
@@ -377,8 +296,8 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
     }
 
     M5.Speaker.setVolume(SPEAKER_VOLUME);
-    bool ok = M5.Speaker.playRaw((const int16_t*)currentWavData,
-                                 currentWavSize / sizeof(int16_t),
+    bool ok = M5.Speaker.playRaw((const int16_t*)s_currentAudioData,
+                                 s_currentAudioSize / sizeof(int16_t),
                                  PCM_SAMPLE_RATE,
                                  false,
                                  1,
@@ -386,23 +305,23 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
                                  true);
     if (!ok) {
         Serial.println("[PCM] Speaker rejected playRaw");
-        free(currentWavData);
-        currentWavData = nullptr;
-        currentWavSize = 0;
-        currentPcmSize = 0;
+        free(s_currentAudioData);
+        s_currentAudioData = nullptr;
+        s_currentAudioSize = 0;
+        s_playbackState.pcmSize = 0;
         setFaceExpression(FACE_IDLE);
-        micResumeRequested = true;
+        s_micResumeRequested = true;
         return PCM_PLAYBACK_SPEAKER_FAILED;
     }
 
     setFaceExpression(FACE_PLAYING);
-    lipSyncOffset = 0;
-    lastLipMs = 0;
-    isPlaying = true;
-    s_currentPlaybackIsPcm = true;
-    s_currentPcmSessionId = sessionId;
-    s_currentPcmFinalSegment = finalSegment;
-    playbackStartMs = millis();
+    s_playbackState.lipSyncOffset = 0;
+    s_playbackState.lastLipMs = 0;
+    s_isPlaying = true;
+    s_playbackState.currentIsPcm = true;
+    s_playbackState.pcmSessionId = sessionId;
+    s_playbackState.pcmFinalSegment = finalSegment;
+    s_playbackStartMs = millis();
     Serial.printf("[PCM] Speaker started: session=%s bytes=%u final=%s queue=%u @ 24kHz mono s16le\n",
                   sessionId.c_str(), (unsigned)pcmSize,
                   finalSegment ? "true" : "false", (unsigned)s_pcmQueuedBytes);
@@ -412,21 +331,21 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
 // ════════════════════════════════════════
 //  口パク更新（loop()から毎回呼ぶ）
 // ════════════════════════════════════════
-void updateLipSync() {
-    if (!isPlaying || currentWavData == nullptr || currentWavSize == 0) return;
+static void updateLipSync() {
+    if (!s_isPlaying || s_currentAudioData == nullptr || s_currentAudioSize == 0) return;
 
     unsigned long now = millis();
-    if (now - lastLipMs < LIPSYNC_INTERVAL_MS) return;
-    lastLipMs = now;
+    if (now - s_playbackState.lastLipMs < LIPSYNC_INTERVAL_MS) return;
+    s_playbackState.lastLipMs = now;
 
-    if (lipSyncOffset < currentPcmOffset) lipSyncOffset = currentPcmOffset;
-    if (lipSyncOffset >= currentPcmOffset + currentPcmSize) {
+    if (s_playbackState.lipSyncOffset < s_playbackState.pcmOffset) s_playbackState.lipSyncOffset = s_playbackState.pcmOffset;
+    if (s_playbackState.lipSyncOffset >= s_playbackState.pcmOffset + s_playbackState.pcmSize) {
         setMouthOpen(0.0f);
         return;
     }
 
-    int16_t* pcm = (int16_t*)(currentWavData + lipSyncOffset);
-    size_t remainBytes = currentPcmOffset + currentPcmSize - lipSyncOffset;
+    int16_t* pcm = (int16_t*)(s_currentAudioData + s_playbackState.lipSyncOffset);
+    size_t remainBytes = s_playbackState.pcmOffset + s_playbackState.pcmSize - s_playbackState.lipSyncOffset;
     size_t samples = min((size_t)LIPSYNC_CHUNK_SAMPLES, remainBytes / sizeof(int16_t));
     if (samples == 0) {
         setMouthOpen(0.0f);
@@ -439,108 +358,30 @@ void updateLipSync() {
         sum += v * v;
     }
     setMouthOpen(constrain(sqrtf(sum / samples) * 8.0f, 0.0f, 1.0f));
-    lipSyncOffset += samples * sizeof(int16_t);
+    s_playbackState.lipSyncOffset += samples * sizeof(int16_t);
 }
 
 PlaybackStatus getPlaybackStatus() {
     PlaybackStatus status;
-    status.playing = isPlaying;
-    status.pcm = s_currentPlaybackIsPcm;
-    status.pcmFinalSegment = s_currentPcmFinalSegment;
-    status.pcmSession = s_currentPcmSessionId.c_str();
-    status.currentBytes = currentWavSize;
+    status.playing = s_isPlaying;
+    status.pcm = s_playbackState.currentIsPcm;
+    status.pcmFinalSegment = s_playbackState.pcmFinalSegment;
+    status.pcmSession = s_playbackState.pcmSessionId.c_str();
+    status.currentBytes = s_currentAudioSize;
     status.queuedPcmBytes = s_pcmQueuedBytes;
     status.queuedPcmSegments = s_pcmQueue.size();
-    status.startedMs = playbackStartMs;
-    status.deadlineMs = playbackDeadlineMs;
+    status.audioQueueDepth = s_audioQueue.size();
+    status.micResumeRequested = s_micResumeRequested;
+    status.startedMs = s_playbackStartMs;
+    status.deadlineMs = s_playbackDeadlineMs;
     return status;
-}
-
-// ════════════════════════════════════════
-//  音声ダウンロード（Core 0のタスクから呼ぶ）
-// ════════════════════════════════════════
-bool downloadVoice(const String& url, uint8_t** outData, size_t* outSize) {
-    HTTPClient http;
-    Serial.printf("[DOWNLOAD] URL: %s\n", url.c_str());
-
-    *outData = nullptr;
-    *outSize = 0;
-
-    http.begin(url);
-    http.setTimeout(DOWNLOAD_TIMEOUT_MS);
-    int httpCode = http.GET();
-
-    if (httpCode != HTTP_CODE_OK) {
-        Serial.printf("[DOWNLOAD] HTTP error: %d\n", httpCode);
-        http.end();
-        return false;
-    }
-
-    int len = http.getSize();
-    if (len <= 0 || len > MAX_WAV_BYTES) {
-        Serial.printf("[DOWNLOAD] Invalid content length: %d\n", len);
-        http.end();
-        return false;
-    }
-
-    uint8_t* wavData = (uint8_t*)ps_malloc(len);
-    if (!wavData) {
-        Serial.println("[DOWNLOAD] ps_malloc failed");
-        http.end();
-        return false;
-    }
-
-    WiFiClient* stream = http.getStreamPtr();
-    size_t bytesRead = 0;
-    unsigned long lastProgressMs = millis();
-    while (bytesRead < (size_t)len) {
-        size_t available = stream->available();
-        if (available) {
-            size_t toRead = min(available, (size_t)(len - bytesRead));
-            size_t got = stream->readBytes(wavData + bytesRead, toRead);
-            if (got == 0) {
-                Serial.println("[DOWNLOAD] Read returned 0 bytes");
-                break;
-            }
-            bytesRead += got;
-            lastProgressMs = millis();
-        } else if (!http.connected()) {
-            Serial.println("[DOWNLOAD] Connection closed before full read");
-            break;
-        } else if (millis() - lastProgressMs > DOWNLOAD_TIMEOUT_MS) {
-            Serial.println("[DOWNLOAD] Read timeout");
-            break;
-        }
-        delay(1);
-    }
-    http.end();
-
-    if (bytesRead != (size_t)len) {
-        Serial.printf("[DOWNLOAD] Incomplete read: got=%u expected=%u\n",
-                      (unsigned)bytesRead, (unsigned)len);
-        free(wavData);
-        return false;
-    }
-
-    WavInfo wavInfo;
-    if (!parseWavInfo(wavData, (size_t)len, &wavInfo)) {
-        free(wavData);
-        return false;
-    }
-
-    Serial.printf("[DOWNLOAD] Complete: bytes=%u data=%u offset=%u\n",
-                  (unsigned)len, (unsigned)wavInfo.dataSize,
-                  (unsigned)wavInfo.dataOffset);
-    *outData = wavData;
-    *outSize = (size_t)len;
-    return true;
 }
 
 // ════════════════════════════════════════
 //  再生完了後の次キュー処理
 // ════════════════════════════════════════
-void processAudioQueue() {
-    if (isPlaying) return;
+static void processAudioQueue() {
+    if (s_isPlaying) return;
 
     setMouthOpen(0.0f);
 
@@ -561,29 +402,78 @@ void processAudioQueue() {
             }
             Serial.printf("[PCM] Dropped queued segment: result=%d\n", result);
         }
-        if (isPlaying) {
+        if (s_isPlaying) {
             return;
         }
     }
 
     checkPendingPlayback();
-    if (isPlaying) {
+    if (s_isPlaying) {
         return;
     }
 
-    if (audioQueue.empty()) {
-        if (s_currentPlaybackIsPcm && s_currentPcmFinalSegment) {
-            Serial.printf("[PCM] Session complete: %s\n", s_currentPcmSessionId.c_str());
+    if (s_audioQueue.empty()) {
+        if (s_playbackState.currentIsPcm && s_playbackState.pcmFinalSegment) {
+            Serial.printf("[PCM] Session complete: %s\n", s_playbackState.pcmSessionId.c_str());
         }
-        s_currentPlaybackIsPcm = false;
-        s_currentPcmSessionId = "";
-        s_currentPcmFinalSegment = false;
+        s_playbackState.currentIsPcm = false;
+        s_playbackState.pcmSessionId = "";
+        s_playbackState.pcmFinalSegment = false;
         setFaceExpression(FACE_IDLE);
         return;
     }
 
-    AudioTask next = audioQueue.top();
-    audioQueue.pop();
+    AudioTask next = s_audioQueue.top();
+    s_audioQueue.pop();
     startPlayback(next);
-    last_played_voice_id = next.voice_id;
+    s_lastPlayedVoiceId = next.voice_id;
+}
+
+void enqueueAudioTask(const AudioTask& task) {
+    if (s_isPlaying) {
+        s_audioQueue.push(task);
+        return;
+    }
+    startPlayback(task);
+    s_lastPlayedVoiceId = task.voice_id;
+}
+
+static void notifyPlaybackFinished() {
+    s_isPlaying = false;
+    retireCurrentPlaybackBuffer();
+    setMouthOpen(0.0f);
+    processAudioQueue();
+
+    if (!s_isPlaying) {
+        s_micResumeRequested = true;
+    }
+}
+
+void updatePlayback() {
+    checkPendingPlayback();
+    updateLipSync();
+
+    if (s_isPlaying &&
+        (millis() - s_playbackStartMs > 1000) &&
+        (!M5.Speaker.isPlaying() ||
+         (s_playbackDeadlineMs != 0 && millis() > s_playbackDeadlineMs))) {
+        if (s_playbackDeadlineMs != 0 && millis() > s_playbackDeadlineMs) {
+            Serial.println("[PLAY] Playback timeout -> force stop");
+            M5.Speaker.stop();
+            clearQueuedPcmPlayback();
+        }
+        notifyPlaybackFinished();
+    }
+}
+
+bool isPlaybackActive() {
+    return s_isPlaying;
+}
+
+bool shouldResumeMic() {
+    return s_micResumeRequested && !s_isPlaying;
+}
+
+void clearMicResumeRequest() {
+    s_micResumeRequested = false;
 }

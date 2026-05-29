@@ -80,7 +80,7 @@ Add to `~/.claude.json`:
     "stackchan": {
       "type": "stdio",
       "command": "python",
-      "args": ["path/to/stackchan/mcp-server/server.py"],
+      "args": ["-m", "mcp_server.server"],
       "env": {
         "FISH_AUDIO_KEY": "your_key_here"
       }
@@ -92,7 +92,7 @@ Add to `~/.claude.json`:
 ### 5. Run (HTTP mode for Chat/Cowork)
 
 ```bash
-python mcp-server/server.py --http --port 8002
+python -m mcp_server.server --http --port 8002
 ```
 
 ## Faces

@@ -12,7 +12,7 @@ push-based Stack-chan voice avatar in this repository.
 - `firmware/config.h.example`: safe template for local Wi-Fi, audio, and display
   settings.
 - `faces/`: source or companion face assets.
-- `mcp-server/server.py`: Python MCP server that exposes Stack-chan tools and
+- `mcp_server/server.py`: Python MCP server that exposes Stack-chan tools and
   talks to the device over HTTP.
 - `start-http.sh`: helper script that starts the MCP server in Streamable HTTP
   mode and launches the public Cloudflare tunnel.
@@ -142,9 +142,7 @@ Then edit `firmware/src/config.h` locally. Keep secrets out of commits.
 
 Important configuration groups:
 
-- `WIFI_NETWORK_COUNT`, `WIFI_SSID_*`, `WIFI_PASSWORD_*`, `SERVER_URL_*`:
-  ordered Wi-Fi profiles. The first successful profile sets the active backend
-  `serverUrl`.
+- `WIFI_NETWORK_COUNT`, `WIFI_SSID_*`, `WIFI_PASSWORD_*`: ordered Wi-Fi profiles.
 - `SPEAKER_VOLUME`: speaker output level.
 - `MIC_SAMPLE_RATE`, `MIC_MAX_RECORD_SECONDS`, trigger/silence RMS thresholds,
   and pre-trigger buffer size: microphone capture behavior.
@@ -158,7 +156,7 @@ The firmware exposes an HTTP API on port 80.
 | --- | --- | --- | --- |
 | `POST` | `/play` | Queue a WAV URL for playback | Body: `{"voice_url":"http://..."}` |
 | `POST` | `/play/pcm` | Play raw PCM audio | Body is 24 kHz mono signed 16-bit little-endian PCM |
-| `POST` | `/mode` | Switch recording behavior | Body: `{"mode":"api"}` or `{"mode":"mcp"}` |
+| `POST` | `/mode` | Clear stale recording state | Body: `{"mode":"mcp"}` |
 | `GET` | `/audio/status` | Check recording state | Returns `ready` and `mode` |
 | `GET` | `/audio` | Fetch latest WAV recording | Consumes and clears readiness |
 | `POST` | `/move` | Move head servos | Body: `{"x":0,"y":0,"speed":50}` |
@@ -236,9 +234,8 @@ For lower latency speech, firmware also accepts `POST /play/pcm` with raw PCM:
 - The main loop never blocks for Wi-Fi reconnect. `serviceWiFi()` requests
   reconnects at intervals while HTTP, playback, and microphone services keep
   running.
-- After recording in API mode, the microphone service queues the generated WAV
-  to a speech worker task. STT and chat HTTP calls no longer run directly in the
-  main loop.
+- After recording, the microphone service stores the generated WAV locally for
+  MCP clients to fetch through `/audio`.
 - Playback timeout clears any queued PCM segments before resuming normal audio
   queue processing, so stale segments from a broken stream are not replayed.
 - The MCP server posts Fish PCM in bounded segments so playback can start
@@ -268,62 +265,23 @@ curl -sS --max-time 5 "http://$STACKCHAN_IP/face"
 # MCP TTS path. With Fish Audio credentials this tries segmented PCM first;
 # without them it uses the validated WAV fallback.
 MAC_IP="$MAC_IP" STACKCHAN_IP="$STACKCHAN_IP" \
-  uv run python - <<'PY'
-import importlib.util
-from pathlib import Path
-
-spec = importlib.util.spec_from_file_location(
-    "stackchan_mcp_server", Path("mcp-server/server.py")
-)
-server = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(server)
-print(server.stackchan_say("Stack-chan playback test.", "en"))
-PY
+  uv run python -m mcp_server.server
 
 # Force WAV for crackle/noise isolation.
 STACKCHAN_AUDIO_MODE=wav MAC_IP="$MAC_IP" STACKCHAN_IP="$STACKCHAN_IP" \
-  uv run python - <<'PY'
-import importlib.util
-from pathlib import Path
-
-spec = importlib.util.spec_from_file_location(
-    "stackchan_mcp_server", Path("mcp-server/server.py")
-)
-server = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(server)
-print(server.stackchan_say("Stack-chan WAV playback test.", "en"))
-PY
+  uv run python -m mcp_server.server
 
 # Force PCM and save the exact Fish PCM stream for diagnosis.
 STACKCHAN_AUDIO_MODE=pcm STACKCHAN_SAVE_PCM=1 MAC_IP="$MAC_IP" STACKCHAN_IP="$STACKCHAN_IP" \
-  uv run python - <<'PY'
-import importlib.util
-from pathlib import Path
-
-spec = importlib.util.spec_from_file_location(
-    "stackchan_mcp_server", Path("mcp-server/server.py")
-)
-server = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(server)
-print(server.stackchan_say("Stack-chan PCM playback test.", "en"))
-PY
+  uv run python -m mcp_server.server
 ```
 
-## Microphone Modes
+## Microphone Recording
 
 The microphone service records 16-bit mono WAV with a pre-trigger ring buffer.
 It uses RMS thresholds to trigger recording and to end after silence.
 
-API mode:
-
 - The device stores the latest recording.
-- It posts WAV audio to `serverUrl + "/speech/transcribe"`.
-- On a successful transcript, it sends the transcript into `chat_service`.
-
-MCP mode:
-
-- The device stores the latest recording.
-- It skips device-side transcription.
 - MCP clients can poll `/audio/status` and then fetch `/audio`.
 
 Switch mode with:
@@ -336,7 +294,7 @@ curl -sS -X POST "http://$STACKCHAN_IP/mode" \
 
 ## MCP Server
 
-`mcp-server/server.py` exposes Stack-chan as MCP tools:
+`mcp_server/server.py` exposes Stack-chan as MCP tools:
 
 - `stackchan_say(text, lang="zh")`
 - `stackchan_listen(lang="zh")`
@@ -381,13 +339,13 @@ heap, and PSRAM.
 Run in stdio mode:
 
 ```sh
-python mcp-server/server.py
+python -m mcp_server.server
 ```
 
 Run in Streamable HTTP mode:
 
 ```sh
-python mcp-server/server.py --http --port 8002
+python -m mcp_server.server --http --port 8002
 ```
 
 Or use:
@@ -399,7 +357,7 @@ Or use:
 
 `start-http.sh` starts the MCP server on port `8002`, starts `cloudflared tunnel
 run` if needed, and checks the public MCP endpoint. It reads optional overrides
-from project-root `.env`: `STACKCHAN_PORT`, `MCP_PYTHON`, `MCP_SCRIPT`,
+from project-root `.env`: `STACKCHAN_PORT`, `MCP_PYTHON`, `MCP_MODULE`,
 `STACKCHAN_PUBLIC_MCP_URL`, and `STACKCHAN_LOG_DIR`. If `MCP_PYTHON` is unset it
 uses `uv run python`, which avoids hard-coding a personal virtualenv path.
 
@@ -477,7 +435,8 @@ camera SCCB pins share GPIO 11 and 12.
 - Prefer small firmware changes that keep the main loop responsive.
 - Avoid blocking work in `loop()`; use existing queues/tasks where possible.
 - Preserve PSRAM allocation patterns for audio, face, and camera buffers.
-- Update both firmware and `mcp-server/server.py` when changing HTTP contracts.
+- Update firmware, `docs/http-api.md`, and MCP client tests when changing HTTP
+  contracts.
 - Keep `firmware/data/` and `face_service.cpp` face filenames synchronized.
 - Do not commit local secrets or Wi-Fi settings from `firmware/src/config.h`.
 - Use `firmware/config.h.example` for documented defaults.

@@ -3,7 +3,6 @@
 // Replaces m5stack-avatar with 小克's own face
 
 #include "face_service.h"
-#include "globals.h"
 #include <M5Unified.h>
 #include <SPIFFS.h>
 
@@ -89,14 +88,11 @@ void setFaceExpression(FaceExpression expr) {
     WhaleFace target;
 
     switch (expr) {
-        case FACE_IDLE:
-            if (serverHour >= 19 || (serverHour >= 0 && serverHour < 7)) {
-                target = WHALE_SLEEPY;
-            } else {
-                target = WHALE_CALM;
-            }
+        case FACE_IDLE: {
+            target = WHALE_CALM;
             isTalking = false;
             break;
+        }
 
         case FACE_LISTENING:
             target = WHALE_THINKING;  // Ripple eyes = paying attention
@@ -150,14 +146,5 @@ void setWhaleFace(WhaleFace face) {
 }
 
 const char* getCurrentFaceName() {
-    switch (currentFace) {
-        case WHALE_CALM:     return "calm";
-        case WHALE_THINKING: return "thinking";
-        case WHALE_HAPPY:    return "happy";
-        case WHALE_SLEEPY:   return "sleepy";
-        case WHALE_SHY:      return "shy";
-        case WHALE_SMUG:     return "smug";
-        case WHALE_POUTY:    return "pouty";
-        default:             return "unknown";
-    }
+    return whaleFaceName(currentFace);
 }

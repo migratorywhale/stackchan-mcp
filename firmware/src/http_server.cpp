@@ -2,73 +2,19 @@
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include "http_server.h"
-#include "queue_manager.h"
-#include "globals.h"
 #include "types.h"
 #include "servo_service.h"
 #include "camera_service.h"
 #include "face_service.h"
 #include "playback_service.h"
 #include "mic_service.h"
+#include "recording_store.h"
+#include "pcm_upload.h"
 
 static WebServer server(80);
 
-// ── 録音バッファ（PSRAMに確保）
-static uint8_t* s_wav_buf   = nullptr;
-static size_t   s_wav_size  = 0;
-static bool     s_wav_ready = false;
-
-static uint8_t* s_pcm_upload_buf = nullptr;
-static size_t   s_pcm_upload_size = 0;
-static size_t   s_pcm_upload_capacity = 0;
-static bool     s_pcm_upload_ready = false;
-static const char* s_pcm_upload_error = nullptr;
 static String   s_pcm_diag_session = "";
 static long     s_pcm_diag_next_seq = 0;
-
-#define HTTP_PCM_MAX_BYTES (128 * 1024)
-
-// ── モードフラグ（false=APIモード / true=MCPモード）
-static bool s_mcp_mode = false;
-
-static void clearPcmUpload() {
-    if (s_pcm_upload_buf) {
-        free(s_pcm_upload_buf);
-    }
-    s_pcm_upload_buf = nullptr;
-    s_pcm_upload_size = 0;
-    s_pcm_upload_capacity = 0;
-    s_pcm_upload_ready = false;
-}
-
-static bool reservePcmUpload(size_t requiredSize) {
-    if (requiredSize <= s_pcm_upload_capacity) {
-        return true;
-    }
-
-    size_t newCapacity = s_pcm_upload_capacity ? s_pcm_upload_capacity : 8192;
-    while (newCapacity < requiredSize) {
-        if (newCapacity > HTTP_PCM_MAX_BYTES / 2) {
-            newCapacity = HTTP_PCM_MAX_BYTES;
-            break;
-        }
-        newCapacity *= 2;
-    }
-
-    uint8_t* newBuf = (uint8_t*)ps_malloc(newCapacity);
-    if (!newBuf) {
-        return false;
-    }
-    if (s_pcm_upload_buf && s_pcm_upload_size > 0) {
-        memcpy(newBuf, s_pcm_upload_buf, s_pcm_upload_size);
-    }
-    if (s_pcm_upload_buf) {
-        free(s_pcm_upload_buf);
-    }
-    s_pcm_upload_buf = newBuf;
-    s_pcm_upload_capacity = newCapacity;
-    return true;
-}
 
 // ────────────────────────────────────────────
 // POST /play
@@ -108,30 +54,27 @@ static void handlePlay() {
 // body: raw 24kHz mono s16le PCM
 // ────────────────────────────────────────────
 static void handlePlayPcm() {
-    if (s_pcm_upload_error) {
+    const char* uploadError = consumePcmUploadError();
+    if (uploadError) {
         String body = "{\"success\":false,\"error\":\"";
-        body += s_pcm_upload_error;
+        body += uploadError;
         body += "\"}";
-        s_pcm_upload_error = nullptr;
         clearPcmUpload();
         server.send(400, "application/json", body);
         return;
     }
-    if (!s_pcm_upload_ready || s_pcm_upload_buf == nullptr || s_pcm_upload_size == 0) {
+    if (!hasPcmUploadBody()) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"no pcm body\"}");
         return;
     }
 
-    const size_t pcmSize = s_pcm_upload_size;
+    PcmUploadBuffer upload = takePcmUploadBody();
+    const size_t pcmSize = upload.size;
     String sessionId = server.arg("session");
     String seqArg = server.arg("seq");
     long seq = seqArg.length() ? seqArg.toInt() : -1;
     bool finalSegment = server.arg("final") == "1" || server.arg("final") == "true";
-    uint8_t* pcmData = s_pcm_upload_buf;
-    s_pcm_upload_buf = nullptr;
-    s_pcm_upload_size = 0;
-    s_pcm_upload_capacity = 0;
-    s_pcm_upload_ready = false;
+    uint8_t* pcmData = upload.data;
 
     long expectedSeq = s_pcm_diag_next_seq;
     bool newDiagSession = sessionId != s_pcm_diag_session;
@@ -192,45 +135,29 @@ static void handlePlayPcmRaw() {
     HTTPRaw& raw = server.raw();
 
     if (raw.status == RAW_START) {
-        clearPcmUpload();
-        s_pcm_upload_error = nullptr;
+        handlePcmUploadRaw(PCM_UPLOAD_RAW_START, nullptr, 0);
         return;
     }
 
     if (raw.status == RAW_WRITE) {
-        if (raw.currentSize > HTTP_PCM_MAX_BYTES - s_pcm_upload_size) {
-            s_pcm_upload_error = "pcm too large";
-            Serial.println("[HTTP] PCM upload too large");
-            clearPcmUpload();
-            return;
-        }
-        size_t newSize = s_pcm_upload_size + raw.currentSize;
-        if (!reservePcmUpload(newSize)) {
-            s_pcm_upload_error = "pcm alloc failed";
-            Serial.println("[HTTP] PCM upload alloc failed");
-            clearPcmUpload();
-            return;
-        }
-        memcpy(s_pcm_upload_buf + s_pcm_upload_size, raw.buf, raw.currentSize);
-        s_pcm_upload_size += raw.currentSize;
+        handlePcmUploadRaw(PCM_UPLOAD_RAW_WRITE, raw.buf, raw.currentSize);
         return;
     }
 
     if (raw.status == RAW_END) {
-        s_pcm_upload_ready = s_pcm_upload_buf != nullptr && s_pcm_upload_size > 0;
+        handlePcmUploadRaw(PCM_UPLOAD_RAW_END, nullptr, 0);
         return;
     }
 
     if (raw.status == RAW_ABORTED) {
-        s_pcm_upload_error = "pcm upload aborted";
-        clearPcmUpload();
+        handlePcmUploadRaw(PCM_UPLOAD_RAW_ABORTED, nullptr, 0);
     }
 }
 
 // ────────────────────────────────────────────
 // POST /mode
-// body: {"mode": "mcp"} または {"mode": "api"}
-// → MCPモード / APIモードを切り替える
+// body: {"mode": "mcp"}
+// → Recording is always MCP pull mode; this endpoint clears stale recordings.
 // ────────────────────────────────────────────
 static void handleMode() {
     if (!server.hasArg("plain")) {
@@ -246,35 +173,22 @@ static void handleMode() {
 
     const char* mode = doc["mode"] | "";
     if (strcmp(mode, "mcp") == 0) {
-        s_mcp_mode = true;
-        // 古い録音を完全クリア
-        s_wav_ready = false;
-        s_wav_size  = 0; 
-        if (s_wav_buf) {
-            free(s_wav_buf); 
-            s_wav_buf = nullptr;
-        }
+        clearLastRecording();
         Serial.println("[HTTP] Mode -> MCP (buffer cleared)");
         server.send(200, "application/json", "{\"success\":true,\"mode\":\"mcp\"}");
-    } else if (strcmp(mode, "api") == 0) {
-        s_mcp_mode = false;
-        Serial.println("[HTTP] Mode -> API");
-        server.send(200, "application/json", "{\"success\":true,\"mode\":\"api\"}");
     } else {
-        server.send(400, "application/json", "{\"success\":false,\"error\":\"mode must be mcp or api\"}");
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"mode must be mcp\"}");
     }
 }
 
 // ────────────────────────────────────────────
 // GET /audio/status
-// → {"ready": true/false, "mode": "mcp"|"api"}
+// → {"ready": true/false, "mode": "mcp"}
 // ────────────────────────────────────────────
 static void handleAudioStatus() {
     String body = "{\"ready\":";
-    body += s_wav_ready ? "true" : "false";
-    body += ",\"mode\":\"";
-    body += s_mcp_mode ? "mcp" : "api";
-    body += "\"}";
+    body += hasLastRecording() ? "true" : "false";
+    body += ",\"mode\":\"mcp\"}";
     server.send(200, "application/json", body);
 }
 
@@ -283,16 +197,17 @@ static void handleAudioStatus() {
 // → 録音済みWAVをそのまま返す（1回読んだらクリア）
 // ────────────────────────────────────────────
 static void handleAudio() {
-    if (!s_wav_ready || s_wav_buf == nullptr || s_wav_size == 0) {
+    RecordingSnapshot recording = getLastRecording();
+    if (!recording.data || recording.size == 0) {
         server.send(404, "application/json", "{\"success\":false,\"error\":\"no audio\"}");
         return;
     }
 
-    Serial.printf("[HTTP] GET /audio -> %u bytes\n", (unsigned)s_wav_size);
-    server.send_P(200, "audio/wav", (const char*)s_wav_buf, s_wav_size);
+    Serial.printf("[HTTP] GET /audio -> %u bytes\n", (unsigned)recording.size);
+    server.send_P(200, "audio/wav", (const char*)recording.data, recording.size);
 
     // 読んだらクリア（1回限り）
-    s_wav_ready = false;
+    markLastRecordingConsumed();
 }
 
 // ────────────────────────────────────────────
@@ -422,11 +337,11 @@ static void handlePlaybackStatus() {
     doc["current_bytes"] = playback.currentBytes;
     doc["queued_pcm_bytes"] = playback.queuedPcmBytes;
     doc["queued_pcm_segments"] = playback.queuedPcmSegments;
-    doc["audio_queue_depth"] = audioQueue.size();
+    doc["audio_queue_depth"] = playback.audioQueueDepth;
     doc["started_ms"] = playback.startedMs;
     doc["deadline_ms"] = playback.deadlineMs;
     doc["mic_state"] = getMicStateName();
-    doc["mic_resume_requested"] = micResumeRequested;
+    doc["mic_resume_requested"] = playback.micResumeRequested;
     doc["servo_ready"] = servo.ready;
     doc["gesture_active"] = servo.gestureActive;
     doc["gesture"] = servo.gestureName;
@@ -462,14 +377,7 @@ static void handleFace() {
     const char* face = doc["face"] | "";
     WhaleFace wf;
 
-    if (strcmp(face, "calm") == 0)          wf = WHALE_CALM;
-    else if (strcmp(face, "thinking") == 0)  wf = WHALE_THINKING;
-    else if (strcmp(face, "happy") == 0)     wf = WHALE_HAPPY;
-    else if (strcmp(face, "sleepy") == 0)    wf = WHALE_SLEEPY;
-    else if (strcmp(face, "shy") == 0)       wf = WHALE_SHY;
-    else if (strcmp(face, "smug") == 0)      wf = WHALE_SMUG;
-    else if (strcmp(face, "pouty") == 0)     wf = WHALE_POUTY;
-    else {
+    if (!whaleFaceFromName(face, &wf)) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"face must be calm/thinking/happy/sleepy/shy/smug/pouty\"}");
         return;
     }
@@ -500,28 +408,6 @@ static void handleSnapshot() {
 // ────────────────────────────────────────────
 // 公開関数
 // ────────────────────────────────────────────
-
-bool isMcpMode() {
-    return s_mcp_mode;
-}
-
-void storeLastRecording(const uint8_t* wav, size_t size) {
-    if (s_wav_buf) {
-        free(s_wav_buf);
-        s_wav_buf = nullptr;
-    }
-    s_wav_buf = (uint8_t*)ps_malloc(size);
-    if (!s_wav_buf) {
-        Serial.println("[HTTP] WAV buffer alloc failed");
-        s_wav_size  = 0;
-        s_wav_ready = false;
-        return;
-    }
-    memcpy(s_wav_buf, wav, size);
-    s_wav_size  = size;
-    s_wav_ready = true;
-    Serial.printf("[HTTP] Stored recording: %u bytes\n", (unsigned)size);
-}
 
 void initHttpServer() {
     server.on("/play",         HTTP_POST, handlePlay);
