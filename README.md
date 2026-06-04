@@ -116,6 +116,20 @@ uv run python scripts/stackchan_voice_bridge.py --lang zh
 `GET /audio` clears the current recording on the device, so use `--dry-run`
 when you only want to inspect readiness.
 
+For a background bridge that writes transcripts into the local voice inbox:
+
+```bash
+./start-voice-bridge.sh
+./start-voice-bridge.sh status
+./start-voice-bridge.sh stop
+```
+
+When the bridge is running, MCP clients can call `stackchan_voice_inbox` to read
+recent transcripts and `stackchan_voice_inbox_clear` to clear them. A simple
+conversation loop is: human speaks to Stack-chan, the bridge writes the
+transcript, the AI reads `stackchan_voice_inbox`, then replies with
+`stackchan_say`.
+
 ## Faces
 
 Stack-chan has 7 expressions stored as 320x240 PNGs on the device's LittleFS. The default face is a gentle whale with crescent eyes.

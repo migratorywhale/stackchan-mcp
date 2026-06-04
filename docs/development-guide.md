@@ -287,6 +287,11 @@ It uses RMS thresholds to trigger recording and to end after silence.
   polls this same path and prints JSONL transcripts. Use `--dry-run --once` to
   inspect readiness without consuming the recording buffer. It reads
   project-root `.env` without overriding already exported variables.
+- `./start-voice-bridge.sh` runs the bridge in the background. Transcript
+  events are appended to `STACKCHAN_VOICE_INBOX`, defaulting to
+  `/tmp/stackchan_audio/voice_inbox.jsonl`.
+- MCP clients can call `stackchan_voice_inbox` and
+  `stackchan_voice_inbox_clear` to read or clear those background transcripts.
 
 Switch mode with:
 

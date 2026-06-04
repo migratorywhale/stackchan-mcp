@@ -8,6 +8,7 @@ from .audio_server import AUDIO_DIR, audio_url, start_audio_server
 from .listening import capture_ready_recording, format_listen_result
 from .stackchan_client import PcmPlaybackError, StackchanClient, post_pcm_stream
 from .stackchan_config import VALID_FACES, StackchanConfig
+from .voice_inbox import clear_events, format_events, read_events
 
 logger = logging.getLogger(__name__)
 
@@ -192,5 +193,21 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
             )
         except requests.exceptions.ConnectionError:
             return f"❌ Stack-chan offline (cannot reach {config.stackchan_ip})"
+        except Exception as exc:
+            return f"❌ Error: {exc}"
+
+    @mcp.tool()
+    def stackchan_voice_inbox(limit: int = 10) -> str:
+        try:
+            events = read_events(limit=limit)
+            return format_events(events)
+        except Exception as exc:
+            return f"❌ Error: {exc}"
+
+    @mcp.tool()
+    def stackchan_voice_inbox_clear() -> str:
+        try:
+            clear_events()
+            return "Stack-chan voice inbox cleared."
         except Exception as exc:
             return f"❌ Error: {exc}"

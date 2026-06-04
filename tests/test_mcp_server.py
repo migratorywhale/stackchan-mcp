@@ -14,6 +14,7 @@ from mcp_server.listening import capture_ready_recording, format_listen_result
 from mcp_server.mcp_tools import can_stream_pcm, register_tools
 from mcp_server.stackchan_client import PcmPlaybackError, StackchanClient, post_pcm_stream
 from mcp_server.stackchan_config import PCM_SAMPLE_WIDTH, StackchanConfig, load_config
+from mcp_server.voice_inbox import append_event, clear_events, format_events, read_events
 from scripts.stackchan_voice_bridge import load_env_file
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -103,6 +104,8 @@ def test_server_entrypoint_registers_expected_tools(monkeypatch):
         "stackchan_home",
         "stackchan_status",
         "stackchan_playback_status",
+        "stackchan_voice_inbox",
+        "stackchan_voice_inbox_clear",
     }
 
 
@@ -143,6 +146,44 @@ def test_voice_bridge_env_loader_does_not_override_existing_values(monkeypatch, 
     assert os.environ["STACKCHAN_IP"] == "192.0.2.55"
     assert os.environ["MAC_IP"] == "192.0.2.99"
     assert os.environ["FISH_AUDIO_KEY"] == "existing-key"
+
+
+def test_voice_inbox_appends_reads_formats_and_clears(tmp_path):
+    inbox = tmp_path / "voice_inbox.jsonl"
+    append_event(
+        {
+            "timestamp": "2026-06-05T00:00:00+09:00",
+            "text": "小记，你好。",
+            "duration": 3.2,
+            "detected_language": "Chinese",
+            "wav_path": "/tmp/stackchan_audio/rec.wav",
+        },
+        inbox,
+    )
+
+    events = read_events(path=inbox)
+
+    assert events[0]["text"] == "小记，你好。"
+    formatted = format_events(events)
+    assert "小记，你好。" in formatted
+    assert "/tmp/stackchan_audio/rec.wav" in formatted
+
+    clear_events(inbox)
+
+    assert read_events(path=inbox) == []
+
+
+def test_voice_inbox_mcp_tools(monkeypatch, tmp_path):
+    inbox = tmp_path / "voice_inbox.jsonl"
+    append_event({"timestamp": "now", "text": "测试", "duration": 1, "wav_path": "/tmp/a.wav"}, inbox)
+    monkeypatch.setenv("STACKCHAN_VOICE_INBOX", str(inbox))
+
+    mcp = FakeFastMCP()
+    register_tools(mcp, object(), make_config(), lambda data, format: {"data": data, "format": format})
+
+    assert "测试" in mcp.tools["stackchan_voice_inbox"]()
+    assert "cleared" in mcp.tools["stackchan_voice_inbox_clear"]()
+    assert "No Stack-chan voice transcripts" in mcp.tools["stackchan_voice_inbox"]()
 
 
 def test_validate_playback_wav_accepts_expected_format(tmp_path):

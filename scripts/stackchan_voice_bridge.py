@@ -73,6 +73,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print idle status events when no recording is ready.",
     )
+    parser.add_argument(
+        "--inbox",
+        help="JSONL inbox path for transcript events. Default: /tmp/stackchan_audio/voice_inbox.jsonl",
+    )
+    parser.add_argument(
+        "--no-inbox",
+        action="store_true",
+        help="Do not append transcript events to the local voice inbox.",
+    )
     return parser
 
 
@@ -80,12 +89,14 @@ def main() -> int:
     from mcp_server.listening import capture_ready_recording
     from mcp_server.stackchan_client import StackchanClient
     from mcp_server.stackchan_config import load_config
+    from mcp_server.voice_inbox import append_event, resolve_inbox_path
 
     args = build_parser().parse_args()
     load_env_file(REPO_ROOT / ".env")
     config = load_config()
     client = StackchanClient(config)
     consumed = 0
+    inbox_path = None if args.no_inbox else resolve_inbox_path(args.inbox)
 
     while True:
         try:
@@ -111,6 +122,8 @@ def main() -> int:
                         "audio_bytes": result.get("audio_bytes", 0),
                         "wav_path": result.get("wav_path"),
                     }
+                    if inbox_path is not None:
+                        append_event(event, inbox_path)
                 elif args.verbose_idle or args.once:
                     event = {
                         "type": "idle",
