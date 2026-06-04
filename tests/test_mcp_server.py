@@ -397,6 +397,26 @@ def test_capture_ready_recording_writes_wav_and_transcribes(monkeypatch, tmp_pat
     assert "你好，Stackchan" in format_listen_result(result)
 
 
+def test_capture_ready_recording_requires_fish_key_before_consuming_audio(tmp_path):
+    class FakeClient:
+        def audio_status(self):
+            return {"ready": True, "mode": "mcp"}
+
+        def get_audio(self):
+            raise AssertionError("GET /audio should not be called without ASR credentials")
+
+    result = capture_ready_recording(
+        FakeClient(),
+        make_config(fish_audio_key=""),
+        audio_dir=tmp_path,
+    )
+
+    assert result["ready"] is True
+    assert result["consumed"] is False
+    assert "Fish Audio key is not configured" in result["error"]
+    assert "Fish Audio key is not configured" in format_listen_result(result)
+
+
 def test_playback_status_formats_runtime_diagnostics():
     class FakeClient:
         def playback_status(self):

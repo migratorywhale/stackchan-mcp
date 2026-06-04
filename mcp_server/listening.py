@@ -24,6 +24,14 @@ def capture_ready_recording(
             "status": status,
         }
 
+    if not config.fish_audio_key:
+        return {
+            "ready": True,
+            "consumed": False,
+            "status": status,
+            "error": "Fish Audio key is not configured; set FISH_AUDIO_KEY before consuming audio.",
+        }
+
     audio_data = client.get_audio()
     if audio_data is None:
         return {
