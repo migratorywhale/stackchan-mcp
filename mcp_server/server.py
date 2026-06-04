@@ -27,7 +27,7 @@ def parse_args(argv: list[str]) -> tuple[bool, int]:
 
 def create_mcp(config: StackchanConfig, *, http_mode: bool = False, port: int = 8002):
     client = StackchanClient(config)
-    mcp = FastMCP("stackchan", host="0.0.0.0", port=port) if http_mode else FastMCP("stackchan")
+    mcp = FastMCP("stackchan", host="127.0.0.1", port=port) if http_mode else FastMCP("stackchan")
     register_tools(mcp, client, config, Image)
     return mcp
 
