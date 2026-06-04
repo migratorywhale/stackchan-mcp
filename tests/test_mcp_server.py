@@ -15,7 +15,7 @@ from mcp_server.mcp_tools import can_stream_pcm, register_tools
 from mcp_server.stackchan_client import PcmPlaybackError, StackchanClient, post_pcm_stream
 from mcp_server.stackchan_config import PCM_SAMPLE_WIDTH, StackchanConfig, load_config
 from mcp_server.voice_inbox import append_event, clear_events, format_events, read_events
-from scripts.stackchan_voice_bridge import load_env_file
+from scripts.stackchan_voice_bridge import load_env_file, should_append_to_inbox
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -146,6 +146,13 @@ def test_voice_bridge_env_loader_does_not_override_existing_values(monkeypatch, 
     assert os.environ["STACKCHAN_IP"] == "192.0.2.55"
     assert os.environ["MAC_IP"] == "192.0.2.99"
     assert os.environ["FISH_AUDIO_KEY"] == "existing-key"
+
+
+def test_voice_bridge_only_appends_non_empty_transcripts_to_inbox():
+    assert should_append_to_inbox({"type": "transcript", "text": "小记，你好。"})
+    assert not should_append_to_inbox({"type": "transcript", "text": ""})
+    assert not should_append_to_inbox({"type": "transcript", "text": "   "})
+    assert not should_append_to_inbox({"type": "idle", "text": "小记，你好。"})
 
 
 def test_voice_inbox_appends_reads_formats_and_clears(tmp_path):

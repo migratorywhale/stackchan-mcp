@@ -43,6 +43,10 @@ def print_event(event: dict) -> None:
     print(json.dumps(event, ensure_ascii=False), flush=True)
 
 
+def should_append_to_inbox(event: dict) -> bool:
+    return event.get("type") == "transcript" and bool(str(event.get("text") or "").strip())
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -122,7 +126,7 @@ def main() -> int:
                         "audio_bytes": result.get("audio_bytes", 0),
                         "wav_path": result.get("wav_path"),
                     }
-                    if inbox_path is not None:
+                    if inbox_path is not None and should_append_to_inbox(event):
                         append_event(event, inbox_path)
                 elif args.verbose_idle or args.once:
                     event = {
@@ -149,7 +153,7 @@ def main() -> int:
             print_event({"type": "error", "timestamp": utc_now(), "error": str(exc)})
             if args.once:
                 return 1
-            time.sleep(max(0.5, args.interval))
+            time.sleep(max(5.0, args.interval))
 
 
 if __name__ == "__main__":
