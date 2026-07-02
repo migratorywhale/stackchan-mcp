@@ -72,9 +72,32 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
 
             wav_path = audio_processing.generate_tts(text, lang, config)
             audio_processing.validate_playback_wav(wav_path)
+            baseline_started_ms = None
+            baseline_playing = False
+            try:
+                baseline_status = client.playback_status()
+                baseline_started_ms = baseline_status.get("started_ms")
+                baseline_playing = bool(baseline_status.get("playing"))
+            except Exception as exc:
+                logger.warning("Could not read playback status before /play: %s", exc)
+
             result = client.play(audio_url(config.mac_ip, config.audio_serve_port, wav_path.name))
 
             if result.get("success"):
+                if not baseline_playing:
+                    start_result = client.wait_for_playback_start(
+                        baseline_started_ms=baseline_started_ms
+                    )
+                    if not start_result.get("started"):
+                        status = start_result.get("status", {})
+                        return (
+                            "❌ Play was queued but playback did not start: "
+                            f"kind={status.get('kind', '?')} "
+                            f"playing={status.get('playing', '?')} "
+                            f"current_bytes={status.get('current_bytes', '?')} "
+                            f"started_ms={status.get('started_ms', '?')} "
+                            f"deadline_ms={status.get('deadline_ms', '?')}"
+                        )
                 engine = "Fish Audio" if (config.tts_engine == "fish-audio" and config.fish_audio_key) else "edge-tts"
                 fallback_note = " (PCM fallback)" if pcm_fallback_reason else ""
                 return f"🗣️ Stack-chan is saying: \"{text[:60]}{'…' if len(text)>60 else ''}\" [{engine} WAV/{lang} mode={config.audio_mode}]{fallback_note}"

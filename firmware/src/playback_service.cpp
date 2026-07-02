@@ -36,6 +36,7 @@ static String s_lastPlayedVoiceId = "";
 #define PCM_BYTES_PER_SAMPLE  2
 #define MAX_PCM_BYTES         (2 * 1024 * 1024)
 #define MAX_QUEUED_PCM_BYTES  (2 * 1024 * 1024)
+#define SPEAKER_PLAYBACK_CHANNEL 0
 
 // ── FreeRTOS: URLをCore 0に渡すキュー
 //    StringはFreeRTOSキューに乗せられないのでchar配列で渡す
@@ -226,9 +227,17 @@ static bool startDownloadedWavPlayback(uint8_t* wavData, size_t wavSize) {
     // マイク停止 → スピーカー起動
     prepareSpeakerPlayback();
     Serial.println("[PLAY] Mic stopped");
-    bool ok = M5.Speaker.playWav(s_currentAudioData, s_currentAudioSize);
+    bool ok = M5.Speaker.playRaw(
+        (const int16_t*)(s_currentAudioData + s_playbackState.pcmOffset),
+        s_playbackState.pcmSize / sizeof(int16_t),
+        s_playbackState.sampleRate,
+        false,
+        1,
+        SPEAKER_PLAYBACK_CHANNEL,
+        true
+    );
     if (!ok) {
-        Serial.println("[PLAY] Speaker rejected playWav");
+        Serial.println("[PLAY] Speaker rejected WAV playRaw");
         retireCurrentPlaybackBuffer();
         setFaceExpression(FACE_IDLE);
         s_micResumeRequested = true;
@@ -320,7 +329,7 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
                                  PCM_SAMPLE_RATE,
                                  false,
                                  1,
-                                 -1,
+                                 SPEAKER_PLAYBACK_CHANNEL,
                                  true);
     if (!ok) {
         Serial.println("[PCM] Speaker rejected playRaw");
