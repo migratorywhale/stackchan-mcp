@@ -94,6 +94,8 @@ def forward_to_frontend(
     payload: dict[str, Any] = {
         "session_id": session_id,
         "prompt": frontend_prompt(prompt_text, prompt_prefix),
+        "display_prompt": prompt_text,
+        "source": "stackchan_voice",
         "force": force,
         "quiet_minutes": quiet_minutes,
     }
