@@ -1,4 +1,5 @@
 #include <M5Unified.h>
+#include <WiFi.h>
 
 #include "mic_service.h"
 #include "config_loader.h"
@@ -40,6 +41,8 @@ static size_t recorded_samples = 0;
 static MicState mic_state = MIC_IDLE;
 static uint32_t trigger_start_ms = 0;
 static uint32_t silence_start_ms = 0;
+static constexpr size_t STREAM_MIN_FRAME_SAMPLES = 160;   // 10 ms @ 16 kHz
+static constexpr size_t STREAM_MAX_FRAME_SAMPLES = 1600;  // 100 ms @ 16 kHz
 
 // プリトリガーリングバッファ
 static int16_t pre_trigger_buf[PRE_TRIGGER_BUFFER_SAMPLES];
@@ -56,6 +59,16 @@ static inline float calcRmsNorm(const int16_t* data, size_t n) {
 }
 
 static bool storeRecordingForMcp(int16_t* audio_data, size_t sample_count);
+
+static void resetMicTriggerState() {
+    memset(pre_trigger_buf, 0, sizeof(pre_trigger_buf));
+    pre_buf_write = 0;
+    pre_buf_full = false;
+    recorded_samples = 0;
+    trigger_start_ms = 0;
+    silence_start_ms = 0;
+    mic_state = MIC_IDLE;
+}
 
 const char* getMicStateName() {
     switch (mic_state) {
@@ -113,9 +126,7 @@ bool initMicrophone() {
     Serial.println("[MIC] Initializing microphone...");
 
     // プリトリガーバッファをリセット（初回 & 再開時共通）
-    memset(pre_trigger_buf, 0, sizeof(pre_trigger_buf));
-    pre_buf_write = 0;
-    pre_buf_full  = false;
+    resetMicTriggerState();
 
     bool mic_started = false;
     if (!audioGateEnter("mic-init", 1000)) {
@@ -155,6 +166,91 @@ bool initMicrophone() {
     mic_state = MIC_IDLE;
 
     return true;
+}
+
+MicStreamResult streamMicrophoneToTcp(
+    const char* host,
+    uint16_t port,
+    uint32_t maxMs,
+    size_t frameSamples
+) {
+    MicStreamResult result = {false, nullptr, 0, 0};
+    if (!host || strlen(host) == 0) {
+        result.error = "host required";
+        return result;
+    }
+    if (port == 0) {
+        result.error = "port required";
+        return result;
+    }
+    if (isPlaybackActive()) {
+        result.error = "playback active";
+        return result;
+    }
+    if (frameSamples < STREAM_MIN_FRAME_SAMPLES) frameSamples = STREAM_MIN_FRAME_SAMPLES;
+    if (frameSamples > STREAM_MAX_FRAME_SAMPLES) frameSamples = STREAM_MAX_FRAME_SAMPLES;
+    if (maxMs < 1000) maxMs = 1000;
+    if (maxMs > 30000) maxMs = 30000;
+
+    WiFiClient client;
+    Serial.printf("[MIC] Stream connect -> %s:%u maxMs=%u frame=%u\n",
+                  host, port, (unsigned)maxMs, (unsigned)frameSamples);
+    if (!client.connect(host, port)) {
+        result.error = "tcp connect failed";
+        return result;
+    }
+
+    if (!audioGateEnter("mic-stream", 1000)) {
+        client.stop();
+        result.error = "audio gate busy";
+        return result;
+    }
+
+    if (M5.Speaker.isRunning() || M5.Speaker.isPlaying()) {
+        result.error = "speaker active";
+    } else {
+        bool micWasRunning = M5.Mic.isRunning();
+        resetMicTriggerState();
+        applyMicConfig();
+        if (!micWasRunning && !M5.Mic.begin()) {
+            result.error = "mic begin failed";
+        } else {
+            setFaceExpression(FACE_LISTENING);
+            static int16_t streamFrame[STREAM_MAX_FRAME_SAMPLES];
+            uint32_t started = millis();
+            uint32_t deadline = started + maxMs;
+            while (client.connected() && millis() < deadline) {
+                bool recorded = M5.Mic.record(streamFrame, frameSamples, MIC_SAMPLE_RATE);
+                if (!recorded) {
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                    continue;
+                }
+                size_t bytes = frameSamples * sizeof(int16_t);
+                size_t written = client.write((const uint8_t*)streamFrame, bytes);
+                if (written != bytes) {
+                    result.error = "tcp write failed";
+                    break;
+                }
+                result.bytesSent += written;
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+            result.durationMs = millis() - started;
+            if (!result.error) {
+                result.success = true;
+            }
+        }
+    }
+
+    client.stop();
+    resetMicTriggerState();
+    setFaceExpression(FACE_IDLE);
+    audioGateLeave("mic-stream");
+    Serial.printf("[MIC] Stream done success=%s bytes=%u duration=%u error=%s\n",
+                  result.success ? "true" : "false",
+                  (unsigned)result.bytesSent,
+                  (unsigned)result.durationMs,
+                  result.error ? result.error : "");
+    return result;
 }
 
 void updateMicrophone() {

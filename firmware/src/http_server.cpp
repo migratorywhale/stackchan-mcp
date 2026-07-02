@@ -11,6 +11,7 @@
 #include "recording_store.h"
 #include "pcm_upload.h"
 #include "audio_gate.h"
+#include "config_loader.h"
 
 static WebServer server(80);
 
@@ -209,6 +210,54 @@ static void handleAudio() {
 
     // 読んだらクリア（1回限り）
     markLastRecordingConsumed();
+}
+
+// ────────────────────────────────────────────
+// GET /stream?port=N[&host=...][&seconds=10][&frame_samples=320]
+// → Experimental: push raw 16 kHz mono s16le PCM to a host TCP listener.
+// ────────────────────────────────────────────
+static void handleStream() {
+    String portArg = server.arg("port");
+    int port = portArg.toInt();
+    if (port <= 0 || port > 65535) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"valid port required\"}");
+        return;
+    }
+
+    String host = server.arg("host");
+    if (host.length() == 0) {
+        host = server.client().remoteIP().toString();
+    }
+
+    uint32_t seconds = (uint32_t)server.arg("seconds").toInt();
+    if (seconds == 0) seconds = 10;
+    uint32_t maxMs = seconds * 1000;
+
+    size_t frameSamples = (size_t)server.arg("frame_samples").toInt();
+    if (frameSamples == 0) frameSamples = 320;
+
+    MicStreamResult result = streamMicrophoneToTcp(
+        host.c_str(),
+        (uint16_t)port,
+        maxMs,
+        frameSamples
+    );
+
+    JsonDocument doc;
+    doc["success"] = result.success;
+    doc["format"] = "s16le";
+    doc["sample_rate"] = MIC_SAMPLE_RATE;
+    doc["channels"] = 1;
+    doc["bytes_sent"] = result.bytesSent;
+    doc["duration_ms"] = result.durationMs;
+    doc["host"] = host;
+    doc["port"] = port;
+    if (result.error) {
+        doc["error"] = result.error;
+    }
+    String body;
+    serializeJson(doc, body);
+    server.send(result.success ? 200 : 409, "application/json", body);
 }
 
 // ────────────────────────────────────────────
@@ -423,6 +472,7 @@ void initHttpServer() {
     server.on("/mode",         HTTP_POST, handleMode);
     server.on("/audio/status", HTTP_GET,  handleAudioStatus);
     server.on("/audio",        HTTP_GET,  handleAudio);
+    server.on("/stream",       HTTP_GET,  handleStream);
     server.on("/move",         HTTP_POST, handleMove);
     server.on("/home",         HTTP_POST, handleHome);
     server.on("/nod",          HTTP_POST, handleNod);

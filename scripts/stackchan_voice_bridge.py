@@ -94,7 +94,9 @@ def resolve_wake_session(session_id: str, title: str = "") -> str:
     return session_id
 
 
-def forward_event_to_frontend(event: dict[str, Any], args: argparse.Namespace) -> dict[str, Any] | None:
+def forward_event_to_frontend(
+    event: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any] | None:
     wake_session_id = resolve_wake_session(args.wake_session_id, args.wake_session_title)
     wake_url = args.wake_url
     if not wake_url and wake_session_id:
@@ -124,7 +126,9 @@ def build_parser() -> argparse.ArgumentParser:
             "This is a host-side bridge prototype; it does not dispatch to Claude Code yet."
         )
     )
-    parser.add_argument("--lang", default="zh", help="ASR language passed to Fish Audio, default: zh")
+    parser.add_argument(
+        "--lang", default="zh", help="ASR language passed to Fish Audio, default: zh"
+    )
     parser.add_argument("--interval", type=float, default=1.0, help="Polling interval in seconds")
     parser.add_argument(
         "--max-events",
