@@ -30,11 +30,13 @@ from scripts.stackchan_frontend_wake import (  # noqa: E402
     forward_to_frontend,
     parse_wake_words,
 )
+from scripts.stackchan_frontend_session import load_sessions, select_session  # noqa: E402
 from scripts.stackchan_voice_bridge import load_env_file, should_append_to_inbox  # noqa: E402
 
 DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 DEFAULT_UPLOAD_RATE_PER_MINUTE = 12
 TOKEN_QUERY_RE = re.compile(r"([?&]token=)[^\s&]+")
+UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,59 @@ def send_json_headers(handler: BaseHTTPRequestHandler, status: int, content_leng
 
 def json_content_length(payload: dict[str, Any]) -> int:
     return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+
+def parse_env_value(raw: str) -> str:
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def load_frontend_token_from_env_file() -> None:
+    if os.environ.get("STACKCHAN_FRONTEND_TOKEN"):
+        return
+    env_path = os.environ.get("STACKCHAN_FRONTEND_ENV", "").strip()
+    if not env_path:
+        return
+    path = Path(env_path).expanduser()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        print(f"[voice-upload] frontend token env not readable: {exc}", file=sys.stderr, flush=True)
+        return
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() == "AGENT_HOST_TOKEN":
+            token = parse_env_value(value)
+            if token:
+                os.environ["STACKCHAN_FRONTEND_TOKEN"] = token
+            return
+
+
+def resolve_wake_session_id(session_id: str) -> str:
+    value = session_id.strip()
+    title = os.environ.get("STACKCHAN_FRONTEND_SESSION_TITLE", "").strip()
+    auto = os.environ.get("STACKCHAN_FRONTEND_AUTO_SESSION", "").strip() == "1"
+    if not value and not title and not auto:
+        return ""
+    if value and value not in {"latest", "auto"} and UUID_RE.match(value):
+        return value
+    if value and value not in {"latest", "auto"} and not title and not auto:
+        return value
+    registry = os.environ.get("STACKCHAN_FRONTEND_REGISTRY") or None
+    try:
+        session = select_session(load_sessions(registry), title=title)
+    except Exception as exc:
+        print(f"[voice-upload] frontend session resolve failed: {exc}", file=sys.stderr, flush=True)
+        return ""
+    resolved = str(session.get("id") or "").strip() if session else ""
+    if not resolved:
+        print("[voice-upload] frontend session resolve failed: no matching session", file=sys.stderr, flush=True)
+    return resolved
 
 
 def write_html(handler: BaseHTTPRequestHandler, status: int, html: str) -> None:
@@ -693,17 +748,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     load_env_file(REPO_ROOT / ".env")
+    load_frontend_token_from_env_file()
     args = build_parser().parse_args()
     config = load_config()
+    wake_session_id = resolve_wake_session_id(args.wake_session_id)
     wake_url = args.wake_url
-    if not wake_url and args.wake_session_id:
+    if not wake_url and wake_session_id:
         wake_url = "http://127.0.0.1:3200/wake"
     options = ServerOptions(
         lang=args.lang,
         max_bytes=args.max_bytes,
         inbox_path=None if args.no_inbox else resolve_inbox_path(args.inbox),
         wake_url=wake_url,
-        wake_session_id=args.wake_session_id,
+        wake_session_id=wake_session_id,
         wake_token=args.wake_token,
         wake_model=args.wake_model,
         wake_timeout=args.wake_timeout,
