@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import struct
 import sys
@@ -18,6 +19,7 @@ from mcp_server.voice_inbox import append_event, clear_events, format_events, re
 from scripts import (
     stackchan_frontend_session,
     stackchan_frontend_wake,
+    stackchan_stream_stt,
     stackchan_voice_upload_server,
 )
 from scripts.stackchan_voice_bridge import (
@@ -136,7 +138,103 @@ def test_invalid_pcm_env_values_fall_back_to_defaults(monkeypatch):
     assert config.pcm_zero_cross_window == 256
 
 
+def test_stackchan_client_can_use_curl_transport_for_json(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_HTTP_TRANSPORT", "curl")
+    captured = {}
+
+    def fake_run(cmd, *, input=None, capture_output=None, timeout=None, check=None):
+        captured["cmd"] = cmd
+        captured["input"] = input
+        captured["timeout"] = timeout
+        body_path = cmd[cmd.index("-o") + 1]
+        Path(body_path).write_bytes(b'{"success":true}')
+        return types.SimpleNamespace(returncode=0, stdout=b"200", stderr=b"")
+
+    monkeypatch.setattr("mcp_server.stackchan_client.subprocess.run", fake_run)
+
+    result = StackchanClient(make_config()).play("http://192.0.2.10/audio.wav")
+
+    assert result == {"success": True}
+    assert captured["input"] == b'{"voice_url": "http://192.0.2.10/audio.wav"}'
+    assert "/usr/bin/curl" in captured["cmd"]
+    assert "http://192.0.2.20:80/play" in captured["cmd"]
+    assert "Content-Type: application/json" in captured["cmd"]
+
+
+def test_stackchan_client_curl_fallback_uses_curl_after_requests_failure(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_HTTP_TRANSPORT", "curl-fallback")
+
+    def fail_request(*_args, **_kwargs):
+        raise __import__("requests").ConnectionError("local network permission denied")
+
+    def fake_run(cmd, *, input=None, capture_output=None, timeout=None, check=None):
+        body_path = cmd[cmd.index("-o") + 1]
+        Path(body_path).write_bytes(b'{"ready":false,"mode":"mcp"}')
+        return types.SimpleNamespace(returncode=0, stdout=b"200", stderr=b"")
+
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.get", fail_request)
+    monkeypatch.setattr("mcp_server.stackchan_client.subprocess.run", fake_run)
+
+    assert StackchanClient(make_config()).audio_status() == {"ready": False, "mode": "mcp"}
+
+
+def test_stackchan_client_starts_experimental_stream(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        content = b'{"success":true,"bytes_sent":640}'
+        text = content.decode()
+
+        def json(self):
+            return {"success": True, "bytes_sent": 640}
+
+    def fake_get(url, *, timeout=None):
+        captured["url"] = url
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.get", fake_get)
+
+    result = StackchanClient(make_config()).stream_to_host(
+        host="192.0.2.99",
+        port=43210,
+        seconds=7,
+        frame_samples=320,
+    )
+
+    assert result == {"success": True, "bytes_sent": 640}
+    assert captured["timeout"] == 15
+    assert captured["url"] == (
+        "http://192.0.2.20:80/stream?port=43210&seconds=7&frame_samples=320&host=192.0.2.99"
+    )
+
+
+def test_wait_for_playback_start_retries_transient_status_errors(monkeypatch):
+    client = StackchanClient(make_config())
+    calls = {"count": 0}
+
+    def fake_playback_status():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise __import__("requests").ConnectionError("connection reset")
+        return {"playing": True, "started_ms": 124}
+
+    monkeypatch.setattr(client, "playback_status", fake_playback_status)
+
+    result = client.wait_for_playback_start(
+        baseline_started_ms=123,
+        timeout=0.5,
+        interval=0,
+    )
+
+    assert result["started"] is True
+    assert calls["count"] == 2
+
+
 def test_voice_bridge_env_loader_does_not_override_existing_values(monkeypatch, tmp_path):
+    monkeypatch.delenv("STACKCHAN_IP", raising=False)
+    monkeypatch.delenv("MAC_IP", raising=False)
     env_path = tmp_path / ".env"
     env_path.write_text(
         "\n".join(
@@ -431,6 +529,34 @@ def test_voice_upload_frontend_forwarding_retries_busy(monkeypatch):
     assert len(calls) == 2
 
 
+def test_stream_stt_dispatch_appends_and_forwards(monkeypatch, tmp_path):
+    forwarded = []
+
+    def fake_forward(event, args):
+        forwarded.append((event, args))
+        return {"ok": True, "status_code": 200}
+
+    monkeypatch.setattr(stackchan_stream_stt, "forward_event_to_frontend", fake_forward)
+
+    args = types.SimpleNamespace()
+    inbox = tmp_path / "voice_inbox.jsonl"
+    event = {
+        "type": "transcript",
+        "timestamp": "2026-06-30T00:00:00Z",
+        "source": "stackchan_stream",
+        "text": "小塔，听得到吗？",
+    }
+
+    result = stackchan_stream_stt.dispatch_transcript_event(event, args, inbox)
+
+    assert result["inbox_appended"] is True
+    assert result["frontend"] == {"ok": True, "status_code": 200}
+    assert forwarded == [(event, args)]
+    inbox_events = [json.loads(line) for line in inbox.read_text(encoding="utf-8").splitlines()]
+    assert inbox_events[0]["source"] == "stackchan_stream"
+    assert inbox_events[0]["text"] == "小塔，听得到吗？"
+
+
 def test_frontend_session_selects_latest_non_archived():
     sessions = [
         {"id": "old", "title": "lab-room-3", "last": "2026-06-20T20:55:19.411Z"},
@@ -484,11 +610,15 @@ def test_voice_inbox_appends_reads_formats_and_clears(tmp_path):
 
 def test_voice_inbox_mcp_tools(monkeypatch, tmp_path):
     inbox = tmp_path / "voice_inbox.jsonl"
-    append_event({"timestamp": "now", "text": "测试", "duration": 1, "wav_path": "/tmp/a.wav"}, inbox)
+    append_event(
+        {"timestamp": "now", "text": "测试", "duration": 1, "wav_path": "/tmp/a.wav"}, inbox
+    )
     monkeypatch.setenv("STACKCHAN_VOICE_INBOX", str(inbox))
 
     mcp = FakeFastMCP()
-    register_tools(mcp, object(), make_config(), lambda data, format: {"data": data, "format": format})
+    register_tools(
+        mcp, object(), make_config(), lambda data, format: {"data": data, "format": format}
+    )
 
     assert "测试" in mcp.tools["stackchan_voice_inbox"]()
     assert "cleared" in mcp.tools["stackchan_voice_inbox_clear"]()
@@ -643,17 +773,101 @@ def test_post_pcm_stream_rejects_oversized_payload_before_http_post(monkeypatch,
 
 def test_post_pcm_stream_raises_for_http_error(monkeypatch, tmp_path):
     class FakeResponse:
-        text = "{\"success\":false,\"error\":\"playback busy\"}"
+        text = '{"success":false,"error":"playback busy"}'
 
         def raise_for_status(self):
             error = __import__("requests").HTTPError("409 Client Error")
             error.response = self
             raise error
 
-    monkeypatch.setattr("mcp_server.stackchan_client.requests.post", lambda *_args, **_kwargs: FakeResponse())
+    monkeypatch.setattr(
+        "mcp_server.stackchan_client.requests.post", lambda *_args, **_kwargs: FakeResponse()
+    )
 
     with pytest.raises(PcmPlaybackError, match="PCM segment HTTP failed"):
-        post_pcm_stream(StackchanClient(make_config()), iter([b"\x00\x00"]), tmp_path, audio_processing)
+        post_pcm_stream(
+            StackchanClient(make_config()), iter([b"\x00\x00"]), tmp_path, audio_processing
+        )
+
+
+def test_tools_say_verifies_wav_playback_start(monkeypatch, tmp_path):
+    wav_path = tmp_path / "speech.wav"
+    write_wav(wav_path)
+
+    class FakeClient:
+        def __init__(self):
+            self.play_url = None
+            self.baseline_started_ms = None
+
+        def playback_status(self):
+            return {"playing": False, "started_ms": 123}
+
+        def play(self, wav_url):
+            self.play_url = wav_url
+            return {"success": True}
+
+        def wait_for_playback_start(self, *, baseline_started_ms=None):
+            self.baseline_started_ms = baseline_started_ms
+            return {"started": True, "status": {"playing": True, "started_ms": 124}}
+
+    monkeypatch.setattr("mcp_server.mcp_tools.start_audio_server", lambda _port: None)
+    monkeypatch.setattr(audio_processing, "generate_tts", lambda *_args: wav_path)
+
+    client = FakeClient()
+    mcp = FakeFastMCP()
+    register_tools(
+        mcp,
+        client,
+        make_config(audio_mode="wav"),
+        lambda data, format: {"data": data, "format": format},
+    )
+
+    result = mcp.tools["stackchan_say"]("hello", "zh")
+
+    assert "Stack-chan is saying" in result
+    assert client.play_url == "http://192.0.2.10:5099/speech.wav"
+    assert client.baseline_started_ms == 123
+
+
+def test_tools_say_reports_wav_playback_start_failure(monkeypatch, tmp_path):
+    wav_path = tmp_path / "silent.wav"
+    write_wav(wav_path)
+
+    class FakeClient:
+        def playback_status(self):
+            return {"playing": False, "started_ms": 123}
+
+        def play(self, _wav_url):
+            return {"success": True}
+
+        def wait_for_playback_start(self, *, baseline_started_ms=None):
+            assert baseline_started_ms == 123
+            return {
+                "started": False,
+                "status": {
+                    "kind": "idle",
+                    "playing": False,
+                    "current_bytes": 0,
+                    "started_ms": 123,
+                    "deadline_ms": 456,
+                },
+            }
+
+    monkeypatch.setattr("mcp_server.mcp_tools.start_audio_server", lambda _port: None)
+    monkeypatch.setattr(audio_processing, "generate_tts", lambda *_args: wav_path)
+
+    mcp = FakeFastMCP()
+    register_tools(
+        mcp,
+        FakeClient(),
+        make_config(audio_mode="wav"),
+        lambda data, format: {"data": data, "format": format},
+    )
+
+    result = mcp.tools["stackchan_say"]("hello", "zh")
+
+    assert "Play was queued but playback did not start" in result
+    assert "kind=idle" in result
 
 
 def test_tools_move_clamps_inputs_before_http_call():
@@ -667,7 +881,9 @@ def test_tools_move_clamps_inputs_before_http_call():
 
     client = FakeClient()
     mcp = FakeFastMCP()
-    register_tools(mcp, client, make_config(), lambda data, format: {"data": data, "format": format})
+    register_tools(
+        mcp, client, make_config(), lambda data, format: {"data": data, "format": format}
+    )
 
     result = mcp.tools["stackchan_move"](x=999, y=-20, speed=250)
 
@@ -683,7 +899,9 @@ def test_invalid_face_is_rejected_without_http_call():
             raise AssertionError("HTTP face setter should not be called for invalid expressions")
 
     mcp = FakeFastMCP()
-    register_tools(mcp, FakeClient(), make_config(), lambda data, format: {"data": data, "format": format})
+    register_tools(
+        mcp, FakeClient(), make_config(), lambda data, format: {"data": data, "format": format}
+    )
 
     assert "Unknown expression" in mcp.tools["stackchan_face"]("surprised")
 
@@ -697,7 +915,9 @@ def test_listen_does_not_consume_audio_when_not_ready():
             raise AssertionError("GET /audio consumes the device buffer and should not be called")
 
     mcp = FakeFastMCP()
-    register_tools(mcp, FakeClient(), make_config(), lambda data, format: {"data": data, "format": format})
+    register_tools(
+        mcp, FakeClient(), make_config(), lambda data, format: {"data": data, "format": format}
+    )
 
     assert "No recording ready" in mcp.tools["stackchan_listen"]()
 
@@ -783,7 +1003,9 @@ def test_playback_status_formats_runtime_diagnostics():
             }
 
     mcp = FakeFastMCP()
-    register_tools(mcp, FakeClient(), make_config(), lambda data, format: {"data": data, "format": format})
+    register_tools(
+        mcp, FakeClient(), make_config(), lambda data, format: {"data": data, "format": format}
+    )
 
     result = mcp.tools["stackchan_playback_status"]()
 
