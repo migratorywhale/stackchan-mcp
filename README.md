@@ -147,6 +147,42 @@ Replace them with your own names. The wake matcher only uses them as an
 activation gate; the forwarded prompt keeps the original phrase so the AI can
 still see how it was addressed.
 
+Current physical-mic input is buffered: the firmware records a complete utterance
+with RMS/silence detection, stores it, and the host pulls it with `GET /audio`.
+A lower-latency streaming STT path is feasible but intentionally not the default
+yet. The experimental branch exposes `GET /stream?port=N`: Stack-chan pushes
+16 kHz mono signed 16-bit PCM to a host TCP listener, while the host uses RMS
+and optional WebRTC VAD to decide when the utterance is done before handing a
+WAV file to Fish Audio ASR or `whisper-cli`. Non-empty transcripts are written
+to the same local voice inbox and can be forwarded through the same frontend
+`/wake` path as the browser upload receiver.
+
+```bash
+# Capture one streamed utterance, save the WAV, and skip transcription.
+uv run python scripts/stackchan_stream_stt.py --no-transcribe
+
+# Use whisper-cli when installed.
+uv run python scripts/stackchan_stream_stt.py --use-webrtc-vad
+
+# Use the existing Fish Audio ASR key instead of whisper-cli.
+uv run python scripts/stackchan_stream_stt.py --use-webrtc-vad --asr-provider fish
+
+# Forward deliberate wake-word transcripts into the latest frontend session.
+STACKCHAN_FRONTEND_SESSION_ID=latest \
+STACKCHAN_FRONTEND_REGISTRY="/path/to/frontend/relay/data/web-sessions.json" \
+STACKCHAN_FRONTEND_WAKE_URL="http://127.0.0.1:3200/wake" \
+STACKCHAN_VOICE_WAKE_WORDS="小克,小可,老公,脑公" \
+uv run python scripts/stackchan_stream_stt.py --use-webrtc-vad --asr-provider fish
+
+# If the device cannot infer the right host IP, pass the host address it should
+# connect back to.
+uv run python scripts/stackchan_stream_stt.py --device-connect-host 192.0.2.99
+```
+
+Keep this separate from the stable `/audio` path until the microphone/speaker
+mutex behavior is verified on the device. It is meant as a latency experiment,
+not a replacement for the working buffered bridge yet.
+
 For a push-style experiment compatible with clients that POST WAV audio, run
 the upload receiver instead. It exposes `POST /voice/upload`, transcribes the
 WAV with Fish Audio, and writes the same local voice inbox:
@@ -250,6 +286,21 @@ Run this health check when something feels stuck:
 It verifies the local receiver, the public HTTPS route, the frontend
 `agent-host`, the Cloudflare launchd service, the resolved frontend session, and
 the configured wake words.
+
+If Python `requests` cannot reach Stack-chan from macOS but command-line
+`curl http://$STACKCHAN_IP/playback/status` works, use the curl transport
+workaround:
+
+```bash
+STACKCHAN_HTTP_TRANSPORT=curl ./start-voice-bridge.sh
+# or, for one command:
+STACKCHAN_HTTP_TRANSPORT=curl uv run python -m mcp_server.server --http --port 8002
+```
+
+`STACKCHAN_HTTP_TRANSPORT=curl-fallback` keeps `requests` as the first choice and
+uses `/usr/bin/curl` only after a connection error. This is for macOS Local
+Network permission oddities; it will not fix a powered-off device, wrong
+`STACKCHAN_IP`, or a blocked Wi-Fi route.
 
 Without `STACKCHAN_FRONTEND_SESSION_ID`, the receiver only records transcripts
 to the voice inbox and never guesses which room should receive them.

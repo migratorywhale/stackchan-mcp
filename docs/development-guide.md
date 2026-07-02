@@ -179,6 +179,38 @@ gesture before moving.
 Be careful with `GET /audio`: it returns the current WAV recording and marks it
 as no longer ready. Use `GET /audio/status` first when checking live devices.
 
+### Experimental: streaming STT endpoint
+
+The current physical microphone path is buffered: `mic_service.cpp` records an
+utterance with pre-roll, RMS trigger, silence detection, and `GET /audio` lets
+the host fetch the finished WAV. That is stable and keeps the device-side state
+small.
+
+A lower-latency path exists as a separate experimental endpoint, rather than
+replacing `/audio`:
+
+1. Host opens a TCP listener on an ephemeral port.
+2. Host calls `GET /stream?port=N` on Stack-chan.
+3. Firmware enters the audio gate, refuses the stream if playback is active,
+   starts the microphone, and connects back to `host:N`.
+4. Firmware sends 16 kHz mono signed 16-bit little-endian PCM frames until the
+   host disconnects or a timeout is reached.
+5. Host uses WebRTC VAD plus an RMS energy gate to decide speech start/end, then
+   transcribes the captured samples.
+
+Host prototype:
+
+```sh
+uv run python scripts/stackchan_stream_stt.py --no-transcribe
+uv run python scripts/stackchan_stream_stt.py --use-webrtc-vad
+uv run python scripts/stackchan_stream_stt.py --use-webrtc-vad --asr-provider fish
+```
+
+Keep this path independent from `/audio` until it has device tests. The risky
+parts are long-lived HTTP/TCP handling in the firmware, microphone/speaker I2S
+ownership, and ensuring the main loop can still service playback, Wi-Fi, face
+updates, and gestures.
+
 ## Safe Live-Device Checks
 
 Set `STACKCHAN_IP` to the current device address before running these:
@@ -204,8 +236,8 @@ WAV playback is push-based:
 4. `playback_service.cpp` downloads audio on a FreeRTOS task so the main loop
    stays responsive.
 5. The download task passes completed WAV buffers back to the main loop through
-   a FreeRTOS queue; the main loop starts speaker playback only when no audio is
-   already playing.
+   a FreeRTOS queue; the main loop validates the WAV, then plays its PCM data
+   with `M5.Speaker.playRaw()` on the fixed playback channel.
 6. Lip sync reads PCM amplitude from the WAV data and toggles mouth state.
 7. Playback completion stops the speaker path and allows microphone resume.
 
@@ -229,8 +261,8 @@ For lower latency speech, firmware also accepts `POST /play/pcm` with raw PCM:
   subsequent PCM segments while the current PCM segment is playing.
 - Playback buffer ownership stays in `playback_service.cpp`. Finished buffers
   are retired for one additional completion cycle before being freed, so
-  `M5.Speaker.playRaw()` / `playWav()` internals are not handed memory that has
-  just been released.
+  `M5.Speaker.playRaw()` internals are not handed memory that has just been
+  released.
 - The main loop never blocks for Wi-Fi reconnect. `serviceWiFi()` requests
   reconnects at intervals while HTTP, playback, and microphone services keep
   running.
@@ -390,6 +422,10 @@ Important environment variables:
   boundary for a quieter cut point, default `256`.
   Invalid PCM tuning values are ignored with a warning and replaced by these
   documented defaults.
+- `STACKCHAN_HTTP_TRANSPORT`: host-to-device HTTP transport. Default
+  `requests`. Set to `curl` to use `/usr/bin/curl` for Stack-chan HTTP calls on
+  macOS when Python cannot access the local network; set to `curl-fallback` to
+  try `requests` first and use curl only after a connection error.
 
 The server writes generated and captured media under `/tmp/stackchan_audio`.
 
@@ -432,6 +468,28 @@ make test-mcp
 These tests verify the exported tool names and device-facing guardrails such as
 servo input clamping, face validation, audio URL generation, and avoiding
 `GET /audio` when `/audio/status` is not ready.
+
+### macOS local network transport
+
+On some macOS setups, Python networking can fail against LAN devices until the
+app has Local Network permission, while `/usr/bin/curl` succeeds from Terminal.
+For that case, the host client has an opt-in curl transport:
+
+```sh
+STACKCHAN_HTTP_TRANSPORT=curl uv run python scripts/stackchan_voice_bridge.py --dry-run --once
+STACKCHAN_HTTP_TRANSPORT=curl uv run python -m mcp_server.server --http --port 8002
+```
+
+Use `curl-fallback` if the normal path mostly works but occasionally hits the
+permission edge:
+
+```sh
+STACKCHAN_HTTP_TRANSPORT=curl-fallback ./start-http.sh
+```
+
+This workaround only changes the host-side HTTP client. It does not change
+firmware behavior and does not repair wrong IPs, offline devices, or router
+isolation.
 
 When adding MCP tools or changing arguments, update `tests/test_mcp_server.py`
 with import-safe tests. Tests should mock network/device calls and must avoid

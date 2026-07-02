@@ -31,6 +31,15 @@ This is the shared contract between the CoreS3 firmware and the MCP server.
   - This is a consuming read: after a successful response, the recording is no
     longer reported as ready.
 
+- `GET /stream?port=<host-port>[&host=<host-ip>][&seconds=10][&frame_samples=320]`
+  - Experimental, lower-latency microphone path.
+  - The firmware connects to the host TCP listener and pushes raw PCM.
+  - Format: `16 kHz`, mono, signed 16-bit little-endian PCM.
+  - If `host` is omitted, firmware connects back to the HTTP requester's IP.
+  - The endpoint refuses while playback/speaker is active.
+  - This is not the stable default recording path; keep clients on
+    `/audio/status` + `/audio` unless they explicitly opt into streaming.
+
 ## Motion
 
 - `POST /move`
