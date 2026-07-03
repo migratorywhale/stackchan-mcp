@@ -1,6 +1,6 @@
 import logging
 import threading
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -15,6 +15,10 @@ _http_thread = None
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
+    # Abandoned sockets (firmware reboot / WiFi drop mid-download) self-terminate
+    # instead of blocking a handler thread forever.
+    timeout = 20
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(AUDIO_DIR), **kwargs)
 
@@ -27,7 +31,10 @@ def start_audio_server(port: int) -> None:
     if _http_server is not None:
         return
     try:
-        _http_server = HTTPServer(("0.0.0.0", port), QuietHandler)
+        # ThreadingHTTPServer: one hung client connection must not starve the
+        # rest — the single-threaded HTTPServer deadlocked playback whenever a
+        # download was interrupted (root cause of the "one bullet" silence bug).
+        _http_server = ThreadingHTTPServer(("0.0.0.0", port), QuietHandler)
         _http_thread = threading.Thread(target=_http_server.serve_forever, daemon=True)
         _http_thread.start()
     except OSError as exc:
