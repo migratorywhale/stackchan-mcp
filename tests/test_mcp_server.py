@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import requests
 
 from mcp_server import audio_processing
 from mcp_server.audio_server import audio_url
@@ -339,6 +340,27 @@ def test_invalid_pcm_env_values_fall_back_to_defaults(monkeypatch):
     assert config.pcm_limit == 0.90
     assert config.pcm_declick_samples == 64
     assert config.pcm_zero_cross_window == 256
+
+
+def test_udp_pace_factor_clamps_to_lower_and_upper_bounds(monkeypatch):
+    monkeypatch.setattr("mcp_server.stackchan_config.load_dotenv", lambda path=None: None)
+
+    monkeypatch.setenv("STACKCHAN_UDP_PACE_FACTOR", "0.5")
+    low_config = load_config()
+
+    monkeypatch.setenv("STACKCHAN_UDP_PACE_FACTOR", "0.85")
+    floor_config = load_config()
+
+    monkeypatch.setenv("STACKCHAN_UDP_PACE_FACTOR", "3.0")
+    high_config = load_config()
+
+    monkeypatch.delenv("STACKCHAN_UDP_PACE_FACTOR", raising=False)
+    default_config = load_config()
+
+    assert low_config.udp_pace_factor == 0.85
+    assert floor_config.udp_pace_factor == 0.85
+    assert high_config.udp_pace_factor == 1.5
+    assert default_config.udp_pace_factor == 1.0
 
 
 def test_invalid_audio_mode_falls_back_to_auto(monkeypatch):
@@ -1264,6 +1286,127 @@ def test_post_pcm_udp_stream_raises_when_device_reports_lost_frames(monkeypatch,
     monkeypatch.setattr("mcp_server.stackchan_client.time.sleep", lambda _seconds: None)
 
     with pytest.raises(PcmPlaybackError, match="lost=1 underruns=1") as excinfo:
+        post_pcm_udp_stream(
+            StackchanClient(make_config(pcm_transport="udp")),
+            iter([b"\x00\x00" * (PCM_UDP_FRAME_BYTES // 2)]),
+            tmp_path,
+            audio_processing,
+        )
+
+    assert excinfo.value.started is True
+
+
+def test_post_pcm_udp_stream_reports_declicked_samples(monkeypatch, tmp_path):
+    class FakeResponse:
+        def json(self):
+            return {"success": True, "session": "udp-test", "token": 0x12345678, "udp_port": 9091}
+
+    class FakeStatusResponse:
+        def json(self):
+            return {
+                "udp_audio_active": False,
+                "udp_audio_playing": False,
+                "udp_audio_session": "",
+                "udp_last_end_reason": "end",
+                "udp_last_frames_received": 1,
+                "udp_last_frames_lost": 0,
+                "udp_last_underruns": 0,
+            }
+
+    class FakeSocket:
+        def settimeout(self, _timeout):
+            return None
+
+        def sendto(self, _data, _address):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.post", lambda *_args, **_kwargs: FakeResponse())
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.get", lambda *_args, **_kwargs: FakeStatusResponse())
+    monkeypatch.setattr("mcp_server.stackchan_client.socket.socket", lambda *_args, **_kwargs: FakeSocket())
+    monkeypatch.setattr("mcp_server.stackchan_client.time.sleep", lambda _seconds: None)
+
+    result = post_pcm_udp_stream(
+        StackchanClient(make_config(pcm_transport="udp")),
+        iter([b"\x00\x00" * (PCM_UDP_FRAME_BYTES // 2)]),
+        tmp_path,
+        audio_processing,
+    )
+
+    # The lone frame is both the session's first and last, so it gets both a fade-in and a
+    # fade-out ramp counted; on all-zero audio the ramp is a no-op but the sample count is real.
+    assert result["declicked_samples"] > 0
+
+
+def test_post_pcm_udp_stream_raises_when_device_receives_zero_frames(monkeypatch, tmp_path):
+    class FakeSessionResponse:
+        def json(self):
+            return {"success": True, "session": "udp-test", "token": 0x12345678, "udp_port": 9091}
+
+    class FakeStatusResponse:
+        def json(self):
+            return {
+                "udp_audio_active": False,
+                "udp_audio_playing": False,
+                "udp_audio_session": "",
+                "udp_last_end_reason": "end",
+                "udp_last_frames_received": 0,
+                "udp_last_frames_lost": 0,
+                "udp_last_underruns": 0,
+            }
+
+    class FakeSocket:
+        def settimeout(self, _timeout):
+            return None
+
+        def sendto(self, _data, _address):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.post", lambda *_args, **_kwargs: FakeSessionResponse())
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.get", lambda *_args, **_kwargs: FakeStatusResponse())
+    monkeypatch.setattr("mcp_server.stackchan_client.socket.socket", lambda *_args, **_kwargs: FakeSocket())
+    monkeypatch.setattr("mcp_server.stackchan_client.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(PcmPlaybackError, match="no frames") as excinfo:
+        post_pcm_udp_stream(
+            StackchanClient(make_config(pcm_transport="udp")),
+            iter([b"\x00\x00" * (PCM_UDP_FRAME_BYTES // 2)]),
+            tmp_path,
+            audio_processing,
+        )
+
+    assert excinfo.value.started is True
+
+
+def test_post_pcm_udp_stream_raises_when_completion_status_unavailable(monkeypatch, tmp_path):
+    class FakeSessionResponse:
+        def json(self):
+            return {"success": True, "session": "udp-test", "token": 0x12345678, "udp_port": 9091}
+
+    class FakeSocket:
+        def settimeout(self, _timeout):
+            return None
+
+        def sendto(self, _data, _address):
+            return None
+
+        def close(self):
+            return None
+
+    def fake_get(*_args, **_kwargs):
+        raise requests.exceptions.ConnectionError("device unreachable")
+
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.post", lambda *_args, **_kwargs: FakeSessionResponse())
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.get", fake_get)
+    monkeypatch.setattr("mcp_server.stackchan_client.socket.socket", lambda *_args, **_kwargs: FakeSocket())
+    monkeypatch.setattr("mcp_server.stackchan_client.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(PcmPlaybackError, match="could not be verified") as excinfo:
         post_pcm_udp_stream(
             StackchanClient(make_config(pcm_transport="udp")),
             iter([b"\x00\x00" * (PCM_UDP_FRAME_BYTES // 2)]),

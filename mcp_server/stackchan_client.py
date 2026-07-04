@@ -445,7 +445,9 @@ def status_int(status: dict, *keys: str) -> int:
 
 
 def wait_for_udp_completion_status(client: StackchanClient, session_id: str) -> dict:
-    timeout = min(max(client.config.playback_start_timeout, 0.5), 3.0)
+    # Firmware's preroll-failure timer is PCM_UDP_PREROLL_TIMEOUT_MS (5s); the poll window
+    # must outlive it or we give up before the device reports a real completion status.
+    timeout = max(client.config.playback_start_timeout, 6.0)
     interval = max(client.config.playback_poll_interval, 0.05)
     deadline = time.monotonic() + timeout
     last_status: dict = {}
@@ -462,6 +464,25 @@ def wait_for_udp_completion_status(client: StackchanClient, session_id: str) -> 
     return last_status
 
 
+def _fade_pcm_tail_to_silence(buffer: bytearray, real_len: int, samples: int) -> int:
+    """Ramp the last `samples` samples of the real (pre-padding) audio in `buffer` toward
+    silence, mirroring the weighting used by audio_processing.declick_pcm_segment but applied
+    at the tail instead of the head (that helper only smooths a segment's leading edge)."""
+    if samples <= 0 or real_len <= 0:
+        return 0
+    sample_count = real_len // PCM_SAMPLE_WIDTH
+    ramp = min(samples, sample_count)
+    if ramp <= 0:
+        return 0
+    start_sample = sample_count - ramp
+    for offset in range(ramp):
+        pos = (start_sample + offset) * PCM_SAMPLE_WIDTH
+        current = struct.unpack_from("<h", buffer, pos)[0]
+        weight = (ramp - offset) / (ramp + 1)
+        struct.pack_into("<h", buffer, pos, round(current * weight))
+    return ramp
+
+
 def post_pcm_udp_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_processing) -> dict:
     import uuid
 
@@ -472,6 +493,7 @@ def post_pcm_udp_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_pr
     total_input_size = 0
     total_sent_size = 0
     limited_samples = 0
+    declicked_samples = 0
     pending_sample_bytes = b""
     frame_buffer = bytearray()
     seq = 0
@@ -495,6 +517,9 @@ def post_pcm_udp_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_pr
     address = (client.config.stackchan_ip, udp_port)
     frame_seconds = (PCM_UDP_FRAME_MS / 1000.0) * client.config.udp_pace_factor
     burst_frames = max(1, int(40 / PCM_UDP_FRAME_MS))
+    # Firmware's UDP ring holds 512 frames; never schedule further ahead of wall clock than
+    # this, or a post-stall catch-up burst could overwrite slots the device hasn't played yet.
+    max_lead_seconds = 256 * frame_seconds
     pacing_started_at: float | None = None
     next_send_at: float | None = None
 
@@ -530,8 +555,14 @@ def post_pcm_udp_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_pr
                 next_send_at = pacing_started_at
             seq += 1
             if pacing_started_at is not None and seq >= burst_frames:
-                base = max(now, next_send_at or now)
+                # Cumulative schedule: never rebase to "now". Rebasing after a stall (the old
+                # `max(now, ...)` behavior) silently discards the lost time and drains the
+                # device's buffer instead of sending a catch-up burst to refill it.
+                base = next_send_at if next_send_at is not None else now
                 next_send_at = base + frame_seconds
+                lead = next_send_at - time.perf_counter()
+                if lead > max_lead_seconds:
+                    time.sleep(lead - max_lead_seconds)
 
     def condition_chunk(chunk: bytes) -> bytes:
         nonlocal first_chunk_ms, limited_samples, pending_sample_bytes, total_input_size
@@ -577,15 +608,31 @@ def post_pcm_udp_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_pr
                     f"{len(frame_buffer)} bytes buffered in {elapsed:.1f}s"
                 )
             while len(frame_buffer) >= PCM_UDP_FRAME_BYTES:
-                send_frame(bytes(frame_buffer[:PCM_UDP_FRAME_BYTES]))
+                frame = bytes(frame_buffer[:PCM_UDP_FRAME_BYTES])
                 del frame_buffer[:PCM_UDP_FRAME_BYTES]
+                if seq == 0:
+                    frame, faded_in = audio_processing.declick_pcm_segment(
+                        frame, 0, client.config.pcm_declick_samples
+                    )
+                    declicked_samples += faded_in
+                send_frame(frame)
         if pending_sample_bytes:
             raise PcmPlaybackError(
                 f"invalid PCM payload size: trailing {len(pending_sample_bytes)} byte partial sample",
                 started=accepted,
             )
         if frame_buffer:
-            frame_buffer.extend(b"\x00" * (PCM_UDP_FRAME_BYTES - len(frame_buffer)))
+            real_len = len(frame_buffer)
+            frame_buffer.extend(b"\x00" * (PCM_UDP_FRAME_BYTES - real_len))
+            if seq == 0:
+                padded, faded_in = audio_processing.declick_pcm_segment(
+                    bytes(frame_buffer), 0, client.config.pcm_declick_samples
+                )
+                declicked_samples += faded_in
+                frame_buffer[:] = padded
+            declicked_samples += _fade_pcm_tail_to_silence(
+                frame_buffer, real_len, client.config.pcm_declick_samples
+            )
             send_frame(bytes(frame_buffer))
         if seq == 0:
             raise ValueError("invalid PCM payload size: 0")
@@ -616,6 +663,7 @@ def post_pcm_udp_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_pr
         "pcm_gain": client.config.pcm_gain,
         "pcm_limit": client.config.pcm_limit,
         "limited_samples": limited_samples,
+        "declicked_samples": declicked_samples,
         "timing_ms": {
             "pcm_total": round((time.perf_counter() - started_at) * 1000),
             "fish_first_chunk": first_chunk_ms,
@@ -629,7 +677,24 @@ def post_pcm_udp_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_pr
     }
     if saved_pcm_path is not None:
         result["saved_pcm"] = str(saved_pcm_path)
-    if completion_status and (
+    # A totally missing status (device unreachable) is distinct from a status that reports
+    # zero frames received, so check it first and fail loudly rather than assume success.
+    if not completion_status:
+        raise PcmPlaybackError(
+            "PCM UDP playback could not be verified: no completion status from device "
+            f"(sent_frames={seq}, session={session_id})",
+            started=True,
+        )
+    # This dominates whatever else the status reports: a completion status -- even a stale
+    # one left over from a previous session -- can never mask the device having received
+    # nothing at all for this session.
+    if seq > 0 and frames_received == 0:
+        raise PcmPlaybackError(
+            "PCM UDP playback incomplete: device received no frames "
+            f"(sent_frames={seq}, session={session_id})",
+            started=True,
+        )
+    if (
         frames_lost > 0
         or underruns > 0
         or (frames_received > 0 and frames_received < seq)

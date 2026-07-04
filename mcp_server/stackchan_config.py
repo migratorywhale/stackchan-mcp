@@ -266,7 +266,7 @@ def load_config() -> StackchanConfig:
             ("STACKCHAN_PCM_STREAM_IO_TIMEOUT", "STACKCHAN_PCM_STREAM_IO_TIMEOUT_SEC"),
             30.0,
         ),
-        udp_pace_factor=max(1.0, min(env_float("STACKCHAN_UDP_PACE_FACTOR", 1.0), 1.5)),
+        udp_pace_factor=max(0.85, min(env_float("STACKCHAN_UDP_PACE_FACTOR", 1.0), 1.5)),
         max_pcm_payload_bytes=max_pcm_payload_bytes,
         pcm_declick_samples=pcm_declick_samples,
         pcm_zero_cross_window=pcm_zero_cross_window,
