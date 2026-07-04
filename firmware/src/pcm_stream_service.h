@@ -2,6 +2,9 @@
 
 #include <Arduino.h>
 
+#define PCM_UDP_FRAME_MS     10
+#define PCM_UDP_START_FRAMES 12
+
 struct PcmStreamStatus {
     bool enabled = false;
     bool active = false;

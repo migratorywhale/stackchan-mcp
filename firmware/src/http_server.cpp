@@ -468,9 +468,9 @@ static void handleAudioSessionStart() {
     doc["sample_rate"] = 24000;
     doc["channels"] = 1;
     doc["sample_width"] = 2;
-    doc["frame_ms"] = 10;
-    doc["jitter_ms"] = 40;
-    doc["start_buffer_ms"] = 40;
+    doc["frame_ms"] = PCM_UDP_FRAME_MS;
+    doc["jitter_ms"] = PCM_UDP_START_FRAMES * PCM_UDP_FRAME_MS;
+    doc["start_buffer_ms"] = PCM_UDP_START_FRAMES * PCM_UDP_FRAME_MS;
     doc["udp_port"] = result.port;
     doc["token"] = result.token;
     String body;

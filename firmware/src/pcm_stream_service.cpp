@@ -15,12 +15,13 @@
 #define PCM_UDP_PORT                 9091
 #define PCM_STREAM_SAMPLE_RATE       24000
 #define PCM_STREAM_BYTES_PER_SAMPLE  2
-#define PCM_UDP_FRAME_MS             10
+// PCM_UDP_FRAME_MS / PCM_UDP_START_FRAMES live in pcm_stream_service.h so
+// http_server.cpp can advertise the real preroll in /audio/session.
 #define PCM_UDP_FRAME_SAMPLES        ((PCM_STREAM_SAMPLE_RATE * PCM_UDP_FRAME_MS) / 1000)
 #define PCM_UDP_FRAME_BYTES          (PCM_UDP_FRAME_SAMPLES * PCM_STREAM_BYTES_PER_SAMPLE)
 #define PCM_UDP_SLAB_FRAMES          1
-#define PCM_UDP_START_FRAMES         12
 #define PCM_UDP_RING_FRAMES          512
+#define PCM_UDP_FADE_SAMPLES         64
 #define PCM_UDP_HEADER_BYTES         24
 #define PCM_UDP_PACKET_MAX           (PCM_UDP_HEADER_BYTES + PCM_UDP_FRAME_BYTES)
 #define PCM_UDP_VERSION              1
@@ -77,6 +78,11 @@ static uint32_t s_udpFramesLost = 0;
 static uint32_t s_udpFramesLate = 0;
 static uint32_t s_udpUnderruns = 0;
 static uint32_t s_udpFirstAudioMs = 0;
+// Last mono sample actually written to I2S (for click-free concealment ramps).
+static int16_t s_udpLastSample = 0;
+// True when the previous frame written was concealed (or this is session
+// start) so the next real frame should fade in instead of jumping.
+static bool s_udpConcealedPrev = true;
 static unsigned long s_udpStartedMs = 0;
 static unsigned long s_udpLastPacketMs = 0;
 static String s_udpLastEndReason = "";
@@ -266,6 +272,39 @@ static bool writeUdpI2sFrame(const uint8_t* frame) {
     return true;
 }
 
+// Fills `frame` (PCM_UDP_FRAME_SAMPLES mono int16 samples) with a linear
+// ramp from `fromSample` down to exactly 0 at the last sample. Used both to
+// conceal lost/late frames and to fade out the tail of a session, avoiding
+// the instantaneous jump ("click") a flat-zero fill would cause. Integer
+// math only, int32 intermediates to avoid overflow (max |fromSample| *
+// denom ~= 32768 * 239, well within int32 range).
+static void fillConcealmentRamp(uint8_t* frame, int32_t fromSample) {
+    int16_t* samples = (int16_t*)frame;
+    const int32_t denom = (int32_t)PCM_UDP_FRAME_SAMPLES - 1;
+    for (size_t i = 0; i < PCM_UDP_FRAME_SAMPLES; ++i) {
+        int32_t remaining = denom - (int32_t)i;
+        int32_t value = (fromSample * remaining) / denom;
+        samples[i] = (int16_t)value;
+    }
+}
+
+// Fades in the first PCM_UDP_FADE_SAMPLES samples of `frame` from 0 up to
+// their original value, in place. Used when real audio resumes after one
+// or more concealed frames (or at session start) to avoid a click.
+static void applyFadeIn(uint8_t* frame) {
+    int16_t* samples = (int16_t*)frame;
+    const size_t fadeSamples =
+        (PCM_UDP_FRAME_SAMPLES < PCM_UDP_FADE_SAMPLES) ? PCM_UDP_FRAME_SAMPLES : PCM_UDP_FADE_SAMPLES;
+    if (fadeSamples < 2) {
+        return;
+    }
+    const int32_t denom = (int32_t)fadeSamples - 1;
+    for (size_t i = 0; i < fadeSamples; ++i) {
+        int32_t value = ((int32_t)samples[i] * (int32_t)i) / denom;
+        samples[i] = (int16_t)value;
+    }
+}
+
 static bool writePcmI2s(const uint8_t* data, size_t size) {
     uint8_t frame[PCM_UDP_FRAME_BYTES];
     size_t offset = 0;
@@ -300,6 +339,8 @@ static void resetUdpState(bool keepSession) {
     s_udpFirstAudioMs = 0;
     s_udpStartedMs = millis();
     s_udpLastPacketMs = 0;
+    s_udpLastSample = 0;
+    s_udpConcealedPrev = true;
     if (!keepSession) {
         s_udpActive = false;
         s_udpSession = "";
@@ -328,6 +369,14 @@ static bool prepareUdpSpeaker() {
 static void finishUdpSession(const char* reason, bool waitForDrain = true) {
     if (s_udpPlaying) {
         (void)waitForDrain;
+        // Fade the last played sample down to silence instead of cutting
+        // the amplifier off mid-waveform, to avoid an end-of-session click.
+        if (s_udpI2sRunning && s_udpLastSample != 0) {
+            uint8_t fadeFrame[PCM_UDP_FRAME_BYTES];
+            fillConcealmentRamp(fadeFrame, s_udpLastSample);
+            writeUdpI2sFrame(fadeFrame);
+            s_udpLastSample = 0;
+        }
         stopUdpI2s();
         audioGateLeave("pcm-udp");
         requestMicResume();
@@ -493,16 +542,34 @@ static void pumpUdpPlayback() {
     for (uint32_t i = 0; i < PCM_UDP_SLAB_FRAMES; ++i) {
         uint32_t seq = s_udpNextPlaySeq++;
         uint8_t frame[PCM_UDP_FRAME_BYTES];
+        bool gotFrame = false;
         if (s_udpEnding && seq >= s_udpEndSeq) {
-            memset(frame, 0, PCM_UDP_FRAME_BYTES);
-        } else if (!takeUdpFrame(seq, frame)) {
+            // Trailing padding frame(s) past the announced end sequence:
+            // ramp to silence rather than jump straight to a flat zero.
+            fillConcealmentRamp(frame, s_udpLastSample);
+            s_udpConcealedPrev = true;
+        } else if (takeUdpFrame(seq, frame)) {
+            gotFrame = true;
+        } else {
             s_udpFramesLost++;
             s_udpUnderruns++;
+            // Conceal the loss/underrun with a ramp to silence instead of
+            // a hard drop to zero (takeUdpFrame() already zeroed `frame`,
+            // this overwrites it with the ramp).
+            fillConcealmentRamp(frame, s_udpLastSample);
+            s_udpConcealedPrev = true;
+        }
+        if (gotFrame && s_udpConcealedPrev) {
+            // Real audio resuming after concealment (or session start):
+            // fade in instead of jumping straight to full amplitude.
+            applyFadeIn(frame);
+            s_udpConcealedPrev = false;
         }
         if (!writeUdpI2sFrame(frame)) {
             finishUdpSession("i2s-write-failed");
             return;
         }
+        s_udpLastSample = ((const int16_t*)frame)[PCM_UDP_FRAME_SAMPLES - 1];
     }
 }
 
