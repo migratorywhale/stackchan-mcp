@@ -14,11 +14,23 @@ import pytest
 from mcp_server import audio_processing
 from mcp_server.audio_server import audio_url
 from mcp_server.listening import capture_ready_recording, format_listen_result
-from mcp_server.mcp_tools import can_stream_pcm, register_tools
-from mcp_server.stackchan_client import PcmPlaybackError, StackchanClient, post_pcm_stream
+from mcp_server.mcp_tools import (
+    can_stream_pcm,
+    format_speech_confirmation,
+    post_preferred_pcm_stream,
+    register_tools,
+)
+from mcp_server.stackchan_client import (
+    PcmPlaybackError,
+    StackchanClient,
+    post_pcm_stream,
+    post_pcm_tcp_stream,
+    post_pcm_udp_stream,
+)
 from mcp_server.stackchan_config import (
     PCM_SAMPLE_WIDTH,
     PCM_SEGMENT_BYTES,
+    PCM_UDP_FRAME_BYTES,
     StackchanConfig,
     load_config,
 )
@@ -67,10 +79,16 @@ def make_config(**overrides):
         "audio_serve_port": 5099,
         "tts_engine": "fish-audio",
         "audio_mode": "auto",
+        "pcm_transport": "tcp",
         "save_pcm": False,
-        "pcm_gain": 0.75,
+        "pcm_gain": 1.0,
         "pcm_limit": 0.90,
         "pcm_segment_bytes": PCM_SEGMENT_BYTES,
+        "pcm_stream_port": 9090,
+        "pcm_stream_initial_buffer_bytes": 96 * 1024,
+        "pcm_stream_connect_timeout": 3.0,
+        "pcm_stream_io_timeout": 30.0,
+        "udp_pace_factor": 1.0,
         "max_pcm_payload_bytes": 2 * 1024 * 1024,
         "pcm_declick_samples": 64,
         "pcm_zero_cross_window": 256,
@@ -255,7 +273,60 @@ def test_audio_url_uses_configured_host_and_port():
     assert audio_url("192.0.2.10", 5099, "hello.wav") == "http://192.0.2.10:5099/hello.wav"
 
 
+def test_speech_confirmation_omits_transport_diagnostics():
+    result = format_speech_confirmation("你好，小克" * 20)
+
+    assert result.startswith("🗣️ Stack-chan is saying: \"")
+    assert "transport=" not in result
+    assert "timing[" not in result
+    assert "…" in result
+
+
+def test_preferred_pcm_auto_uses_tcp_before_experimental_udp(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_tcp(_client, _chunks, _audio_dir, _audio_processing):
+        calls.append("tcp")
+        return {"success": True, "transport": "tcp", "total_bytes": 2}
+
+    def fake_udp(*_args, **_kwargs):
+        raise AssertionError("auto should not use UDP")
+
+    monkeypatch.setattr("mcp_server.mcp_tools.AUDIO_DIR", tmp_path)
+    monkeypatch.setattr("mcp_server.mcp_tools.post_pcm_tcp_stream", fake_tcp)
+    monkeypatch.setattr("mcp_server.mcp_tools.post_pcm_udp_stream", fake_udp)
+
+    config = make_config(pcm_transport="auto")
+    result = post_preferred_pcm_stream(StackchanClient(config), "hello", "zh", config)
+
+    assert calls == ["tcp"]
+    assert result["transport"] == "tcp"
+
+
+def test_preferred_pcm_auto_falls_back_to_staged_when_tcp_rejects_before_start(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_tcp(_client, _chunks, _audio_dir, _audio_processing):
+        calls.append("tcp")
+        raise PcmPlaybackError("busy", started=False)
+
+    def fake_staged(_client, _chunks, _audio_dir, _audio_processing):
+        calls.append("staged")
+        return {"success": True, "total_bytes": 2}
+
+    monkeypatch.setattr("mcp_server.mcp_tools.AUDIO_DIR", tmp_path)
+    monkeypatch.setattr("mcp_server.mcp_tools.post_pcm_tcp_stream", fake_tcp)
+    monkeypatch.setattr("mcp_server.mcp_tools.post_pcm_stream", fake_staged)
+
+    config = make_config(pcm_transport="auto")
+    result = post_preferred_pcm_stream(StackchanClient(config), "hello", "zh", config)
+
+    assert calls == ["tcp", "staged"]
+    assert result["transport"] == "staged"
+
+
 def test_invalid_pcm_env_values_fall_back_to_defaults(monkeypatch):
+    monkeypatch.setattr("mcp_server.stackchan_config.load_dotenv", lambda path=None: None)
     monkeypatch.setenv("STACKCHAN_PCM_GAIN", "loud")
     monkeypatch.setenv("STACKCHAN_PCM_LIMIT", "hot")
     monkeypatch.setenv("STACKCHAN_PCM_DECLICK_SAMPLES", "many")
@@ -263,14 +334,80 @@ def test_invalid_pcm_env_values_fall_back_to_defaults(monkeypatch):
 
     config = load_config()
 
-    assert config.pcm_gain == 0.75
+    assert config.audio_mode == "wav"
+    assert config.pcm_gain == 1.0
     assert config.pcm_limit == 0.90
     assert config.pcm_declick_samples == 64
     assert config.pcm_zero_cross_window == 256
 
 
+def test_invalid_audio_mode_falls_back_to_auto(monkeypatch):
+    monkeypatch.setattr("mcp_server.stackchan_config.load_dotenv", lambda path=None: None)
+    monkeypatch.setenv("STACKCHAN_AUDIO_MODE", "stream")
+
+    config = load_config()
+
+    assert config.audio_mode == "wav"
+
+
+def test_invalid_pcm_transport_falls_back_to_auto(monkeypatch):
+    monkeypatch.setattr("mcp_server.stackchan_config.load_dotenv", lambda path=None: None)
+    monkeypatch.setenv("STACKCHAN_PCM_TRANSPORT", "bananas")
+
+    config = load_config()
+
+    assert config.pcm_transport == "auto"
+
+
+def test_load_config_defaults_to_wav_and_full_pcm_gain(monkeypatch):
+    monkeypatch.delenv("STACKCHAN_AUDIO_MODE", raising=False)
+    monkeypatch.delenv("STACKCHAN_PCM_GAIN", raising=False)
+    monkeypatch.delenv("STACKCHAN_PCM_LIMIT", raising=False)
+    monkeypatch.setattr("mcp_server.stackchan_config.load_dotenv", lambda path=None: None)
+
+    config = load_config()
+
+    assert config.audio_mode == "wav"
+    assert config.pcm_transport == "tcp"
+    assert config.pcm_gain == 1.0
+    assert config.pcm_limit == 0.90
+
+
+def test_load_config_accepts_explicit_audio_modes(monkeypatch):
+    monkeypatch.setattr("mcp_server.stackchan_config.load_dotenv", lambda path=None: None)
+
+    monkeypatch.setenv("STACKCHAN_AUDIO_MODE", "auto")
+    auto_config = load_config()
+
+    monkeypatch.setenv("STACKCHAN_AUDIO_MODE", "pcm")
+    pcm_config = load_config()
+
+    assert auto_config.audio_mode == "auto"
+    assert pcm_config.audio_mode == "pcm"
+
+
+def test_load_config_accepts_explicit_pcm_transports(monkeypatch):
+    monkeypatch.setattr("mcp_server.stackchan_config.load_dotenv", lambda path=None: None)
+
+    monkeypatch.setenv("STACKCHAN_PCM_TRANSPORT", "udp")
+    udp_config = load_config()
+
+    monkeypatch.setenv("STACKCHAN_PCM_TRANSPORT", "auto")
+    auto_config = load_config()
+
+    monkeypatch.setenv("STACKCHAN_PCM_TRANSPORT", "staged")
+    staged_config = load_config()
+
+    assert udp_config.pcm_transport == "udp"
+    assert auto_config.pcm_transport == "auto"
+    assert staged_config.pcm_transport == "staged"
+
+
 def test_config_reads_pcm_and_timeout_env_aliases(monkeypatch):
     monkeypatch.setenv("STACKCHAN_PCM_SEGMENT_BYTES", "32768")
+    monkeypatch.setenv("STACKCHAN_PCM_TRANSPORT", "tcp")
+    monkeypatch.setenv("STACKCHAN_PCM_STREAM_PORT", "9191")
+    monkeypatch.setenv("STACKCHAN_PCM_STREAM_INITIAL_BUFFER_BYTES", "32768")
     monkeypatch.setenv("STACKCHAN_PCM_MAX_PAYLOAD_BYTES", "1048576")
     monkeypatch.setenv("STACKCHAN_PLAYBACK_START_TIMEOUT_SEC", "7.5")
     monkeypatch.setenv("STACKCHAN_PCM_SEGMENT_POST_TIMEOUT_SEC", "22")
@@ -280,6 +417,9 @@ def test_config_reads_pcm_and_timeout_env_aliases(monkeypatch):
     config = load_config()
 
     assert config.pcm_segment_bytes == 32768
+    assert config.pcm_transport == "tcp"
+    assert config.pcm_stream_port == 9191
+    assert config.pcm_stream_initial_buffer_bytes == 32768
     assert config.max_pcm_payload_bytes == 1048576
     assert config.playback_start_timeout == 7.5
     assert config.pcm_segment_post_timeout == 22
@@ -792,14 +932,16 @@ def test_post_pcm_stream_posts_binary_payload_with_content_length(monkeypatch, t
     assert result["success"] is True
     assert result["segments"] == 1
     assert set(result["timing_ms"]) == {"pcm_total", "fish_first_chunk", "first_segment_posted"}
-    assert request_kwargs["kwargs"]["data"] == struct.pack("<hh", 750, -750)
+    assert request_kwargs["kwargs"]["data"] == struct.pack("<hh", 1000, -1000)
     assert isinstance(request_kwargs["kwargs"]["data"], bytes)
     headers = request_kwargs["kwargs"]["headers"]
     assert headers["Content-Type"].startswith("audio/x-raw")
     assert headers["X-Stackchan-Pcm-Session"] == result["session"]
     assert headers["X-Stackchan-Pcm-Seq"] == "0"
     assert headers["X-Stackchan-Pcm-Final"] == "1"
+    assert headers["X-Stackchan-Pcm-Mode"] == "staged"
     assert "final=1" in request_kwargs["args"][0]
+    assert "mode=staged" in request_kwargs["args"][0]
 
 
 def test_post_pcm_stream_handles_split_sample_boundaries(monkeypatch, tmp_path):
@@ -827,7 +969,46 @@ def test_post_pcm_stream_handles_split_sample_boundaries(monkeypatch, tmp_path):
     )
 
     assert result["success"] is True
-    assert request_kwargs["kwargs"]["data"] == struct.pack("<hh", 750, -750)
+    assert request_kwargs["kwargs"]["data"] == struct.pack("<hh", 1000, -1000)
+
+
+def test_post_pcm_stream_staged_segments_do_not_mark_audio_started(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload=None, error=None):
+            self._payload = payload or {}
+            self._error = error
+            self.text = "{\"success\":false,\"error\":\"upload failed\"}"
+
+        def raise_for_status(self):
+            if self._error:
+                error = __import__("requests").HTTPError(self._error)
+                error.response = self
+                raise error
+
+        def json(self):
+            return self._payload
+
+    def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            return FakeResponse({"success": True, "staged": True})
+        return FakeResponse(error="500 Server Error")
+
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.post", fake_post)
+    client = StackchanClient(make_config(pcm_segment_bytes=4))
+
+    with pytest.raises(PcmPlaybackError) as excinfo:
+        post_pcm_stream(
+            client,
+            iter([struct.pack("<hhhh", 1, 2, 3, 4)]),
+            tmp_path,
+            audio_processing,
+        )
+
+    assert excinfo.value.started is False
+    assert calls[0][1]["headers"]["X-Stackchan-Pcm-Mode"] == "staged"
 
 
 def test_wait_for_playback_start_detects_started_ms_change(monkeypatch):
@@ -877,6 +1058,238 @@ def test_post_pcm_stream_raises_for_http_error(monkeypatch, tmp_path):
 
     with pytest.raises(PcmPlaybackError, match="PCM segment HTTP failed"):
         post_pcm_stream(StackchanClient(make_config()), iter([b"\x00\x00"]), tmp_path, audio_processing)
+
+
+def test_post_pcm_tcp_stream_sends_header_and_pcm(monkeypatch, tmp_path):
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+            self.response = bytearray(b"OK\n")
+            self.timeout = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def sendall(self, data):
+            self.sent.append(bytes(data))
+
+        def recv(self, size):
+            assert size == 1
+            if not self.response:
+                return b""
+            data = self.response[:1]
+            del self.response[:1]
+            return bytes(data)
+
+    fake_socket = FakeSocket()
+    calls = []
+
+    def fake_create_connection(address, timeout):
+        calls.append((address, timeout))
+        return fake_socket
+
+    monkeypatch.setattr("mcp_server.stackchan_client.socket.create_connection", fake_create_connection)
+    client = StackchanClient(make_config(pcm_stream_initial_buffer_bytes=4))
+
+    result = post_pcm_tcp_stream(
+        client,
+        iter([struct.pack("<h", 1000), struct.pack("<h", -1000)]),
+        tmp_path,
+        audio_processing,
+    )
+
+    assert result["success"] is True
+    assert result["transport"] == "tcp"
+    assert result["sent_bytes"] == 4
+    assert calls == [(("192.0.2.20", 9090), 3.0)]
+    assert fake_socket.sent[0].startswith(b"STACKCHAN_PCM_STREAM/1 session=")
+    assert b"rate=24000 channels=1 width=2\n" in fake_socket.sent[0]
+    assert fake_socket.sent[1] == struct.pack("<hh", 1000, -1000)
+
+
+def test_post_pcm_tcp_stream_rejection_is_not_started(monkeypatch, tmp_path):
+    class FakeSocket:
+        response = bytearray(b"ERR BUSY\n")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def settimeout(self, _timeout):
+            return None
+
+        def sendall(self, _data):
+            return None
+
+        def recv(self, _size):
+            if not self.response:
+                return b""
+            data = self.response[:1]
+            del self.response[:1]
+            return bytes(data)
+
+    monkeypatch.setattr(
+        "mcp_server.stackchan_client.socket.create_connection",
+        lambda *_args, **_kwargs: FakeSocket(),
+    )
+
+    with pytest.raises(PcmPlaybackError, match="ERR BUSY") as excinfo:
+        post_pcm_tcp_stream(
+            StackchanClient(make_config(pcm_stream_initial_buffer_bytes=2)),
+            iter([b"\x00\x00"]),
+            tmp_path,
+            audio_processing,
+        )
+
+    assert excinfo.value.started is False
+
+
+def test_post_pcm_udp_stream_starts_session_and_sends_framed_packets(monkeypatch, tmp_path):
+    class FakeResponse:
+        def json(self):
+            return {"success": True, "session": "udp-test", "token": 0x12345678, "udp_port": 9091}
+
+    class FakeStatusResponse:
+        def json(self):
+            return {
+                "udp_audio_active": False,
+                "udp_audio_playing": False,
+                "udp_audio_session": "",
+                "udp_last_end_reason": "end",
+                "udp_last_frames_received": 1,
+                "udp_last_frames_lost": 0,
+                "udp_last_underruns": 0,
+            }
+
+    class FakeSocket:
+        def __init__(self, *_args, **_kwargs):
+            self.sent = []
+            self.timeout = None
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def sendto(self, data, address):
+            self.sent.append((bytes(data), address))
+
+        def close(self):
+            return None
+
+    fake_socket = FakeSocket()
+    session_posts = []
+
+    def fake_post(url, **kwargs):
+        session_posts.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.post", fake_post)
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.get", lambda *_args, **_kwargs: FakeStatusResponse())
+    monkeypatch.setattr("mcp_server.stackchan_client.socket.socket", lambda *_args, **_kwargs: fake_socket)
+    monkeypatch.setattr("mcp_server.stackchan_client.time.sleep", lambda _seconds: None)
+    client = StackchanClient(make_config(pcm_transport="udp"))
+
+    result = post_pcm_udp_stream(
+        client,
+        iter([b"\x00\x00" * (PCM_UDP_FRAME_BYTES // 2)]),
+        tmp_path,
+        audio_processing,
+    )
+
+    assert result["success"] is True
+    assert result["transport"] == "udp"
+    assert result["frames"] == 1
+    assert result["udp_frames_lost"] == 0
+    assert result["udp_underruns"] == 0
+    assert session_posts[0][0] == "http://192.0.2.20:80/audio/session"
+    first_packet, address = fake_socket.sent[0]
+    assert address == ("192.0.2.20", 9091)
+    magic, version, flags, header_len, token, seq, timestamp, payload_len, reserved = struct.unpack(
+        "<4sBBHIIIHH",
+        first_packet[:24],
+    )
+    assert (magic, version, flags, header_len, token, seq, timestamp, payload_len, reserved) == (
+        b"SCP1",
+        1,
+        0,
+        24,
+        0x12345678,
+        0,
+        0,
+        PCM_UDP_FRAME_BYTES,
+        0,
+    )
+    assert len(first_packet[24:]) == PCM_UDP_FRAME_BYTES
+    assert len(fake_socket.sent) == 4
+    assert all(packet[0][5] == 1 for packet in fake_socket.sent[1:])
+
+
+def test_post_pcm_udp_stream_raises_when_device_reports_lost_frames(monkeypatch, tmp_path):
+    class FakeSessionResponse:
+        def json(self):
+            return {"success": True, "session": "udp-test", "token": 0x12345678, "udp_port": 9091}
+
+    class FakeStatusResponse:
+        def json(self):
+            return {
+                "udp_audio_active": False,
+                "udp_audio_playing": False,
+                "udp_audio_session": "",
+                "udp_last_end_reason": "end",
+                "udp_last_frames_received": 1,
+                "udp_last_frames_lost": 1,
+                "udp_last_underruns": 1,
+            }
+
+    class FakeSocket:
+        def settimeout(self, _timeout):
+            return None
+
+        def sendto(self, _data, _address):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.post", lambda *_args, **_kwargs: FakeSessionResponse())
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.get", lambda *_args, **_kwargs: FakeStatusResponse())
+    monkeypatch.setattr("mcp_server.stackchan_client.socket.socket", lambda *_args, **_kwargs: FakeSocket())
+    monkeypatch.setattr("mcp_server.stackchan_client.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(PcmPlaybackError, match="lost=1 underruns=1") as excinfo:
+        post_pcm_udp_stream(
+            StackchanClient(make_config(pcm_transport="udp")),
+            iter([b"\x00\x00" * (PCM_UDP_FRAME_BYTES // 2)]),
+            tmp_path,
+            audio_processing,
+        )
+
+    assert excinfo.value.started is True
+
+
+def test_post_pcm_udp_stream_session_failure_is_not_started(monkeypatch, tmp_path):
+    class FakeResponse:
+        def json(self):
+            return {"success": False, "error": "busy"}
+
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.post", lambda *_args, **_kwargs: FakeResponse())
+
+    with pytest.raises(PcmPlaybackError, match="PCM UDP session failed") as excinfo:
+        post_pcm_udp_stream(
+            StackchanClient(make_config()),
+            iter([b"\x00\x00"]),
+            tmp_path,
+            audio_processing,
+        )
+
+    assert excinfo.value.started is False
 
 
 def test_tools_move_clamps_inputs_before_http_call():
@@ -1041,6 +1454,8 @@ def test_playback_status_formats_runtime_diagnostics():
 
 def test_can_stream_pcm_requires_fish_credentials():
     assert can_stream_pcm(make_config()) is True
+    assert can_stream_pcm(make_config(audio_mode="auto")) is True
+    assert can_stream_pcm(make_config(audio_mode="pcm")) is True
     assert can_stream_pcm(make_config(audio_mode="wav")) is False
     assert can_stream_pcm(make_config(tts_engine="edge-tts")) is False
     assert can_stream_pcm(make_config(fish_audio_key="")) is False

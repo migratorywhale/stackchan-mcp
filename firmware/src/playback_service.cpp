@@ -7,6 +7,7 @@
 #include "face_service.h"
 #include "wav_parser.h"
 #include "audio_gate.h"
+#include "pcm_stream_service.h"
 
 struct PlaybackRuntimeState {
     size_t lipSyncOffset = 0;
@@ -63,11 +64,17 @@ static size_t s_pcmQueuedBytes = 0;
 static QueueHandle_t s_downloadCompleteQueue = nullptr;
 static bool s_downloadInFlight = false;
 static unsigned long s_lastSpeakerEndMs = 0;
+static uint8_t* s_stagedPcmData = nullptr;
+static size_t s_stagedPcmSize = 0;
+static size_t s_stagedPcmCapacity = 0;
+static String s_stagedPcmSessionId = "";
+static long s_stagedPcmNextSeq = 0;
 
 static void processAudioQueue();
+static void clearStagedPcmPlayback();
 
 static bool hasPendingPlaybackWork() {
-    return s_downloadInFlight || !s_audioQueue.empty() || !s_pcmQueue.empty();
+    return s_downloadInFlight || !s_audioQueue.empty() || !s_pcmQueue.empty() || isPcmStreamActive();
 }
 
 void clearQueuedPcmPlayback() {
@@ -77,7 +84,51 @@ void clearQueuedPcmPlayback() {
         free(dropped.data);
     }
     s_pcmQueuedBytes = 0;
+    clearStagedPcmPlayback();
     Serial.println("[PCM] Queue cleared");
+}
+
+static void clearStagedPcmPlayback() {
+    if (s_stagedPcmData) {
+        free(s_stagedPcmData);
+    }
+    s_stagedPcmData = nullptr;
+    s_stagedPcmSize = 0;
+    s_stagedPcmCapacity = 0;
+    s_stagedPcmSessionId = "";
+    s_stagedPcmNextSeq = 0;
+}
+
+static bool reserveStagedPcm(size_t requiredSize) {
+    if (requiredSize <= s_stagedPcmCapacity) {
+        return true;
+    }
+
+    size_t newCapacity = s_stagedPcmCapacity ? s_stagedPcmCapacity : (128 * 1024);
+    while (newCapacity < requiredSize) {
+        if (newCapacity > MAX_PCM_BYTES / 2) {
+            newCapacity = MAX_PCM_BYTES;
+            break;
+        }
+        newCapacity *= 2;
+    }
+    if (newCapacity < requiredSize || newCapacity > MAX_PCM_BYTES) {
+        return false;
+    }
+
+    uint8_t* newData = (uint8_t*)ps_malloc(newCapacity);
+    if (!newData) {
+        return false;
+    }
+    if (s_stagedPcmData && s_stagedPcmSize > 0) {
+        memcpy(newData, s_stagedPcmData, s_stagedPcmSize);
+    }
+    if (s_stagedPcmData) {
+        free(s_stagedPcmData);
+    }
+    s_stagedPcmData = newData;
+    s_stagedPcmCapacity = newCapacity;
+    return true;
 }
 
 static bool enqueuePcmBuffer(uint8_t* pcmData, size_t pcmSize, const String& sessionId, bool finalSegment) {
@@ -326,7 +377,7 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
         Serial.printf("[PCM] Invalid size: %u\n", (unsigned)pcmSize);
         return PCM_PLAYBACK_INVALID;
     }
-    if (s_isPlaying || M5.Speaker.isPlaying()) {
+    if (s_isPlaying || isPcmStreamActive() || M5.Speaker.isPlaying()) {
         if (s_playbackState.currentIsPcm && sessionId == s_playbackState.pcmSessionId &&
             enqueuePcmBuffer(pcmData, pcmSize, sessionId, finalSegment)) {
             return PCM_PLAYBACK_QUEUED;
@@ -408,6 +459,78 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
     logAudioMemory("pcm-start");
     audioGateLeave("pcm-play");
     return PCM_PLAYBACK_OK;
+}
+
+PcmPlaybackResult stagePcmPlayback(uint8_t* pcmData, size_t pcmSize, const String& sessionId, long seq, bool finalSegment) {
+    if (!pcmData || pcmSize == 0) {
+        Serial.println("[PCM] Empty staged segment");
+        return PCM_PLAYBACK_INVALID;
+    }
+    if (sessionId.length() == 0 || seq < 0) {
+        Serial.println("[PCM] Invalid staged metadata");
+        return PCM_PLAYBACK_INVALID;
+    }
+    if ((pcmSize % PCM_BYTES_PER_SAMPLE) != 0 || pcmSize > MAX_PCM_BYTES) {
+        Serial.printf("[PCM] Invalid staged size: %u\n", (unsigned)pcmSize);
+        return PCM_PLAYBACK_INVALID;
+    }
+    if (s_isPlaying || isPcmStreamActive() || M5.Speaker.isPlaying() || s_downloadInFlight ||
+        !s_audioQueue.empty() || !s_pcmQueue.empty()) {
+        Serial.printf("[PCM] Busy; refusing staged segment session=%s\n", sessionId.c_str());
+        return PCM_PLAYBACK_BUSY;
+    }
+
+    const bool newSession = sessionId != s_stagedPcmSessionId;
+    if (newSession) {
+        if (seq != 0) {
+            Serial.printf("[PCM] Staged seq mismatch for new session: got=%ld expected=0\n", seq);
+            return PCM_PLAYBACK_SESSION_MISMATCH;
+        }
+        clearStagedPcmPlayback();
+        s_stagedPcmSessionId = sessionId;
+    } else if (seq != s_stagedPcmNextSeq) {
+        Serial.printf("[PCM] Staged seq mismatch: session=%s got=%ld expected=%ld\n",
+                      sessionId.c_str(), seq, s_stagedPcmNextSeq);
+        return PCM_PLAYBACK_SESSION_MISMATCH;
+    }
+
+    if (pcmSize > MAX_PCM_BYTES - s_stagedPcmSize) {
+        Serial.printf("[PCM] Staged payload too large: current=%u segment=%u\n",
+                      (unsigned)s_stagedPcmSize, (unsigned)pcmSize);
+        clearStagedPcmPlayback();
+        return PCM_PLAYBACK_INVALID;
+    }
+    const size_t newSize = s_stagedPcmSize + pcmSize;
+    if (!reserveStagedPcm(newSize)) {
+        Serial.printf("[PCM] Staged alloc failed: required=%u\n", (unsigned)newSize);
+        clearStagedPcmPlayback();
+        free(pcmData);
+        return PCM_PLAYBACK_SPEAKER_FAILED;
+    }
+
+    memcpy(s_stagedPcmData + s_stagedPcmSize, pcmData, pcmSize);
+    s_stagedPcmSize = newSize;
+    s_stagedPcmNextSeq = seq + 1;
+    free(pcmData);
+
+    Serial.printf("[PCM] Staged segment: session=%s seq=%ld bytes=%u total=%u final=%s\n",
+                  sessionId.c_str(), seq, (unsigned)pcmSize, (unsigned)s_stagedPcmSize,
+                  finalSegment ? "true" : "false");
+
+    if (!finalSegment) {
+        return PCM_PLAYBACK_QUEUED;
+    }
+
+    uint8_t* stagedData = s_stagedPcmData;
+    size_t stagedSize = s_stagedPcmSize;
+    String stagedSession = s_stagedPcmSessionId;
+    s_stagedPcmData = nullptr;
+    s_stagedPcmSize = 0;
+    s_stagedPcmCapacity = 0;
+    s_stagedPcmSessionId = "";
+    s_stagedPcmNextSeq = 0;
+
+    return startPcmPlayback(stagedData, stagedSize, stagedSession, true);
 }
 
 // ════════════════════════════════════════
@@ -520,7 +643,7 @@ static void processAudioQueue() {
 bool enqueueAudioTask(const AudioTask& task) {
     AudioTask queuedTask = task;
     queuedTask.sequence = s_nextAudioSequence++;
-    if (s_isPlaying || s_downloadInFlight) {
+    if (s_isPlaying || s_downloadInFlight || isPcmStreamActive()) {
         if (s_audioQueue.size() >= MAX_AUDIO_QUEUE_DEPTH) {
             Serial.printf("[PLAY] Audio queue full; dropped: %s\n", queuedTask.voice_url.c_str());
             return false;
@@ -583,4 +706,8 @@ bool shouldResumeMic() {
 
 void clearMicResumeRequest() {
     s_micResumeRequested = false;
+}
+
+void requestMicResume() {
+    s_micResumeRequested = true;
 }

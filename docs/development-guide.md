@@ -217,11 +217,31 @@ WAV playback is push-based:
 The WAV playback path expects data suitable for the device. The MCP server
 converts generated TTS to 24 kHz, mono, signed 16-bit WAV.
 
-For lower latency speech, firmware also accepts `POST /play/pcm` with raw PCM:
+For lower latency speech, firmware accepts raw PCM without using WAV as the
+live transport:
+
+- TCP PCM stream on port `9090`: the MCP server sends
+  `STACKCHAN_PCM_STREAM/1 session=<id> rate=24000 channels=1 width=2\n`, waits
+  for `OK\n`, then sends raw 24 kHz mono signed 16-bit little-endian PCM until
+  TCP EOF. Firmware prebuffers about 120 ms, then writes 10 ms frames to an
+  ESP-IDF I2S DMA backend configured for the CoreS3 speaker amplifier. This path
+  is experimental until audible playback is verified on the device.
+- UDP PCM session: the MCP server starts `POST /audio/session`, receives a
+  session token and UDP port, then sends 10 ms `24 kHz` mono signed 16-bit
+  little-endian PCM frames as `SCP1` datagrams. Firmware tracks sequence
+  numbers, fills missing frames with silence, and writes frames through the same
+  I2S DMA backend. This remains available for experiments where lossy low-level
+  datagrams are acceptable.
+- HTTP staged PCM through `POST /play/pcm?mode=staged`: MCP sends bounded
+  segments with `X-Stackchan-Pcm-Mode: staged`; firmware joins them in PSRAM
+  and starts playback only after the final segment. This remains the fallback
+  PCM path when TCP cannot connect before playback starts.
+
+The legacy immediate HTTP PCM segment path remains available for direct tests:
 
 - Format: 24 kHz, mono, signed 16-bit little-endian.
 - Content type: `audio/x-raw;format=s16le;rate=24000;channels=1`.
-- MCP sends PCM in 48 KiB segments and firmware accepts later segments with
+- MCP can send PCM in 48 KiB segments and firmware accepts later segments with
   `202 Accepted` while the current PCM segment is playing.
 - Each PCM segment includes `session`, `seq`, and `final` metadata. MCP sends
   these as `X-Stackchan-Pcm-Session`, `X-Stackchan-Pcm-Seq`, and
@@ -253,23 +273,27 @@ For lower latency speech, firmware also accepts `POST /play/pcm` with raw PCM:
   MCP clients to fetch through `/audio`.
 - Playback timeout clears any queued PCM segments before resuming normal audio
   queue processing, so stale segments from a broken stream are not replayed.
-- The MCP server posts Fish PCM in bounded segments so playback can start
-  before the full TTS response has completed. Each segment is still sent as a
-  normal HTTP request with `Content-Length`, because the ESP32 `WebServer`
-  handler is not compatible with chunked request bodies.
-- The MCP server tries Fish Audio PCM streaming first when `TTS_ENGINE` is
-  `fish-audio` and `FISH_AUDIO_KEY` is set. If streaming setup or playback
-  fails before any PCM segment is accepted, it falls back to the existing WAV
-  `/play` path. If a later PCM segment fails after audio has started, MCP
-  returns an error instead of falling back to WAV to avoid duplicate speech.
-- Set `STACKCHAN_AUDIO_MODE=wav` to force the validated WAV path, `pcm` to
-  force PCM without fallback, or `auto` for the default behavior. Set
+- The MCP server defaults to `STACKCHAN_AUDIO_MODE=wav`, using the validated
+  `M5.Speaker` WAV path for normal speech.
+- Set `STACKCHAN_AUDIO_MODE=auto` or `pcm` only for PCM experiments. In those
+  modes the MCP server tries Fish Audio PCM first if `TTS_ENGINE` is
+  `fish-audio` and `FISH_AUDIO_KEY` is set. In `auto` mode, if PCM setup or
+  upload fails before audio starts, it falls back to the existing WAV `/play`
+  path. If PCM fails after audio has started, MCP returns an error instead of
+  falling back to WAV to avoid duplicate speech.
+- `STACKCHAN_PCM_TRANSPORT=tcp` selects the TCP PCM stream when PCM mode is
+  enabled. `auto` tries TCP, then staged HTTP PCM. Set
+  `STACKCHAN_PCM_TRANSPORT=staged` to skip streaming transports, or `tcp`/`udp`
+  to require a specific stream path. UDP is kept as an explicit experimental
+  path and is not used by transport `auto`.
+- Use `wav` for normal speech, `auto` for PCM with WAV fallback, or `pcm` to
+  force PCM without fallback. Set
   `STACKCHAN_SAVE_PCM=1` to save streamed Fish PCM as
-  `/tmp/stackchan_audio/diag_<session>.pcm` for offline inspection. PCM
-  streaming applies conservative gain/peak limiting before sending to the
-  device; tune with `STACKCHAN_PCM_GAIN` and `STACKCHAN_PCM_LIMIT`. It also
-  chooses segment boundaries near low-amplitude samples and smooths a short
-  ramp at PCM segment boundaries to reduce clicks from `playRaw()` transitions.
+  `/tmp/stackchan_audio/diag_<session>.pcm` for offline inspection. PCM applies
+  peak limiting with `STACKCHAN_PCM_GAIN` defaulting to `1.0` and
+  `STACKCHAN_PCM_LIMIT` defaulting to `0.90`. It also chooses segment
+  boundaries near low-amplitude samples and smooths a short ramp at PCM segment
+  boundaries.
 
 Safe playback smoke tests:
 
@@ -277,12 +301,11 @@ Safe playback smoke tests:
 # Non-destructive device reachability check.
 curl -sS --max-time 5 "http://$STACKCHAN_IP/face"
 
-# MCP TTS path. With Fish Audio credentials this tries segmented PCM first;
-# without them it uses the validated WAV fallback.
+# MCP TTS path. By default this uses the validated WAV path.
 MAC_IP="$MAC_IP" STACKCHAN_IP="$STACKCHAN_IP" \
   uv run python -m mcp_server.server
 
-# Force WAV for crackle/noise isolation.
+# Explicitly keep the stable WAV path for crackle/noise isolation.
 STACKCHAN_AUDIO_MODE=wav MAC_IP="$MAC_IP" STACKCHAN_IP="$STACKCHAN_IP" \
   uv run python -m mcp_server.server
 
@@ -393,10 +416,15 @@ Important environment variables:
 - `TTS_ENGINE`: `fish-audio` or `edge-tts`.
 - `FISH_AUDIO_KEY`: required for Fish Audio TTS/ASR.
 - `EDGE_TTS_BIN`: path to `edge-tts` when using the edge TTS fallback.
-- `STACKCHAN_AUDIO_MODE`: `auto`, `pcm`, or `wav`; useful for isolating PCM
-  streaming noise from WAV playback behavior.
+- `STACKCHAN_AUDIO_MODE`: `wav` by default; use `auto` to try PCM with WAV
+  fallback or `pcm` to force PCM without fallback.
+- `STACKCHAN_PCM_TRANSPORT`: `tcp` by default when PCM mode is enabled; use
+  `auto` for TCP/staged fallback, `staged` to force HTTP staged PCM, or
+  `tcp`/`udp` to require a specific stream path. UDP is experimental and only
+  used when explicitly selected.
+- `STACKCHAN_PCM_STREAM_PORT`: TCP PCM port, default `9090`.
 - `STACKCHAN_SAVE_PCM`: set to `1` to save streamed PCM diagnostic files.
-- `STACKCHAN_PCM_GAIN`: PCM streaming gain before playback, default `0.75`.
+- `STACKCHAN_PCM_GAIN`: PCM streaming gain before playback, default `1.0`.
 - `STACKCHAN_PCM_LIMIT`: PCM streaming peak limit as full-scale ratio, default
   `0.90`.
 - `STACKCHAN_PCM_DECLICK_SAMPLES`: samples smoothed at each PCM segment

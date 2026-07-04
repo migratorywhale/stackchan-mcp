@@ -153,18 +153,19 @@ serial behavior is a WAV validation error and no speaker playback.
 
 ## 2026-05-29 Follow-up: MCP PCM Streaming Noise
 
-After the WAV download fix, crackling still occurred during normal MCP speech.
-That path now uses Fish Audio PCM streaming by default, so the follow-up work
-focused on the `/play/pcm` route rather than the WAV `/play` route.
+After the WAV download fix, crackling still occurred during Fish Audio PCM
+speech. Later follow-up work focused on the `/play/pcm` route rather than the
+WAV `/play` route. The host now defaults to `STACKCHAN_AUDIO_MODE=wav` for
+normal speech; use `auto` or `pcm` only when explicitly testing PCM transports.
 
 Additional mitigations now in place:
 
-- `STACKCHAN_AUDIO_MODE=auto|pcm|wav` can force PCM or WAV for isolation.
+- `STACKCHAN_AUDIO_MODE=auto|pcm|wav` can select PCM or WAV for isolation.
 - `STACKCHAN_SAVE_PCM=1` saves the original Fish PCM stream under
   `/tmp/stackchan_audio/diag_<session>.pcm`.
 - PCM streaming applies host-side gain and limiting before device playback:
-  `STACKCHAN_PCM_GAIN` defaults to `0.75`, and `STACKCHAN_PCM_LIMIT` defaults
-  to `0.90`.
+  `STACKCHAN_PCM_GAIN` defaults to `1.0`, and `STACKCHAN_PCM_LIMIT` defaults to
+  `0.90`.
 - PCM segments are cut near a low-amplitude sample when possible
   (`STACKCHAN_PCM_ZERO_CROSS_WINDOW`, default `256`) and get a short de-click
   ramp at the next segment start (`STACKCHAN_PCM_DECLICK_SAMPLES`, default

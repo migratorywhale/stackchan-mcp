@@ -1,3 +1,5 @@
+import socket
+import struct
 import time
 from contextlib import suppress
 
@@ -5,7 +7,10 @@ import requests
 
 from .stackchan_config import (
     PCM_CONTENT_TYPE,
+    PCM_SAMPLE_RATE,
     PCM_SAMPLE_WIDTH,
+    PCM_UDP_FRAME_BYTES,
+    PCM_UDP_FRAME_MS,
     StackchanConfig,
 )
 
@@ -74,6 +79,25 @@ class StackchanClient:
     def playback_status(self) -> dict:
         return requests.get(f"{self.base_url}/playback/status", timeout=self.config.http_status_timeout).json()
 
+    def start_audio_session(self) -> dict:
+        return requests.post(
+            f"{self.base_url}/audio/session",
+            json={
+                "codec": "pcm_s16le",
+                "sample_rate": PCM_SAMPLE_RATE,
+                "channels": 1,
+                "sample_width": PCM_SAMPLE_WIDTH,
+                "frame_ms": PCM_UDP_FRAME_MS,
+            },
+            timeout=self.config.http_command_timeout,
+        ).json()
+
+    def stop_audio_session(self, session_id: str) -> dict:
+        return requests.delete(
+            f"{self.base_url}/audio/session/{session_id}",
+            timeout=self.config.http_command_timeout,
+        ).json()
+
     def move(self, x: float, y: float, speed: int) -> dict:
         return requests.post(
             f"{self.base_url}/move",
@@ -132,7 +156,10 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
         )
         declicked_samples += declicked
         last_segment_tail_sample = struct.unpack_from("<h", segment, len(segment) - PCM_SAMPLE_WIDTH)[0]
-        url = f"{client.base_url}/play/pcm?session={session_id}&seq={segment_index}&final={1 if final else 0}"
+        url = (
+            f"{client.base_url}/play/pcm?session={session_id}&seq={segment_index}"
+            f"&final={1 if final else 0}&mode=staged"
+        )
         try:
             resp = requests.post(
                 url,
@@ -142,6 +169,7 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
                     "X-Stackchan-Pcm-Session": session_id,
                     "X-Stackchan-Pcm-Seq": str(segment_index),
                     "X-Stackchan-Pcm-Final": "1" if final else "0",
+                    "X-Stackchan-Pcm-Mode": "staged",
                 },
                 timeout=client.config.pcm_segment_post_timeout,
             )
@@ -160,7 +188,8 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
 
         if not result.get("success"):
             raise PcmPlaybackError(f"PCM segment play failed: {result}", started=started)
-        started = True
+        if not result.get("staged"):
+            started = True
         if first_segment_ms is None:
             first_segment_ms = round((time.perf_counter() - started_at) * 1000)
         segment_index += 1
@@ -263,4 +292,353 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
     )
     if saved_pcm_path is not None:
         result.setdefault("saved_pcm", str(saved_pcm_path))
+    return result
+
+
+def post_pcm_tcp_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_processing) -> dict:
+    import uuid
+
+    started_at = time.perf_counter()
+    session_id = uuid.uuid4().hex
+    first_chunk_ms = None
+    first_send_ms = None
+    total_input_size = 0
+    total_sent_size = 0
+    limited_samples = 0
+    pending_sample_bytes = b""
+    saved_pcm_path = audio_dir / f"diag_{session_id}.pcm" if client.config.save_pcm else None
+    saved_pcm_file = saved_pcm_path.open("wb") if saved_pcm_path is not None else None
+    initial_buffer = bytearray()
+    chunks_iter = iter(pcm_chunks)
+    accepted = False
+    exhausted = False
+
+    def condition_chunk(chunk: bytes) -> bytes:
+        nonlocal first_chunk_ms, limited_samples, pending_sample_bytes, total_input_size
+        if not chunk:
+            return b""
+        if first_chunk_ms is None:
+            first_chunk_ms = round((time.perf_counter() - started_at) * 1000)
+        total_input_size += len(chunk)
+        if total_input_size > client.config.max_pcm_payload_bytes:
+            raise ValueError(
+                f"PCM payload too large: {total_input_size} bytes exceeds "
+                f"{client.config.max_pcm_payload_bytes} byte limit"
+            )
+        if saved_pcm_file is not None:
+            saved_pcm_file.write(chunk)
+        if pending_sample_bytes:
+            chunk = pending_sample_bytes + chunk
+            pending_sample_bytes = b""
+        if len(chunk) % PCM_SAMPLE_WIDTH != 0:
+            pending_sample_bytes = chunk[-(len(chunk) % PCM_SAMPLE_WIDTH) :]
+            chunk = chunk[: -(len(chunk) % PCM_SAMPLE_WIDTH)]
+        if not chunk:
+            return b""
+        conditioned_chunk, limited = audio_processing.condition_pcm_chunk(
+            chunk,
+            gain=client.config.pcm_gain,
+            limit=client.config.pcm_limit,
+        )
+        limited_samples += limited
+        return conditioned_chunk
+
+    def next_conditioned_chunk() -> bytes | None:
+        nonlocal exhausted
+        for chunk in chunks_iter:
+            conditioned = condition_chunk(chunk)
+            if conditioned:
+                return conditioned
+        exhausted = True
+        return None
+
+    try:
+        while len(initial_buffer) < client.config.pcm_stream_initial_buffer_bytes:
+            chunk = next_conditioned_chunk()
+            if chunk is None:
+                break
+            initial_buffer.extend(chunk)
+            elapsed = time.perf_counter() - started_at
+            if client.config.pcm_first_segment_timeout > 0 and elapsed > client.config.pcm_first_segment_timeout:
+                raise ValueError(
+                    "PCM stream initial buffer timeout: "
+                    f"{len(initial_buffer)} bytes buffered in {elapsed:.1f}s"
+                )
+        if exhausted and pending_sample_bytes:
+            raise ValueError(f"invalid PCM payload size: trailing {len(pending_sample_bytes)} byte partial sample")
+        if not initial_buffer:
+            raise ValueError("invalid PCM payload size: 0")
+
+        address = (client.config.stackchan_ip, client.config.pcm_stream_port)
+        header = (
+            f"STACKCHAN_PCM_STREAM/1 session={session_id} rate={PCM_SAMPLE_RATE} "
+            "channels=1 width=2\n"
+        ).encode("ascii")
+        try:
+            with socket.create_connection(address, timeout=client.config.pcm_stream_connect_timeout) as sock:
+                sock.settimeout(client.config.pcm_stream_io_timeout)
+                sock.sendall(header)
+                response = bytearray()
+                while not response.endswith(b"\n") and len(response) < 80:
+                    chunk = sock.recv(1)
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+                if response != b"OK\n":
+                    message = response.decode("ascii", errors="replace").strip() or "no response"
+                    raise PcmPlaybackError(f"PCM TCP stream rejected: {message}", started=False)
+                accepted = True
+
+                sock.sendall(initial_buffer)
+                total_sent_size += len(initial_buffer)
+                first_send_ms = round((time.perf_counter() - started_at) * 1000)
+
+                while True:
+                    chunk = next_conditioned_chunk()
+                    if chunk is None:
+                        break
+                    sock.sendall(chunk)
+                    total_sent_size += len(chunk)
+                if pending_sample_bytes:
+                    raise PcmPlaybackError(
+                        f"invalid PCM payload size: trailing {len(pending_sample_bytes)} byte partial sample",
+                        started=True,
+                    )
+        except PcmPlaybackError:
+            raise
+        except OSError as exc:
+            raise PcmPlaybackError(f"PCM TCP stream failed: {exc}", started=accepted) from exc
+    finally:
+        if saved_pcm_file is not None:
+            saved_pcm_file.close()
+
+    result = {
+        "success": True,
+        "session": session_id,
+        "transport": "tcp",
+        "total_bytes": total_input_size,
+        "sent_bytes": total_sent_size,
+        "pcm_gain": client.config.pcm_gain,
+        "pcm_limit": client.config.pcm_limit,
+        "limited_samples": limited_samples,
+        "timing_ms": {
+            "pcm_total": round((time.perf_counter() - started_at) * 1000),
+            "fish_first_chunk": first_chunk_ms,
+            "first_stream_send": first_send_ms,
+        },
+    }
+    if saved_pcm_path is not None:
+        result["saved_pcm"] = str(saved_pcm_path)
+    return result
+
+
+def status_int(status: dict, *keys: str) -> int:
+    for key in keys:
+        value = status.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def wait_for_udp_completion_status(client: StackchanClient, session_id: str) -> dict:
+    timeout = min(max(client.config.playback_start_timeout, 0.5), 3.0)
+    interval = max(client.config.playback_poll_interval, 0.05)
+    deadline = time.monotonic() + timeout
+    last_status: dict = {}
+    while time.monotonic() < deadline:
+        try:
+            last_status = client.playback_status()
+        except requests.RequestException:
+            break
+        current_session = str(last_status.get("udp_audio_session") or "")
+        udp_active = bool(last_status.get("udp_audio_active") or last_status.get("udp_audio_playing"))
+        if not udp_active and current_session in {"", session_id}:
+            return last_status
+        time.sleep(interval)
+    return last_status
+
+
+def post_pcm_udp_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_processing) -> dict:
+    import uuid
+
+    started_at = time.perf_counter()
+    diagnostic_id = uuid.uuid4().hex
+    first_chunk_ms = None
+    first_send_ms = None
+    total_input_size = 0
+    total_sent_size = 0
+    limited_samples = 0
+    pending_sample_bytes = b""
+    frame_buffer = bytearray()
+    seq = 0
+    session_id = ""
+    accepted = False
+    saved_pcm_path = audio_dir / f"diag_{diagnostic_id}.pcm" if client.config.save_pcm else None
+    saved_pcm_file = saved_pcm_path.open("wb") if saved_pcm_path is not None else None
+
+    session = client.start_audio_session()
+    if not session.get("success"):
+        raise PcmPlaybackError(f"PCM UDP session failed: {session}", started=False)
+    accepted = True
+    session_id = str(session.get("session", ""))
+    token = int(session.get("token", 0))
+    udp_port = int(session.get("udp_port", 0))
+    if not session_id or token == 0 or udp_port <= 0:
+        raise PcmPlaybackError(f"PCM UDP session returned invalid metadata: {session}", started=False)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(client.config.pcm_stream_io_timeout)
+    address = (client.config.stackchan_ip, udp_port)
+    frame_seconds = (PCM_UDP_FRAME_MS / 1000.0) * client.config.udp_pace_factor
+    burst_frames = max(1, int(40 / PCM_UDP_FRAME_MS))
+    pacing_started_at: float | None = None
+    next_send_at: float | None = None
+
+    def send_frame(frame: bytes, *, end: bool = False) -> None:
+        nonlocal first_send_ms, pacing_started_at, next_send_at, seq, total_sent_size
+        now = time.perf_counter()
+        if not end and pacing_started_at is not None and seq >= burst_frames and next_send_at is not None:
+            delay = next_send_at - now
+            if delay > 0:
+                time.sleep(delay)
+                now = time.perf_counter()
+        flags = 1 if end else 0
+        payload = b"" if end else frame
+        header = struct.pack(
+            "<4sBBHIIIHH",
+            b"SCP1",
+            1,
+            flags,
+            24,
+            token,
+            seq,
+            seq * (PCM_SAMPLE_RATE * PCM_UDP_FRAME_MS // 1000),
+            len(payload),
+            0,
+        )
+        packet = header + payload
+        sock.sendto(packet, address)
+        if not end:
+            total_sent_size += len(payload)
+            if first_send_ms is None:
+                first_send_ms = round((time.perf_counter() - started_at) * 1000)
+                pacing_started_at = time.perf_counter()
+                next_send_at = pacing_started_at
+            seq += 1
+            if pacing_started_at is not None and seq >= burst_frames:
+                base = max(now, next_send_at or now)
+                next_send_at = base + frame_seconds
+
+    def condition_chunk(chunk: bytes) -> bytes:
+        nonlocal first_chunk_ms, limited_samples, pending_sample_bytes, total_input_size
+        if not chunk:
+            return b""
+        if first_chunk_ms is None:
+            first_chunk_ms = round((time.perf_counter() - started_at) * 1000)
+        total_input_size += len(chunk)
+        if total_input_size > client.config.max_pcm_payload_bytes:
+            raise PcmPlaybackError(
+                f"PCM payload too large: {total_input_size} bytes exceeds "
+                f"{client.config.max_pcm_payload_bytes} byte limit",
+                started=accepted,
+            )
+        if saved_pcm_file is not None:
+            saved_pcm_file.write(chunk)
+        if pending_sample_bytes:
+            chunk = pending_sample_bytes + chunk
+            pending_sample_bytes = b""
+        if len(chunk) % PCM_SAMPLE_WIDTH != 0:
+            pending_sample_bytes = chunk[-(len(chunk) % PCM_SAMPLE_WIDTH) :]
+            chunk = chunk[: -(len(chunk) % PCM_SAMPLE_WIDTH)]
+        if not chunk:
+            return b""
+        conditioned_chunk, limited = audio_processing.condition_pcm_chunk(
+            chunk,
+            gain=client.config.pcm_gain,
+            limit=client.config.pcm_limit,
+        )
+        limited_samples += limited
+        return conditioned_chunk
+
+    try:
+        for chunk in pcm_chunks:
+            conditioned = condition_chunk(chunk)
+            if not conditioned:
+                continue
+            frame_buffer.extend(conditioned)
+            elapsed = time.perf_counter() - started_at
+            if first_send_ms is None and client.config.pcm_first_segment_timeout > 0 and elapsed > client.config.pcm_first_segment_timeout:
+                raise ValueError(
+                    "PCM UDP first frame timeout: "
+                    f"{len(frame_buffer)} bytes buffered in {elapsed:.1f}s"
+                )
+            while len(frame_buffer) >= PCM_UDP_FRAME_BYTES:
+                send_frame(bytes(frame_buffer[:PCM_UDP_FRAME_BYTES]))
+                del frame_buffer[:PCM_UDP_FRAME_BYTES]
+        if pending_sample_bytes:
+            raise PcmPlaybackError(
+                f"invalid PCM payload size: trailing {len(pending_sample_bytes)} byte partial sample",
+                started=accepted,
+            )
+        if frame_buffer:
+            frame_buffer.extend(b"\x00" * (PCM_UDP_FRAME_BYTES - len(frame_buffer)))
+            send_frame(bytes(frame_buffer))
+        if seq == 0:
+            raise ValueError("invalid PCM payload size: 0")
+        for _ in range(3):
+            send_frame(b"", end=True)
+            time.sleep(0.005)
+    except OSError as exc:
+        raise PcmPlaybackError(f"PCM UDP stream failed: {exc}", started=accepted) from exc
+    finally:
+        sock.close()
+        if saved_pcm_file is not None:
+            saved_pcm_file.close()
+
+    completion_status = wait_for_udp_completion_status(client, session_id)
+    frames_received = status_int(completion_status, "udp_last_frames_received", "frames_received")
+    frames_lost = status_int(completion_status, "udp_last_frames_lost", "frames_lost")
+    underruns = status_int(completion_status, "udp_last_underruns", "underruns")
+    end_reason = str(completion_status.get("udp_last_end_reason") or "")
+
+    result = {
+        "success": True,
+        "session": session_id,
+        "transport": "udp",
+        "frames": seq,
+        "segments": seq,
+        "total_bytes": total_input_size,
+        "sent_bytes": total_sent_size,
+        "pcm_gain": client.config.pcm_gain,
+        "pcm_limit": client.config.pcm_limit,
+        "limited_samples": limited_samples,
+        "timing_ms": {
+            "pcm_total": round((time.perf_counter() - started_at) * 1000),
+            "fish_first_chunk": first_chunk_ms,
+            "first_udp_frame": first_send_ms,
+        },
+        "udp_pace_factor": client.config.udp_pace_factor,
+        "udp_frames_received": frames_received,
+        "udp_frames_lost": frames_lost,
+        "udp_underruns": underruns,
+        "udp_end_reason": end_reason,
+    }
+    if saved_pcm_path is not None:
+        result["saved_pcm"] = str(saved_pcm_path)
+    if completion_status and (
+        frames_lost > 0
+        or underruns > 0
+        or (frames_received > 0 and frames_received < seq)
+        or (end_reason and end_reason != "end")
+    ):
+        raise PcmPlaybackError(
+            "PCM UDP playback incomplete: "
+            f"sent_frames={seq} received={frames_received} "
+            f"lost={frames_lost} underruns={underruns} reason={end_reason or '?'}",
+            started=True,
+        )
     return result

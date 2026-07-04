@@ -1,5 +1,6 @@
 #include <M5Unified.h>
 #include <WebServer.h>
+#include <uri/UriBraces.h>
 #include <ArduinoJson.h>
 #include "http_server.h"
 #include "types.h"
@@ -11,6 +12,7 @@
 #include "recording_store.h"
 #include "pcm_upload.h"
 #include "audio_gate.h"
+#include "pcm_stream_service.h"
 
 static WebServer server(80);
 
@@ -20,6 +22,7 @@ static long     s_pcm_diag_next_seq = 0;
 static const char* PCM_HEADER_SESSION = "X-Stackchan-Pcm-Session";
 static const char* PCM_HEADER_SEQ = "X-Stackchan-Pcm-Seq";
 static const char* PCM_HEADER_FINAL = "X-Stackchan-Pcm-Final";
+static const char* PCM_HEADER_MODE = "X-Stackchan-Pcm-Mode";
 
 // ────────────────────────────────────────────
 // POST /play
@@ -92,6 +95,8 @@ static void handlePlayPcm() {
     long seq = seqArg.length() ? seqArg.toInt() : -1;
     String finalArg = headerOrArg(PCM_HEADER_FINAL, "final");
     bool finalSegment = finalArg == "1" || finalArg == "true";
+    String pcmMode = headerOrArg(PCM_HEADER_MODE, "mode");
+    bool stagedMode = pcmMode == "staged" || server.arg("staged") == "1" || server.arg("defer") == "1";
     uint8_t* pcmData = upload.data;
 
     long expectedSeq = s_pcm_diag_next_seq;
@@ -113,7 +118,9 @@ static void handlePlayPcm() {
         server.send(409, "application/json", "{\"success\":false,\"error\":\"pcm seq invalid\"}");
         return;
     }
-    PcmPlaybackResult result = startPcmPlayback(pcmData, pcmSize, sessionId, finalSegment);
+    PcmPlaybackResult result = stagedMode
+        ? stagePcmPlayback(pcmData, pcmSize, sessionId, seq, finalSegment)
+        : startPcmPlayback(pcmData, pcmSize, sessionId, finalSegment);
     if (result != PCM_PLAYBACK_OK && result != PCM_PLAYBACK_QUEUED) {
         if (result != PCM_PLAYBACK_SPEAKER_FAILED) {
             free(pcmData);
@@ -139,14 +146,19 @@ static void handlePlayPcm() {
     }
     s_pcm_diag_next_seq = seq + 1;
 
-    Serial.printf("[HTTP] POST /play/pcm -> session=%s seq=%ld bytes=%u final=%s result=%d queued=%s\n",
+    Serial.printf("[HTTP] POST /play/pcm -> session=%s seq=%ld bytes=%u final=%s mode=%s result=%d queued=%s\n",
                   sessionId.c_str(), seq, (unsigned)pcmSize,
-                  finalSegment ? "true" : "false", result,
+                  finalSegment ? "true" : "false", stagedMode ? "staged" : "stream",
+                  result,
                   result == PCM_PLAYBACK_QUEUED ? "true" : "false");
     if (result == PCM_PLAYBACK_QUEUED) {
-        server.send(202, "application/json", "{\"success\":true,\"queued\":true,\"format\":\"s16le\",\"sample_rate\":24000,\"channels\":1}");
+        if (stagedMode) {
+            server.send(202, "application/json", "{\"success\":true,\"queued\":true,\"staged\":true,\"format\":\"s16le\",\"sample_rate\":24000,\"channels\":1}");
+        } else {
+            server.send(202, "application/json", "{\"success\":true,\"queued\":true,\"staged\":false,\"format\":\"s16le\",\"sample_rate\":24000,\"channels\":1}");
+        }
     } else {
-        server.send(200, "application/json", "{\"success\":true,\"queued\":false,\"format\":\"s16le\",\"sample_rate\":24000,\"channels\":1}");
+        server.send(200, "application/json", "{\"success\":true,\"queued\":false,\"staged\":false,\"format\":\"s16le\",\"sample_rate\":24000,\"channels\":1}");
     }
 }
 
@@ -346,14 +358,46 @@ static void handleServoStatus() {
 // ────────────────────────────────────────────
 static void handlePlaybackStatus() {
     PlaybackStatus playback = getPlaybackStatus();
+    PcmStreamStatus stream = getPcmStreamStatus();
     ServoStatus servo = getServoStatus();
     AudioGateStatus audio = getAudioGateStatus();
 
     JsonDocument doc;
-    doc["playing"] = playback.playing;
-    doc["kind"] = playback.pcm ? "pcm" : (playback.playing ? "wav" : "idle");
+    bool streamActive = stream.active || stream.playing;
+    bool udpActive = stream.udpActive || stream.udpPlaying;
+    doc["playing"] = playback.playing || streamActive || udpActive;
+    doc["kind"] = udpActive ? "udp_pcm" : (streamActive ? "pcm_stream" : (playback.pcm ? "pcm" : (playback.playing ? "wav" : "idle")));
     doc["pcm_session"] = playback.pcmSession;
     doc["pcm_final_segment"] = playback.pcmFinalSegment;
+    doc["pcm_stream_enabled"] = stream.enabled;
+    doc["pcm_stream_port"] = stream.port;
+    doc["pcm_stream_active"] = stream.active;
+    doc["pcm_stream_playing"] = stream.playing;
+    doc["pcm_stream_client_connected"] = stream.clientConnected;
+    doc["pcm_stream_session"] = stream.session;
+    doc["pcm_stream_buffered_bytes"] = stream.bufferedBytes;
+    doc["pcm_stream_total_bytes"] = stream.totalBytes;
+    doc["pcm_stream_underruns"] = stream.underruns;
+    doc["udp_audio_enabled"] = stream.udpEnabled;
+    doc["udp_audio_active"] = stream.udpActive;
+    doc["udp_audio_playing"] = stream.udpPlaying;
+    doc["udp_audio_session"] = stream.udpSession;
+    doc["udp_audio_port"] = stream.udpPort;
+    doc["udp_audio_token"] = stream.udpToken;
+    doc["udp_audio_buffered_frames"] = stream.udpBufferedFrames;
+    doc["jitter_ms"] = (unsigned)(stream.udpBufferedFrames * 10);
+    doc["udp_audio_buffered_bytes"] = stream.udpBufferedBytes;
+    doc["frames_received"] = stream.udpFramesReceived;
+    doc["frames_lost"] = stream.udpFramesLost;
+    doc["frames_late"] = stream.udpFramesLate;
+    doc["underruns"] = stream.udpUnderruns;
+    doc["first_audio_ms"] = stream.udpFirstAudioMs;
+    doc["udp_last_end_reason"] = stream.udpLastEndReason;
+    doc["udp_last_frames_received"] = stream.udpLastFramesReceived;
+    doc["udp_last_frames_lost"] = stream.udpLastFramesLost;
+    doc["udp_last_frames_late"] = stream.udpLastFramesLate;
+    doc["udp_last_underruns"] = stream.udpLastUnderruns;
+    doc["udp_last_first_audio_ms"] = stream.udpLastFirstAudioMs;
     doc["current_bytes"] = playback.currentBytes;
     doc["queued_pcm_bytes"] = playback.queuedPcmBytes;
     doc["queued_pcm_segments"] = playback.queuedPcmSegments;
@@ -379,6 +423,70 @@ static void handlePlaybackStatus() {
     String body;
     serializeJson(doc, body);
     server.send(200, "application/json", body);
+}
+
+static bool validateAudioSessionBody() {
+    if (!server.hasArg("plain") || server.arg("plain").length() == 0) {
+        return true;
+    }
+    JsonDocument req;
+    if (deserializeJson(req, server.arg("plain")) != DeserializationError::Ok) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"json parse error\"}");
+        return false;
+    }
+    const char* codec = req["codec"] | "pcm_s16le";
+    int sampleRate = req["sample_rate"] | 24000;
+    int channels = req["channels"] | 1;
+    int sampleWidth = req["sample_width"] | 2;
+    int frameMs = req["frame_ms"] | 10;
+    if (strcmp(codec, "pcm_s16le") != 0 || sampleRate != 24000 ||
+        channels != 1 || sampleWidth != 2 || frameMs != 10) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"unsupported audio session format\"}");
+        return false;
+    }
+    return true;
+}
+
+static void handleAudioSessionStart() {
+    if (!validateAudioSessionBody()) {
+        return;
+    }
+    UdpPcmSessionResult result = beginUdpPcmSession();
+    if (!result.success) {
+        String body = "{\"success\":false,\"error\":\"";
+        body += result.error;
+        body += "\"}";
+        server.send(409, "application/json", body);
+        return;
+    }
+
+    JsonDocument doc;
+    doc["success"] = true;
+    doc["session"] = result.session;
+    doc["transport"] = "udp";
+    doc["codec"] = "pcm_s16le";
+    doc["sample_rate"] = 24000;
+    doc["channels"] = 1;
+    doc["sample_width"] = 2;
+    doc["frame_ms"] = 10;
+    doc["jitter_ms"] = 40;
+    doc["start_buffer_ms"] = 40;
+    doc["udp_port"] = result.port;
+    doc["token"] = result.token;
+    String body;
+    serializeJson(doc, body);
+    server.send(200, "application/json", body);
+}
+
+static void handleAudioSessionStop() {
+    String prefix = "/audio/session/";
+    String uri = server.uri();
+    String sessionId = uri.startsWith(prefix) ? uri.substring(prefix.length()) : "";
+    if (!stopUdpPcmSession(sessionId)) {
+        server.send(404, "application/json", "{\"success\":false,\"error\":\"session not active\"}");
+        return;
+    }
+    server.send(200, "application/json", "{\"success\":true}");
 }
 
 // ────────────────────────────────────────────
@@ -442,10 +550,13 @@ void initHttpServer() {
         PCM_HEADER_SESSION,
         PCM_HEADER_SEQ,
         PCM_HEADER_FINAL,
+        PCM_HEADER_MODE,
     };
     server.collectHeaders(headerKeys, sizeof(headerKeys) / sizeof(headerKeys[0]));
     server.on("/play",         HTTP_POST, handlePlay);
     server.on("/play/pcm",     HTTP_POST, handlePlayPcm, handlePlayPcmRaw);
+    server.on("/audio/session", HTTP_POST, handleAudioSessionStart);
+    server.on(UriBraces("/audio/session/{}"), HTTP_DELETE, handleAudioSessionStop);
     server.on("/mode",         HTTP_POST, handleMode);
     server.on("/audio/status", HTTP_GET,  handleAudioStatus);
     server.on("/audio",        HTTP_GET,  handleAudio);

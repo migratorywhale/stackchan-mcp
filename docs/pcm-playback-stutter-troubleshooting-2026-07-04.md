@@ -76,14 +76,17 @@ Fish Audio WAV/zh mode=wav timing[tts=1653ms validate=0ms status=268ms play_post
 - A configurable `STACKCHAN_PCM_FIRST_SEGMENT_TIMEOUT(_SEC)` was added as a
   guard for slow pre-playback PCM startup, though it does not solve slow segment
   upload after playback has begun.
+- Follow-up firmware and host changes now provide non-WAV PCM paths for
+  experiments: TCP sends raw 24 kHz mono s16le over a reliable socket, and UDP
+  sends framed datagrams. The normal MCP speech path remains WAV until audible
+  PCM playback is verified on the device.
 
 ## Follow-up Options
 
-- Keep production speech on `STACKCHAN_AUDIO_MODE=wav` until PCM transport is
-  redesigned.
-- For a real PCM fix, avoid host-to-device raw PCM push for continuous audio:
-  consider a firmware pull model, larger device-side buffering, or SD-backed
-  staging before playback.
+- Use `STACKCHAN_AUDIO_MODE=wav` for normal speech. Use `auto` only when testing
+  PCM with WAV fallback, `pcm` to force PCM without fallback, `tcp`/`staged` to
+  isolate PCM transport behavior, or `udp` to require the experimental UDP
+  stream.
 - If PCM is kept for experiments, add per-segment post timing telemetry to
   confirm whether bottlenecks are Fish streaming, HTTP upload, or firmware
   queue handling.

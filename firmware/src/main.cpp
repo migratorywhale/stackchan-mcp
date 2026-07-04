@@ -9,6 +9,7 @@
 #include "mic_service.h"
 #include "wifi_manager.h"
 #include "playback_service.h"
+#include "pcm_stream_service.h"
 #include "face_service.h"
 #include "servo_service.h"
 #include "camera_service.h"
@@ -44,6 +45,7 @@ void setup() {
 
     connectWiFi();
     initPlayback();
+    initPcmStreamService();
     initHttpServer();
 }
 void loop() {

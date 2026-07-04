@@ -9,7 +9,13 @@ import requests
 from . import audio_processing
 from .audio_server import AUDIO_DIR, audio_url, start_audio_server
 from .listening import capture_ready_recording, format_listen_result
-from .stackchan_client import PcmPlaybackError, StackchanClient, post_pcm_stream
+from .stackchan_client import (
+    PcmPlaybackError,
+    StackchanClient,
+    post_pcm_stream,
+    post_pcm_tcp_stream,
+    post_pcm_udp_stream,
+)
 from .stackchan_config import VALID_FACES, StackchanConfig, config_summary
 from .telemetry import emit_event, new_request_id
 from .voice_inbox import clear_events, format_events, read_events
@@ -35,6 +41,12 @@ def format_timing_ms(timings: dict[str, object]) -> str:
         if value is not None:
             parts.append(f"{key}={value}ms")
     return " timing[" + " ".join(parts) + "]" if parts else ""
+
+
+def format_speech_confirmation(text: str) -> str:
+    preview = text[:60]
+    suffix = "…" if len(text) > 60 else ""
+    return f"🗣️ Stack-chan is saying: \"{preview}{suffix}\""
 
 
 def check_audio_dir() -> dict[str, object]:
@@ -76,6 +88,31 @@ def build_health_report(client: StackchanClient, config: StackchanConfig) -> dic
     return report
 
 
+def post_preferred_pcm_stream(client: StackchanClient, text: str, lang: str, config: StackchanConfig) -> dict:
+    def pcm_chunks():
+        return audio_processing.iter_fish_pcm_stream(text, lang, config)
+
+    if config.pcm_transport == "staged":
+        result = post_pcm_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing)
+        result.setdefault("transport", "staged")
+        return result
+
+    if config.pcm_transport in {"auto", "tcp"}:
+        try:
+            return post_pcm_tcp_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing)
+        except PcmPlaybackError as exc:
+            if exc.started or config.pcm_transport == "tcp":
+                raise
+            logger.warning("Falling back from TCP PCM to staged PCM: %s", exc)
+
+    if config.pcm_transport == "udp":
+        return post_pcm_udp_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing)
+
+    result = post_pcm_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing)
+    result.setdefault("transport", "staged")
+    return result
+
+
 def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_cls):
     @mcp.tool()
     def stackchan_say(text: str, lang: str = "zh") -> str:
@@ -88,14 +125,10 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
             if can_stream_pcm(config):
                 pcm_started = time.perf_counter()
                 try:
-                    result = post_pcm_stream(
-                        client,
-                        audio_processing.iter_fish_pcm_stream(text, lang, config),
-                        AUDIO_DIR,
-                        audio_processing,
-                    )
+                    result = post_preferred_pcm_stream(client, text, lang, config)
                     if result.get("success"):
                         diag = (
+                            f" transport={result.get('transport', 'staged')}"
                             f" session={result.get('session', '?')}"
                             f" segments={result.get('segments', '?')}"
                             f" bytes={result.get('total_bytes', '?')}"
@@ -112,6 +145,7 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
                             attributes={
                                 "stackchan.audio.path": "pcm",
                                 "stackchan.audio.mode": config.audio_mode,
+                                "stackchan.pcm.transport": result.get("transport", "staged"),
                                 "stackchan.tts.engine": config.tts_engine,
                                 "stackchan.lang": lang,
                                 "stackchan.text.length": len(text),
@@ -122,10 +156,8 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
                         )
                         if result.get("saved_pcm"):
                             diag += f" saved={result['saved_pcm']}"
-                        return (
-                            f"🗣️ Stack-chan is saying: \"{text[:60]}{'…' if len(text)>60 else ''}\" "
-                            f"[Fish Audio PCM/{lang}{diag}{format_timing_ms(timings)}]"
-                        )
+                        logger.info("PCM speech accepted: lang=%s%s%s", lang, diag, format_timing_ms(timings))
+                        return format_speech_confirmation(text)
                     pcm_fallback_reason = f"PCM play returned {result}"
                     if config.audio_mode == "pcm":
                         return f"❌ PCM play failed: {result}"
@@ -217,11 +249,15 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
                         **{f"stackchan.latency.{key}_ms": value for key, value in wav_timing.items()},
                     },
                 )
-                return (
-                    f"🗣️ Stack-chan is saying: \"{text[:60]}{'…' if len(text)>60 else ''}\" "
-                    f"[{engine} WAV/{lang} mode={config.audio_mode}{fallback_note}"
-                    f"{format_timing_ms(wav_timing)}]"
+                logger.info(
+                    "WAV speech accepted: engine=%s lang=%s mode=%s%s%s",
+                    engine,
+                    lang,
+                    config.audio_mode,
+                    fallback_note,
+                    format_timing_ms(wav_timing),
                 )
+                return format_speech_confirmation(text)
             emit_event(
                 "stackchan.say.failed",
                 body="Playback request failed",

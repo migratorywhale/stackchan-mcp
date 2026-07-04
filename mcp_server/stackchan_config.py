@@ -91,10 +91,16 @@ class StackchanConfig:
     audio_serve_port: int
     tts_engine: str
     audio_mode: str
+    pcm_transport: str
     save_pcm: bool
     pcm_gain: float
     pcm_limit: float
     pcm_segment_bytes: int
+    pcm_stream_port: int
+    pcm_stream_initial_buffer_bytes: int
+    pcm_stream_connect_timeout: float
+    pcm_stream_io_timeout: float
+    udp_pace_factor: float
     max_pcm_payload_bytes: int
     pcm_declick_samples: int
     pcm_zero_cross_window: int
@@ -118,12 +124,18 @@ class StackchanConfig:
 
 
 VALID_AUDIO_MODES = {"auto", "pcm", "wav"}
+VALID_PCM_TRANSPORTS = {"auto", "udp", "tcp", "staged"}
 PCM_SAMPLE_RATE = 24000
 PCM_CHANNELS = 1
 PCM_SAMPLE_WIDTH = 2
 PCM_CONTENT_TYPE = "audio/x-raw;format=s16le;rate=24000;channels=1"
 MAX_PCM_PAYLOAD_BYTES = 2 * 1024 * 1024
 PCM_SEGMENT_BYTES = 48 * 1024
+PCM_STREAM_PORT = 9090
+PCM_UDP_PORT = 9091
+PCM_UDP_FRAME_MS = 10
+PCM_UDP_FRAME_BYTES = (PCM_SAMPLE_RATE * PCM_UDP_FRAME_MS // 1000) * PCM_SAMPLE_WIDTH
+PCM_STREAM_INITIAL_BUFFER_BYTES = 96 * 1024
 FISH_STREAM_CHUNK_BYTES = 4096
 DEFAULT_AUDIO_DIR = str(Path(tempfile.gettempdir()) / "stackchan_audio")
 VALID_FACES = ("calm", "thinking", "happy", "sleepy", "shy", "smug", "pouty")
@@ -147,16 +159,25 @@ def config_summary(config: StackchanConfig) -> dict[str, Any]:
             "save_pcm": config.save_pcm,
         },
         "pcm": {
+            "transport": config.pcm_transport,
             "sample_rate": PCM_SAMPLE_RATE,
             "channels": PCM_CHANNELS,
             "sample_width": PCM_SAMPLE_WIDTH,
             "segment_bytes": config.pcm_segment_bytes,
+            "stream_port": config.pcm_stream_port,
+            "udp_port": PCM_UDP_PORT,
+            "udp_frame_ms": PCM_UDP_FRAME_MS,
+            "udp_frame_bytes": PCM_UDP_FRAME_BYTES,
+            "udp_pace_factor": config.udp_pace_factor,
+            "stream_initial_buffer_bytes": config.pcm_stream_initial_buffer_bytes,
             "max_payload_bytes": config.max_pcm_payload_bytes,
             "gain": config.pcm_gain,
             "limit": config.pcm_limit,
             "declick_samples": config.pcm_declick_samples,
             "zero_cross_window": config.pcm_zero_cross_window,
             "first_segment_timeout": config.pcm_first_segment_timeout,
+            "stream_connect_timeout": config.pcm_stream_connect_timeout,
+            "stream_io_timeout": config.pcm_stream_io_timeout,
         },
         "tts": {
             "engine": config.tts_engine,
@@ -185,10 +206,14 @@ def config_summary(config: StackchanConfig) -> dict[str, Any]:
 def load_config() -> StackchanConfig:
     load_dotenv()
 
-    audio_mode = os.environ.get("STACKCHAN_AUDIO_MODE", "auto").lower()
+    audio_mode = os.environ.get("STACKCHAN_AUDIO_MODE", "wav").lower()
     if audio_mode not in VALID_AUDIO_MODES:
-        logger.warning("Invalid STACKCHAN_AUDIO_MODE=%s; using auto", audio_mode)
-        audio_mode = "auto"
+        logger.warning("Invalid STACKCHAN_AUDIO_MODE=%s; using wav", audio_mode)
+        audio_mode = "wav"
+    pcm_transport = os.environ.get("STACKCHAN_PCM_TRANSPORT", os.environ.get("STACKCHAN_AUDIO_TRANSPORT", "tcp")).lower()
+    if pcm_transport not in VALID_PCM_TRANSPORTS:
+        logger.warning("Invalid STACKCHAN_PCM_TRANSPORT=%s; using auto", pcm_transport)
+        pcm_transport = "auto"
 
     pcm_segment_bytes = clamp_int(
         env_int("STACKCHAN_PCM_SEGMENT_BYTES", PCM_SEGMENT_BYTES),
@@ -204,7 +229,7 @@ def load_config() -> StackchanConfig:
         pcm_segment_bytes,
         64 * 1024 * 1024,
     )
-    pcm_gain = max(0.0, min(env_float("STACKCHAN_PCM_GAIN", 0.75), 1.0))
+    pcm_gain = max(0.0, min(env_float("STACKCHAN_PCM_GAIN", 1.0), 1.0))
     pcm_limit = max(0.1, min(env_float("STACKCHAN_PCM_LIMIT", 0.90), 1.0))
     pcm_declick_samples = max(
         0,
@@ -222,10 +247,26 @@ def load_config() -> StackchanConfig:
         audio_serve_port=int(os.environ.get("AUDIO_SERVE_PORT", 5060)),
         tts_engine=os.environ.get("TTS_ENGINE", "fish-audio"),
         audio_mode=audio_mode,
+        pcm_transport=pcm_transport,
         save_pcm=env_bool("STACKCHAN_SAVE_PCM"),
         pcm_gain=pcm_gain,
         pcm_limit=pcm_limit,
         pcm_segment_bytes=pcm_segment_bytes,
+        pcm_stream_port=clamp_int(env_int("STACKCHAN_PCM_STREAM_PORT", PCM_STREAM_PORT), 1, 65535),
+        pcm_stream_initial_buffer_bytes=clamp_int(
+            env_int("STACKCHAN_PCM_STREAM_INITIAL_BUFFER_BYTES", PCM_STREAM_INITIAL_BUFFER_BYTES),
+            PCM_SAMPLE_WIDTH,
+            MAX_PCM_PAYLOAD_BYTES,
+        ),
+        pcm_stream_connect_timeout=env_float_any(
+            ("STACKCHAN_PCM_STREAM_CONNECT_TIMEOUT", "STACKCHAN_PCM_STREAM_CONNECT_TIMEOUT_SEC"),
+            3.0,
+        ),
+        pcm_stream_io_timeout=env_float_any(
+            ("STACKCHAN_PCM_STREAM_IO_TIMEOUT", "STACKCHAN_PCM_STREAM_IO_TIMEOUT_SEC"),
+            30.0,
+        ),
+        udp_pace_factor=max(1.0, min(env_float("STACKCHAN_UDP_PACE_FACTOR", 1.0), 1.5)),
         max_pcm_payload_bytes=max_pcm_payload_bytes,
         pcm_declick_samples=pcm_declick_samples,
         pcm_zero_cross_window=pcm_zero_cross_window,

@@ -6,6 +6,7 @@ void updatePlayback();
 bool isPlaybackActive();
 bool shouldResumeMic();
 void clearMicResumeRequest();
+void requestMicResume();
 bool enqueueAudioTask(const AudioTask& task);
 enum PcmPlaybackResult {
     PCM_PLAYBACK_OK,
@@ -31,5 +32,6 @@ struct PlaybackStatus {
     unsigned long deadlineMs = 0;
 };
 PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const String& sessionId, bool finalSegment);
+PcmPlaybackResult stagePcmPlayback(uint8_t* pcmData, size_t pcmSize, const String& sessionId, long seq, bool finalSegment);
 void clearQueuedPcmPlayback();
 PlaybackStatus getPlaybackStatus();
