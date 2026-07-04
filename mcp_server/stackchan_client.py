@@ -114,6 +114,7 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
     first_chunk_ms = None
     first_segment_ms = None
     pending_segment = None
+    pending_sample_bytes = b""
     limited_samples = 0
     declicked_samples = 0
     last_segment_tail_sample = None
@@ -182,6 +183,24 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
                 raise ValueError(message)
             if saved_pcm_file is not None:
                 saved_pcm_file.write(chunk)
+            if pending_sample_bytes:
+                chunk = pending_sample_bytes + chunk
+                pending_sample_bytes = b""
+            if len(chunk) % PCM_SAMPLE_WIDTH != 0:
+                pending_sample_bytes = chunk[-(len(chunk) % PCM_SAMPLE_WIDTH) :]
+                chunk = chunk[: -(len(chunk) % PCM_SAMPLE_WIDTH)]
+            if not chunk:
+                continue
+            elapsed = time.perf_counter() - started_at
+            if (
+                not started
+                and client.config.pcm_first_segment_timeout > 0
+                and elapsed > client.config.pcm_first_segment_timeout
+            ):
+                raise ValueError(
+                    "PCM first segment timeout: "
+                    f"{len(buffer) + len(chunk)} bytes buffered in {elapsed:.1f}s"
+                )
             conditioned_chunk, limited = audio_processing.condition_pcm_chunk(
                 chunk,
                 gain=client.config.pcm_gain,
@@ -205,6 +224,11 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
 
         if not buffer and pending_segment is None and last_result is None:
             raise ValueError("invalid PCM payload size: 0")
+        if pending_sample_bytes:
+            message = f"invalid PCM payload size: trailing {len(pending_sample_bytes)} byte partial sample"
+            if started:
+                raise PcmPlaybackError(message, started=True)
+            raise ValueError(message)
         if len(buffer) % PCM_SAMPLE_WIDTH != 0:
             message = f"invalid PCM payload size: {len(buffer)}"
             if started:

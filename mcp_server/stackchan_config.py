@@ -98,6 +98,7 @@ class StackchanConfig:
     max_pcm_payload_bytes: int
     pcm_declick_samples: int
     pcm_zero_cross_window: int
+    pcm_first_segment_timeout: float
     http_play_timeout: float
     http_audio_timeout: float
     http_status_timeout: float
@@ -155,6 +156,7 @@ def config_summary(config: StackchanConfig) -> dict[str, Any]:
             "limit": config.pcm_limit,
             "declick_samples": config.pcm_declick_samples,
             "zero_cross_window": config.pcm_zero_cross_window,
+            "first_segment_timeout": config.pcm_first_segment_timeout,
         },
         "tts": {
             "engine": config.tts_engine,
@@ -227,6 +229,10 @@ def load_config() -> StackchanConfig:
         max_pcm_payload_bytes=max_pcm_payload_bytes,
         pcm_declick_samples=pcm_declick_samples,
         pcm_zero_cross_window=pcm_zero_cross_window,
+        pcm_first_segment_timeout=env_float_any(
+            ("STACKCHAN_PCM_FIRST_SEGMENT_TIMEOUT", "STACKCHAN_PCM_FIRST_SEGMENT_TIMEOUT_SEC"),
+            3.0,
+        ),
         http_play_timeout=env_float_any(("STACKCHAN_HTTP_PLAY_TIMEOUT", "STACKCHAN_HTTP_PLAY_TIMEOUT_SEC"), 5.0),
         http_audio_timeout=env_float_any(("STACKCHAN_HTTP_AUDIO_TIMEOUT", "STACKCHAN_HTTP_AUDIO_TIMEOUT_SEC"), 10.0),
         http_status_timeout=env_float_any(("STACKCHAN_HTTP_STATUS_TIMEOUT", "STACKCHAN_HTTP_STATUS_TIMEOUT_SEC"), 3.0),

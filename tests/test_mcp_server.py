@@ -83,6 +83,7 @@ def make_config(**overrides):
         "playback_start_timeout": 5.0,
         "playback_poll_interval": 0.2,
         "pcm_segment_post_timeout": 30.0,
+        "pcm_first_segment_timeout": 3.0,
         "fish_tts_timeout": 30.0,
         "fish_asr_timeout": 15.0,
         "fish_stream_chunk_bytes": 4096,
@@ -273,6 +274,7 @@ def test_config_reads_pcm_and_timeout_env_aliases(monkeypatch):
     monkeypatch.setenv("STACKCHAN_PCM_MAX_PAYLOAD_BYTES", "1048576")
     monkeypatch.setenv("STACKCHAN_PLAYBACK_START_TIMEOUT_SEC", "7.5")
     monkeypatch.setenv("STACKCHAN_PCM_SEGMENT_POST_TIMEOUT_SEC", "22")
+    monkeypatch.setenv("STACKCHAN_PCM_FIRST_SEGMENT_TIMEOUT_SEC", "4.5")
     monkeypatch.setenv("STACKCHAN_FISH_STREAM_CHUNK_BYTES", "8192")
 
     config = load_config()
@@ -281,6 +283,7 @@ def test_config_reads_pcm_and_timeout_env_aliases(monkeypatch):
     assert config.max_pcm_payload_bytes == 1048576
     assert config.playback_start_timeout == 7.5
     assert config.pcm_segment_post_timeout == 22
+    assert config.pcm_first_segment_timeout == 4.5
     assert config.fish_stream_chunk_bytes == 8192
 
 
@@ -797,6 +800,34 @@ def test_post_pcm_stream_posts_binary_payload_with_content_length(monkeypatch, t
     assert headers["X-Stackchan-Pcm-Seq"] == "0"
     assert headers["X-Stackchan-Pcm-Final"] == "1"
     assert "final=1" in request_kwargs["args"][0]
+
+
+def test_post_pcm_stream_handles_split_sample_boundaries(monkeypatch, tmp_path):
+    request_kwargs = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"success": True}
+
+    def fake_post(*args, **kwargs):
+        request_kwargs["args"] = args
+        request_kwargs["kwargs"] = kwargs
+        return FakeResponse()
+
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.post", fake_post)
+
+    result = post_pcm_stream(
+        StackchanClient(make_config()),
+        iter([b"\xe8", b"\x03\x18", b"\xfc"]),
+        tmp_path,
+        audio_processing,
+    )
+
+    assert result["success"] is True
+    assert request_kwargs["kwargs"]["data"] == struct.pack("<hh", 750, -750)
 
 
 def test_wait_for_playback_start_detects_started_ms_change(monkeypatch):
