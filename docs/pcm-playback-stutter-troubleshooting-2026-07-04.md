@@ -12,9 +12,9 @@
 - Non-destructive device checks:
 
 ```sh
-curl -sS --max-time 5 http://10.83.20.187/playback/status
-curl -sS --max-time 5 http://10.83.20.187/audio/status
-curl -sS --max-time 5 http://10.83.20.187/face
+curl -sS --max-time 5 http://$STACKCHAN_IP/playback/status
+curl -sS --max-time 5 http://$STACKCHAN_IP/audio/status
+curl -sS --max-time 5 http://$STACKCHAN_IP/face
 ```
 
 - `/playback/status` showed `queued_pcm_segments=0`, `audio_queue_depth=0`,
