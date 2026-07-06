@@ -364,7 +364,8 @@ It uses RMS thresholds to trigger recording and to end after silence.
   to the frontend.
 - The upload receiver serves a minimal recorder page at `/`. Mobile browsers
   usually require HTTPS before `navigator.mediaDevices.getUserMedia` exists, so
-  phone tests need a tunnel or another HTTPS wrapper. If using `cloudflared
+  phone tests need a tunnel or another HTTPS wrapper. Prefer `tailscale serve`
+  for this — see `docs/tailscale-deployment.md` — over a public tunnel. If using `cloudflared
   tunnel --url`, pass an empty config such as
   `--config /tmp/empty-cloudflared.yml`; otherwise the existing
   `~/.cloudflared/config.yml` named-tunnel ingress rules can intercept the

@@ -78,7 +78,19 @@ export FISH_AUDIO_KEY="your_key_here"    # Fish Audio API key
 For Streamable HTTP mode, `./start-http.sh` also reads project-root `.env`
 overrides such as `STACKCHAN_PORT`, `MCP_PYTHON`, `STACKCHAN_PUBLIC_MCP_URL`,
 `STACKCHAN_ENABLE_PUBLIC_MCP_TUNNEL`, and `STACKCHAN_LOG_DIR`. Public MCP
-tunnel startup is disabled unless `STACKCHAN_ENABLE_PUBLIC_MCP_TUNNEL=1`.
+tunnel startup is disabled unless `STACKCHAN_ENABLE_PUBLIC_MCP_TUNNEL=1`, and
+that path is optional/advanced — it must be fronted by authentication if
+enabled (see below).
+
+**Recommended: private access over Tailscale.** For remote access to the MCP
+server, prefer a private [Tailscale](https://tailscale.com/) tailnet over a
+public tunnel: only your enrolled devices can reach the server, and there is
+no public hostname to leak. See
+[`docs/tailscale-deployment.md`](docs/tailscale-deployment.md) for setup,
+including the loopback-plus-`tailscale serve` pattern, phone microphone
+access over trusted HTTPS, and tailnet ACLs. The public `cloudflared` tunnel
+below remains supported for devices that cannot join your tailnet, but keep
+the `STACKCHAN_MCP_AUTH_TOKEN` bearer check in front of it either way.
 
 For local secrets and host-specific values, copy `.env.example` to `.env` and
 edit the copy. `.env` is gitignored; do not commit API keys, upload tokens,
@@ -220,8 +232,14 @@ STACKCHAN_VOICE_WAKE_WORDS="小塔,机器人" \
 ```
 
 The receiver also serves a small recorder page at `/`. On mobile browsers,
-microphone access usually requires HTTPS. For a temporary phone test, run the
-receiver with a one-off upload token, then expose it through a quick tunnel:
+microphone access usually requires HTTPS. **Recommended:** use `tailscale
+serve` to get trusted HTTPS entirely inside your tailnet — see
+[`docs/tailscale-deployment.md`](docs/tailscale-deployment.md#3-phone-microphone--voice-upload-the-https-catch).
+The public quick-tunnel flow below is an optional/advanced fallback for
+phones that aren't on your tailnet; if you use it, protect it with the
+upload token shown here (and ideally Cloudflare Access) and don't reuse a
+previously public hostname. For a temporary phone test, run the receiver
+with a one-off upload token, then expose it through a quick tunnel:
 
 ```bash
 # Terminal 1: local receiver with token protection.
