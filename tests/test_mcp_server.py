@@ -11,6 +11,10 @@ from typing import Any
 
 import pytest
 import requests
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+from starlette.testclient import TestClient
 
 from mcp_server import audio_processing
 from mcp_server.audio_server import audio_url
@@ -21,6 +25,7 @@ from mcp_server.mcp_tools import (
     post_preferred_pcm_stream,
     register_tools,
 )
+from mcp_server.server import BearerAuthMiddleware, ensure_http_auth_configured
 from mcp_server.stackchan_client import (
     PcmPlaybackError,
     StackchanClient,
@@ -33,10 +38,12 @@ from mcp_server.stackchan_config import (
     PCM_SEGMENT_BYTES,
     PCM_UDP_FRAME_BYTES,
     StackchanConfig,
+    config_summary,
     load_config,
 )
 from mcp_server.voice_inbox import append_event, clear_events, format_events, read_events
 from scripts import (
+    ci_security_audit,
     stackchan_frontend_session,
     stackchan_frontend_wake,
     stackchan_voice_upload_server,
@@ -110,6 +117,7 @@ def make_config(**overrides):
         "fish_audio_key": "test-key",
         "fish_audio_model_zh": "zh-model",
         "fish_audio_model_en": "en-model",
+        "mcp_auth_token": "",
     }
     values.update(overrides)
     return StackchanConfig(**values)
@@ -447,6 +455,81 @@ def test_config_reads_pcm_and_timeout_env_aliases(monkeypatch):
     assert config.pcm_segment_post_timeout == 22
     assert config.pcm_first_segment_timeout == 4.5
     assert config.fish_stream_chunk_bytes == 8192
+
+
+def test_config_loads_mcp_auth_token_from_env(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_MCP_AUTH_TOKEN", "s3cr3t-token-value")
+
+    config = load_config()
+
+    assert config.mcp_auth_token == "s3cr3t-token-value"
+
+
+def test_config_summary_reports_mcp_auth_token_configured_without_leaking_value():
+    configured_summary = config_summary(make_config(mcp_auth_token="s3cr3t-token-value"))
+    assert configured_summary["mcp_auth_token_configured"] is True
+    assert "s3cr3t-token-value" not in json.dumps(configured_summary)
+
+    unconfigured_summary = config_summary(make_config(mcp_auth_token=""))
+    assert unconfigured_summary["mcp_auth_token_configured"] is False
+
+
+def test_ensure_http_auth_configured_fails_closed_without_token():
+    with pytest.raises(RuntimeError, match="STACKCHAN_MCP_AUTH_TOKEN"):
+        ensure_http_auth_configured(make_config(mcp_auth_token=""))
+
+    assert ensure_http_auth_configured(make_config(mcp_auth_token="s3cr3t-token-value")) is None
+
+
+def test_bearer_auth_middleware_requires_matching_token():
+    async def whoami(request):
+        return JSONResponse({"ok": True})
+
+    app = Starlette(routes=[Route("/whoami", whoami)])
+    app.add_middleware(BearerAuthMiddleware, token="s3cr3t-token-value")
+    client = TestClient(app)
+
+    assert client.get("/whoami").status_code == 401
+    assert client.get("/whoami", headers={"Authorization": "s3cr3t-token-value"}).status_code == 401
+    assert client.get("/whoami", headers={"Authorization": "Bearer wrong-token"}).status_code == 401
+    response = client.get("/whoami", headers={"Authorization": "Bearer s3cr3t-token-value"})
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+def test_ci_audit_flags_committed_mcp_auth_token():
+    errors: list[str] = []
+    # Built at runtime (not a literal assignment) so this test fixture never
+    # itself looks like a committed secret to the audit it exercises.
+    fake_token_value = "deadbeef" + "cafebabe1234"
+    text = f'STACKCHAN_MCP_AUTH_TOKEN="{fake_token_value}"\n'
+
+    ci_security_audit.check_tokens(ci_security_audit.ROOT / "fake.env", text, errors)
+
+    assert len(errors) == 1
+    assert "STACKCHAN_MCP_AUTH_TOKEN" in errors[0]
+
+
+def test_ci_audit_flags_retired_tunnel_hostname():
+    errors: list[str] = []
+    # Split so the retired hostname never appears contiguously in this source file.
+    retired_hostname = "stackchan." + "migratory" + "bird" + ".xyz"
+    text = f"legacy tunnel: {retired_hostname}\n"
+
+    ci_security_audit.check_forbidden_hostnames(ci_security_audit.ROOT / "fake.txt", text, errors)
+
+    assert len(errors) == 1
+    assert "retired tunnel hostname" in errors[0]
+
+
+def test_ci_audit_clean_text_passes_token_and_hostname_checks():
+    errors: list[str] = []
+    text = 'STACKCHAN_MCP_AUTH_TOKEN=""\nlegacy tunnel: stackchan.example.com\n'
+
+    ci_security_audit.check_tokens(ci_security_audit.ROOT / "clean.env", text, errors)
+    ci_security_audit.check_forbidden_hostnames(ci_security_audit.ROOT / "clean.env", text, errors)
+
+    assert errors == []
 
 
 def test_voice_bridge_env_loader_does_not_override_existing_values(monkeypatch, tmp_path):

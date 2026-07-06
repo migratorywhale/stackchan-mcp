@@ -121,6 +121,7 @@ class StackchanConfig:
     fish_audio_key: str
     fish_audio_model_zh: str
     fish_audio_model_en: str
+    mcp_auth_token: str = ""
 
 
 VALID_AUDIO_MODES = {"auto", "pcm", "wav"}
@@ -187,6 +188,7 @@ def config_summary(config: StackchanConfig) -> dict[str, Any]:
             "fish_audio_model_en_configured": bool(config.fish_audio_model_en),
             "fish_stream_chunk_bytes": config.fish_stream_chunk_bytes,
         },
+        "mcp_auth_token_configured": bool(config.mcp_auth_token),
         "timeouts": {
             "http_play": config.http_play_timeout,
             "http_audio": config.http_audio_timeout,
@@ -309,4 +311,5 @@ def load_config() -> StackchanConfig:
         fish_audio_key=os.environ.get("FISH_AUDIO_KEY", ""),
         fish_audio_model_zh=os.environ.get("FISH_AUDIO_MODEL_ZH", ""),
         fish_audio_model_en=os.environ.get("FISH_AUDIO_MODEL_EN", ""),
+        mcp_auth_token=os.environ.get("STACKCHAN_MCP_AUTH_TOKEN", ""),
     )

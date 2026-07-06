@@ -19,7 +19,7 @@ FORBIDDEN_TRACKED_FILES = {
 
 TOKEN_ASSIGNMENT_RE = re.compile(
     r"""(?<![A-Za-z0-9_${])
-        (?P<name>FISH_AUDIO_KEY|STACKCHAN_UPLOAD_TOKEN|STACKCHAN_FRONTEND_TOKEN)
+        (?P<name>FISH_AUDIO_KEY|STACKCHAN_UPLOAD_TOKEN|STACKCHAN_FRONTEND_TOKEN|STACKCHAN_MCP_AUTH_TOKEN)
         \s*[:=]\s*
         (?P<quote>["']?)
         (?P<value>[A-Za-z0-9_./+=:@-]+)
@@ -31,6 +31,11 @@ TRYCLOUDFLARE_RE = re.compile(r"https?://(?!\.\.\.)([A-Za-z0-9-]+)\.trycloudflar
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 ACTION_USE_RE = re.compile(r"^\s*uses:\s*(?P<target>[^#\s]+)", re.MULTILINE)
 PINNED_ACTION_RE = re.compile(r"@[0-9a-fA-F]{40}$")
+
+# Retired tunnel hostnames that must never reappear in tracked files. Built from
+# split literals below so this module's own source never contains the
+# contiguous substring it is checking for.
+FORBIDDEN_HOSTNAME_SUBSTRINGS = ("migratory" "bird",)
 
 PLACEHOLDER_VALUES = {
     "",
@@ -67,6 +72,7 @@ def main() -> int:
         check_private_ips(path, text, errors)
         check_public_tunnel_urls(path, text, errors)
         check_tokens(path, text, errors)
+        check_forbidden_hostnames(path, text, errors)
         if path.match(".github/workflows/*.yml") or path.match(".github/workflows/*.yaml"):
             check_action_pins(path, text, errors)
 
@@ -149,6 +155,13 @@ def check_tokens(path: Path, text: str, errors: list[str]) -> None:
             continue
         if value.lower() not in PLACEHOLDER_VALUES:
             errors.append(f"{relpath(path)} contains non-placeholder {match.group('name')} value")
+
+
+def check_forbidden_hostnames(path: Path, text: str, errors: list[str]) -> None:
+    lowered = text.lower()
+    for substring in FORBIDDEN_HOSTNAME_SUBSTRINGS:
+        if substring in lowered:
+            errors.append(f"{relpath(path)} contains retired tunnel hostname '{substring}...'")
 
 
 def check_action_pins(path: Path, text: str, errors: list[str]) -> None:

@@ -21,6 +21,7 @@ STACKCHAN_MCP_HTTP_PORT="${STACKCHAN_MCP_HTTP_PORT:-8002}"
 MCP_PYTHON="${MCP_PYTHON:-}"
 MCP_MODULE="${MCP_MODULE:-mcp_server.server}"
 STACKCHAN_PUBLIC_MCP_URL="${STACKCHAN_PUBLIC_MCP_URL:-}"
+STACKCHAN_MCP_AUTH_TOKEN="${STACKCHAN_MCP_AUTH_TOKEN:-}"
 STACKCHAN_ENABLE_PUBLIC_MCP_TUNNEL="${STACKCHAN_ENABLE_PUBLIC_MCP_TUNNEL:-0}"
 STACKCHAN_LOG_DIR="${STACKCHAN_LOG_DIR:-/tmp}"
 STACKCHAN_MCP_STOP_GRACE_SEC="${STACKCHAN_MCP_STOP_GRACE_SEC:-1}"
@@ -75,8 +76,13 @@ sleep "$STACKCHAN_TUNNEL_WAIT_SEC"
 echo ""
 echo "=== Status ==="
 if [ -n "$STACKCHAN_PUBLIC_MCP_URL" ]; then
+    CURL_AUTH_ARGS=()
+    if [ -n "$STACKCHAN_MCP_AUTH_TOKEN" ]; then
+        CURL_AUTH_ARGS=(-H "Authorization: Bearer ${STACKCHAN_MCP_AUTH_TOKEN}")
+    fi
     if curl -s --max-time "$STACKCHAN_MCP_HEALTH_TIMEOUT_SEC" "$STACKCHAN_PUBLIC_MCP_URL" -X POST \
         -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+        "${CURL_AUTH_ARGS[@]}" \
         -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' 2>&1 | grep -q "serverInfo"; then
         echo "✅ $STACKCHAN_PUBLIC_MCP_URL → Streamable HTTP OK"
     else
