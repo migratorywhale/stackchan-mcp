@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Any
 
 
+class SessionResolutionError(RuntimeError):
+    pass
+
+
 def default_registry_path() -> Path:
     return Path(os.environ.get("STACKCHAN_FRONTEND_REGISTRY", "web-sessions.json"))
 
@@ -19,11 +23,11 @@ def load_sessions(path: str | Path | None = None) -> list[dict[str, Any]]:
     try:
         raw = json.loads(registry_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        raise SystemExit(f"session registry not found: {registry_path}") from None
+        raise SessionResolutionError(f"session registry not found: {registry_path}") from None
     except json.JSONDecodeError as exc:
-        raise SystemExit(f"session registry is not valid JSON: {registry_path}: {exc}") from None
+        raise SessionResolutionError(f"session registry is not valid JSON: {registry_path}: {exc}") from None
     if not isinstance(raw, list):
-        raise SystemExit(f"session registry must be a JSON array: {registry_path}")
+        raise SessionResolutionError(f"session registry must be a JSON array: {registry_path}")
     return [item for item in raw if isinstance(item, dict)]
 
 
@@ -73,11 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    session = select_session(
-        load_sessions(args.registry),
-        title=args.title,
-        include_archived=args.include_archived,
-    )
+    try:
+        session = select_session(
+            load_sessions(args.registry),
+            title=args.title,
+            include_archived=args.include_archived,
+        )
+    except SessionResolutionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     if not session:
         print("no matching frontend session", file=sys.stderr)
         return 1

@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import importlib.util
 import json
@@ -50,6 +51,7 @@ from scripts import (
     stackchan_voice_upload_server,
 )
 from scripts.stackchan_voice_bridge import (
+    forward_event_to_frontend,
     load_env_file,
     load_frontend_token,
     should_append_to_inbox,
@@ -951,6 +953,40 @@ def test_frontend_session_selects_latest_by_title():
 
     assert selected is not None
     assert selected["id"] == "room4-new"
+
+
+def test_load_sessions_missing_registry_raises_session_resolution_error(tmp_path):
+    missing_path = tmp_path / "does-not-exist.json"
+
+    with pytest.raises(stackchan_frontend_session.SessionResolutionError):
+        stackchan_frontend_session.load_sessions(missing_path)
+
+
+def test_forward_event_to_frontend_survives_missing_registry(tmp_path, monkeypatch):
+    missing_registry = tmp_path / "web-sessions.json"
+    monkeypatch.setenv("STACKCHAN_FRONTEND_REGISTRY", str(missing_registry))
+
+    args = argparse.Namespace(
+        wake_session_id="latest",
+        wake_session_title="",
+        wake_url="",
+        wake_token="",
+        wake_model="",
+        wake_timeout=3,
+        wake_retries=0,
+        wake_retry_delay=0,
+        wake_no_force=False,
+        wake_quiet_minutes=0,
+        prompt_prefix="",
+        wake_words="",
+    )
+
+    result = forward_event_to_frontend({"type": "transcript", "text": "hi"}, args)
+
+    assert result is not None
+    assert result["ok"] is False
+    assert "skipped" in result
+    assert "web-sessions.json" in result["skipped"] or "session registry not found" in result["skipped"]
 
 
 def test_voice_inbox_appends_reads_formats_and_clears(tmp_path):

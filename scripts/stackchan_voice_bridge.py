@@ -12,7 +12,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.stackchan_frontend_session import load_sessions, select_session  # noqa: E402
+from scripts.stackchan_frontend_session import (  # noqa: E402
+    SessionResolutionError,
+    load_sessions,
+    select_session,
+)
 from scripts.stackchan_frontend_wake import (  # noqa: E402
     DEFAULT_PROMPT_PREFIX,
     forward_to_frontend,
@@ -84,18 +88,21 @@ def resolve_wake_session(session_id: str, title: str = "") -> str:
     if title:
         session = select_session(load_sessions(), title=title)
         if not session:
-            raise SystemExit(f"no matching frontend session title: {title}")
+            raise SessionResolutionError(f"no matching frontend session title: {title}")
         return str(session.get("id") or "")
     if session_id in {"latest", "auto"}:
         session = select_session(load_sessions())
         if not session:
-            raise SystemExit("no non-archived frontend session found")
+            raise SessionResolutionError("no non-archived frontend session found")
         return str(session.get("id") or "")
     return session_id
 
 
 def forward_event_to_frontend(event: dict[str, Any], args: argparse.Namespace) -> dict[str, Any] | None:
-    wake_session_id = resolve_wake_session(args.wake_session_id, args.wake_session_title)
+    try:
+        wake_session_id = resolve_wake_session(args.wake_session_id, args.wake_session_title)
+    except SessionResolutionError as exc:
+        return {"ok": False, "skipped": f"frontend session not resolved: {exc}"}
     wake_url = args.wake_url
     if not wake_url and wake_session_id:
         wake_url = "http://127.0.0.1:3200/wake"

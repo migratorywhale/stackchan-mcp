@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import logging
 import os
 import re
 import sys
@@ -26,6 +27,7 @@ from mcp_server.audio_server import AUDIO_DIR  # noqa: E402
 from mcp_server.stackchan_config import StackchanConfig, load_config  # noqa: E402
 from mcp_server.telemetry import emit_event, new_request_id  # noqa: E402
 from mcp_server.voice_inbox import append_event, resolve_inbox_path  # noqa: E402
+from scripts.stackchan_frontend_session import SessionResolutionError  # noqa: E402
 from scripts.stackchan_frontend_wake import (  # noqa: E402
     forward_to_frontend,
     parse_wake_words,
@@ -36,6 +38,8 @@ from scripts.stackchan_voice_bridge import (  # noqa: E402
     resolve_wake_session,
     should_append_to_inbox,
 )
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 DEFAULT_UPLOAD_RATE_PER_MINUTE = 12
@@ -647,13 +651,16 @@ class VoiceUploadHandler(BaseHTTPRequestHandler):
         frontend_started = time.perf_counter()
         try:
             wake_session_id = resolve_frontend_wake_session(self.voice_server.options)
-        except SystemExit as exc:
+        except SessionResolutionError as exc:
             wake_session_id = ""
             frontend = {
                 "ok": False,
                 "skipped": f"frontend session not resolved: {exc}",
                 "timing_ms": {"wake_total": 0},
             }
+            logger.warning(
+                "frontend wake session unresolved; skipping wake forward, upload still recorded: %s", exc
+            )
         else:
             frontend = forward_to_frontend(
                 event,
