@@ -49,6 +49,15 @@ def format_speech_confirmation(text: str) -> str:
     return f"🗣️ Stack-chan is saying: \"{preview}{suffix}\""
 
 
+def audit_tool_call(name: str, **attributes: object) -> None:
+    parts = []
+    for key, value in attributes.items():
+        if value is not None:
+            parts.append(f"{key}={value!r}")
+    suffix = " " + " ".join(parts) if parts else ""
+    logger.info("Stack-chan MCP tool call: tool=%s%s", name, suffix)
+
+
 def check_audio_dir() -> dict[str, object]:
     return {
         "path": str(AUDIO_DIR),
@@ -118,6 +127,11 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
     def stackchan_say(text: str, lang: str = "zh") -> str:
         request_id = new_request_id()
         say_started = time.perf_counter()
+        audit_tool_call(
+            "stackchan_say",
+            lang=lang,
+            text_len=len(text),
+        )
         start_audio_server(config.audio_serve_port)
 
         try:
@@ -287,6 +301,7 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
 
     @mcp.tool()
     def stackchan_listen(lang: str = "zh") -> str:
+        audit_tool_call("stackchan_listen", lang=lang)
         try:
             result = capture_ready_recording(client, config, lang=lang, audio_dir=AUDIO_DIR)
             return format_listen_result(result)
@@ -295,6 +310,7 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
 
     @mcp.tool()
     def stackchan_move(x: float = 0, y: float = 0, speed: int = 50) -> str:
+        audit_tool_call("stackchan_move", x=x, y=y, speed=speed)
         try:
             x = max(-128, min(128, x))
             y = max(0, min(90, y))
@@ -308,6 +324,7 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
 
     @mcp.tool()
     def stackchan_nod() -> str:
+        audit_tool_call("stackchan_nod")
         try:
             result = client.gesture("nod")
             return "🤖 *nods yes*" if result.get("success") else f"❌ Nod failed: {result}"
@@ -316,6 +333,7 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
 
     @mcp.tool()
     def stackchan_shake() -> str:
+        audit_tool_call("stackchan_shake")
         try:
             result = client.gesture("shake")
             return "🤖 *shakes head no*" if result.get("success") else f"❌ Shake failed: {result}"
@@ -324,6 +342,7 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
 
     @mcp.tool()
     def stackchan_face(expression: str = "calm") -> str:
+        audit_tool_call("stackchan_face", expression=expression)
         if expression not in VALID_FACES:
             return f"❌ Unknown expression. Choose from: {', '.join(VALID_FACES)}"
         try:
@@ -345,6 +364,7 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
 
     @mcp.tool(structured_output=False)
     def stackchan_see() -> list[object] | str:
+        audit_tool_call("stackchan_see")
         try:
             jpeg_data, size = client.snapshot()
             if jpeg_data is None:
@@ -362,6 +382,7 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
 
     @mcp.tool()
     def stackchan_home() -> str:
+        audit_tool_call("stackchan_home")
         try:
             result = client.gesture("home")
             return "🤖 Head returned to home position" if result.get("success") else f"❌ Home failed: {result}"
@@ -370,6 +391,7 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
 
     @mcp.tool()
     def stackchan_status() -> str:
+        audit_tool_call("stackchan_status")
         try:
             status = client.audio_status()
             return f"✅ Stack-chan online at {config.stackchan_ip} | Mode: {status.get('mode', '?')} | Recording ready: {status.get('ready', '?')}"
@@ -381,15 +403,18 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
     @mcp.tool()
     def stackchan_health() -> str:
         """Non-destructive health check for config, dependencies, and device status."""
+        audit_tool_call("stackchan_health")
         return json.dumps(build_health_report(client, config), ensure_ascii=False, indent=2)
 
     @mcp.tool()
     def stackchan_config_summary() -> str:
         """Return Stack-chan runtime config without secrets."""
+        audit_tool_call("stackchan_config_summary")
         return json.dumps(config_summary(config), ensure_ascii=False, indent=2)
 
     @mcp.tool()
     def stackchan_playback_status() -> str:
+        audit_tool_call("stackchan_playback_status")
         try:
             status = client.playback_status()
             return (
@@ -413,6 +438,7 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
 
     @mcp.tool()
     def stackchan_voice_inbox(limit: int = 10) -> str:
+        audit_tool_call("stackchan_voice_inbox", limit=limit)
         try:
             events = read_events(limit=limit)
             return format_events(events)
@@ -421,6 +447,7 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
 
     @mcp.tool()
     def stackchan_voice_inbox_clear() -> str:
+        audit_tool_call("stackchan_voice_inbox_clear")
         try:
             clear_events()
             return "Stack-chan voice inbox cleared."

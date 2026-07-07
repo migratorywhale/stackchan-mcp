@@ -83,6 +83,7 @@ def forward_to_frontend(
     quiet_minutes: int = 0,
     prompt_prefix: str = DEFAULT_PROMPT_PREFIX,
     wake_words: tuple[str, ...] = (),
+    source: str = "",
     request_id: str | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
@@ -138,6 +139,8 @@ def forward_to_frontend(
         "force": force,
         "quiet_minutes": quiet_minutes,
     }
+    if source:
+        payload["source"] = source
     if model:
         payload["model"] = model
 

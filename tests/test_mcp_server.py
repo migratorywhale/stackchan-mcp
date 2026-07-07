@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import struct
 import sys
@@ -291,6 +292,36 @@ def test_speech_confirmation_omits_transport_diagnostics():
     assert "…" in result
 
 
+def test_stackchan_say_audit_log_records_length_without_speech_text(monkeypatch, tmp_path, caplog):
+    secret_text = "这段 Stack-chan say 原文应该留在会话备份里，但不要复制进 MCP 服务日志"
+    wav_path = tmp_path / "speech.wav"
+    write_wav(wav_path)
+
+    class FakeClient:
+        def playback_status(self):
+            return {"playing": False, "started_ms": 1}
+
+        def play(self, _url):
+            return {"success": True}
+
+        def wait_for_playback_start(self, baseline_started_ms=None):
+            return {"started": True, "status": {"started_ms": baseline_started_ms}}
+
+    monkeypatch.setattr("mcp_server.mcp_tools.start_audio_server", lambda _port: None)
+    monkeypatch.setattr("mcp_server.audio_processing.generate_tts", lambda *_args, **_kwargs: wav_path)
+
+    caplog.set_level(logging.INFO, logger="mcp_server.mcp_tools")
+    mcp = FakeFastMCP()
+    register_tools(mcp, FakeClient(), make_config(audio_mode="wav"), image_cls=None)
+
+    result = mcp.tools["stackchan_say"](secret_text, lang="zh")
+
+    assert secret_text in result
+    assert "tool=stackchan_say" in caplog.text
+    assert f"text_len={len(secret_text)}" in caplog.text
+    assert secret_text not in caplog.text
+
+
 def test_preferred_pcm_auto_uses_tcp_before_experimental_udp(monkeypatch, tmp_path):
     calls = []
 
@@ -458,6 +489,7 @@ def test_config_reads_pcm_and_timeout_env_aliases(monkeypatch):
 
 
 def test_config_loads_mcp_auth_token_from_env(monkeypatch):
+    monkeypatch.setattr("mcp_server.stackchan_config.load_dotenv", lambda path=None: None)
     monkeypatch.setenv("STACKCHAN_MCP_AUTH_TOKEN", "s3cr3t-token-value")
 
     config = load_config()
@@ -633,6 +665,7 @@ def test_voice_upload_recorder_page_exposes_upload_ui():
             inbox_path=None,
             wake_url="http://127.0.0.1:3200/wake",
             wake_session_id="117067d6-1111-2222-3333-444444444444",
+            wake_session_title="",
             wake_token="",
             wake_model="",
             wake_timeout=3,
@@ -654,6 +687,53 @@ def test_voice_upload_recorder_page_exposes_upload_ui():
     assert "X-Stackchan-Upload-Token" in html
     assert "secret-token-for-test" not in html
     assert "小塔 / 机器人" in html
+
+
+def test_voice_upload_default_prompt_prefix_separates_frontend_upload(monkeypatch):
+    monkeypatch.delenv("STACKCHAN_VOICE_UPLOAD_PROMPT_PREFIX", raising=False)
+    monkeypatch.delenv("STACKCHAN_FRONTEND_PROMPT_PREFIX", raising=False)
+
+    parser = stackchan_voice_upload_server.build_parser()
+    args = parser.parse_args([])
+
+    assert args.prompt_prefix == "[前端语音输入] "
+
+
+def test_voice_upload_resolves_latest_wake_session(monkeypatch):
+    resolved = []
+
+    def fake_resolve(session_id, title=""):
+        resolved.append((session_id, title))
+        return "117067d6-1111-2222-3333-444444444444"
+
+    monkeypatch.setattr(stackchan_voice_upload_server, "resolve_wake_session", fake_resolve)
+
+    session_id = stackchan_voice_upload_server.resolve_frontend_wake_session(
+        stackchan_voice_upload_server.ServerOptions(
+            lang="zh",
+            max_bytes=1024,
+            inbox_path=None,
+            wake_url="http://127.0.0.1:3200/wake",
+            wake_session_id="latest",
+            wake_session_title="起居室",
+            wake_token="agent-token",
+            wake_model="",
+            wake_timeout=3,
+            wake_retries=0,
+            wake_retry_delay=0,
+            wake_force=True,
+            wake_quiet_minutes=0,
+            prompt_prefix="[Stack-chan语音输入] ",
+            wake_words=("小塔", "机器人"),
+            upload_token="secret-token-for-test",
+            upload_rate_per_minute=12,
+            upload_rate_window_seconds=60,
+            allowed_origins=(),
+        )
+    )
+
+    assert session_id == "117067d6-1111-2222-3333-444444444444"
+    assert resolved == [("latest", "起居室")]
 
 
 def test_voice_upload_token_authorization():
@@ -777,6 +857,7 @@ def test_voice_upload_frontend_forwarding_posts_wake_request(monkeypatch):
         model="claude-opus-4-6[1m]",
         timeout=3,
         wake_words=("小塔", "机器人"),
+        source="voice_upload",
     )
 
     assert result["ok"] is True
@@ -790,6 +871,7 @@ def test_voice_upload_frontend_forwarding_posts_wake_request(monkeypatch):
                 "prompt": "[Stack-chan语音输入] 小塔，听得到吗？",
                 "force": True,
                 "quiet_minutes": 0,
+                "source": "voice_upload",
                 "model": "claude-opus-4-6[1m]",
             },
             "headers": {
@@ -833,6 +915,7 @@ def test_voice_upload_frontend_forwarding_retries_busy(monkeypatch):
         session_id="117067d6-1111-2222-3333-444444444444",
         retries=1,
         retry_delay=0.1,
+        source="voice_upload",
     )
 
     assert result["ok"] is True
@@ -841,6 +924,7 @@ def test_voice_upload_frontend_forwarding_retries_busy(monkeypatch):
     assert result["body"] == {"ok": True}
     assert set(result["timing_ms"]) == {"wake_post", "wake_total"}
     assert len(calls) == 2
+    assert calls[0]["json"]["source"] == "voice_upload"
 
 
 def test_frontend_session_selects_latest_non_archived():

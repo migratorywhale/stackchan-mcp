@@ -114,6 +114,7 @@ def forward_event_to_frontend(event: dict[str, Any], args: argparse.Namespace) -
         quiet_minutes=args.wake_quiet_minutes,
         prompt_prefix=args.prompt_prefix,
         wake_words=parse_wake_words(args.wake_words),
+        source=str(event.get("source") or "stackchan_mic"),
     )
 
 

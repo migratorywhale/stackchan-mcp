@@ -27,15 +27,20 @@ from mcp_server.stackchan_config import StackchanConfig, load_config  # noqa: E4
 from mcp_server.telemetry import emit_event, new_request_id  # noqa: E402
 from mcp_server.voice_inbox import append_event, resolve_inbox_path  # noqa: E402
 from scripts.stackchan_frontend_wake import (  # noqa: E402
-    DEFAULT_PROMPT_PREFIX,
     forward_to_frontend,
     parse_wake_words,
 )
-from scripts.stackchan_voice_bridge import load_env_file, should_append_to_inbox  # noqa: E402
+from scripts.stackchan_voice_bridge import (  # noqa: E402
+    load_env_file,
+    load_frontend_token,
+    resolve_wake_session,
+    should_append_to_inbox,
+)
 
 DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 DEFAULT_UPLOAD_RATE_PER_MINUTE = 12
 DEFAULT_UPLOAD_RATE_WINDOW_SECONDS = 60.0
+DEFAULT_UPLOAD_PROMPT_PREFIX = "[前端语音输入] "
 TOKEN_QUERY_RE = re.compile(r"([?&]token=)[^\s&]+")
 
 
@@ -46,6 +51,7 @@ class ServerOptions:
     inbox_path: Path | None
     wake_url: str
     wake_session_id: str
+    wake_session_title: str
     wake_token: str
     wake_model: str
     wake_timeout: float
@@ -483,6 +489,8 @@ def build_health_payload(options: ServerOptions) -> dict[str, Any]:
         "service": "stackchan_voice_upload_server",
         "inbox": str(options.inbox_path) if options.inbox_path else None,
         "frontend": bool(options.wake_url and options.wake_session_id),
+        "wake_session_id": options.wake_session_id,
+        "wake_session_title": options.wake_session_title,
         "config": {
             "lang": options.lang,
             "max_bytes": options.max_bytes,
@@ -498,6 +506,10 @@ def build_health_payload(options: ServerOptions) -> dict[str, Any]:
             "allowed_origins": list(options.allowed_origins),
         },
     }
+
+
+def resolve_frontend_wake_session(options: ServerOptions) -> str:
+    return resolve_wake_session(options.wake_session_id, options.wake_session_title)
 
 
 def write_rate_limit_error(handler: BaseHTTPRequestHandler) -> None:
@@ -633,21 +645,32 @@ class VoiceUploadHandler(BaseHTTPRequestHandler):
             inbox_ms = 0
 
         frontend_started = time.perf_counter()
-        frontend = forward_to_frontend(
-            event,
-            wake_url=self.voice_server.options.wake_url,
-            session_id=self.voice_server.options.wake_session_id,
-            token=self.voice_server.options.wake_token,
-            model=self.voice_server.options.wake_model,
-            timeout=self.voice_server.options.wake_timeout,
-            retries=self.voice_server.options.wake_retries,
-            retry_delay=self.voice_server.options.wake_retry_delay,
-            force=self.voice_server.options.wake_force,
-            quiet_minutes=self.voice_server.options.wake_quiet_minutes,
-            prompt_prefix=self.voice_server.options.prompt_prefix,
-            wake_words=self.voice_server.options.wake_words,
-            request_id=request_id,
-        )
+        try:
+            wake_session_id = resolve_frontend_wake_session(self.voice_server.options)
+        except SystemExit as exc:
+            wake_session_id = ""
+            frontend = {
+                "ok": False,
+                "skipped": f"frontend session not resolved: {exc}",
+                "timing_ms": {"wake_total": 0},
+            }
+        else:
+            frontend = forward_to_frontend(
+                event,
+                wake_url=self.voice_server.options.wake_url,
+                session_id=wake_session_id,
+                token=self.voice_server.options.wake_token,
+                model=self.voice_server.options.wake_model,
+                timeout=self.voice_server.options.wake_timeout,
+                retries=self.voice_server.options.wake_retries,
+                retry_delay=self.voice_server.options.wake_retry_delay,
+                force=self.voice_server.options.wake_force,
+                quiet_minutes=self.voice_server.options.wake_quiet_minutes,
+                prompt_prefix=self.voice_server.options.prompt_prefix,
+                wake_words=self.voice_server.options.wake_words,
+                source=str(event.get("source") or "voice_upload"),
+                request_id=request_id,
+            )
         frontend_ms = round((time.perf_counter() - frontend_started) * 1000)
         timing_ms = {
             "upload_read": read_ms,
@@ -721,6 +744,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("STACKCHAN_FRONTEND_SESSION_ID", ""),
         help="Frontend session UUID to receive transcripts.",
     )
+    parser.add_argument(
+        "--wake-session-title",
+        default=os.environ.get("STACKCHAN_FRONTEND_SESSION_TITLE", ""),
+        help="Resolve the latest non-archived frontend session whose title contains this text.",
+    )
     parser.add_argument("--wake-token", default=os.environ.get("STACKCHAN_FRONTEND_TOKEN", ""))
     parser.add_argument("--wake-model", default=os.environ.get("STACKCHAN_FRONTEND_MODEL", ""))
     parser.add_argument(
@@ -752,7 +780,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--prompt-prefix",
-        default=os.environ.get("STACKCHAN_FRONTEND_PROMPT_PREFIX", DEFAULT_PROMPT_PREFIX),
+        default=os.environ.get(
+            "STACKCHAN_VOICE_UPLOAD_PROMPT_PREFIX",
+            os.environ.get("STACKCHAN_FRONTEND_PROMPT_PREFIX", DEFAULT_UPLOAD_PROMPT_PREFIX),
+        ),
     )
     parser.add_argument(
         "--wake-words",
@@ -795,6 +826,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     load_env_file(REPO_ROOT / ".env")
+    load_frontend_token()
     args = build_parser().parse_args()
     config = load_config()
     wake_url = args.wake_url
@@ -806,6 +838,7 @@ def main() -> int:
         inbox_path=None if args.no_inbox else resolve_inbox_path(args.inbox),
         wake_url=wake_url,
         wake_session_id=args.wake_session_id,
+        wake_session_title=args.wake_session_title,
         wake_token=args.wake_token,
         wake_model=args.wake_model,
         wake_timeout=args.wake_timeout,
