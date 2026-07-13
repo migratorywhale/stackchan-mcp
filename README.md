@@ -317,7 +317,20 @@ that private copy. Do not commit machine-specific LaunchAgent files.
 
 Stack-chan has 7 expressions stored as 320x240 PNGs on the device's LittleFS. The default face is a gentle whale with crescent eyes.
 
-> **Note:** The included face PNGs are this particular Stack-chan's face — they were designed for him by his person. You'll probably want to replace them with your own. Drop your own 320x240 PNGs into `firmware/data/` before flashing.
+> **Note:** The included face PNGs are this particular Stack-chan's face — they were designed for him by his person. You'll probably want to replace them with your own!
+
+### How to change your Stack-chan's face
+
+1. **Prepare your images** — 7 PNGs, one per expression (see table below). Size: **320×240 px**, RGB.
+2. **Name them exactly:**
+   ```
+   calm.png  thinking.png  happy.png  sleepy.png  shy.png  smug.png  pouty.png
+   ```
+3. **Drop them into** `firmware/data/`, replacing the defaults.
+4. **Flash the filesystem** — if you use the Makefile: `make fs-flash`. If you use PlatformIO: *Upload Filesystem Image*.
+5. **Reboot** — your Stack-chan now wears your AI's face.
+
+> **Quick way:** run `python3 scripts/set_face.py path/to/your/image.png` — it auto-resizes and copies to all 7 expression slots so you can start with a single image and refine later.
 
 | Expression | Description |
 |-----------|-------------|
