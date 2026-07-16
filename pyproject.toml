@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Host-side tooling for the Stack-chan voice avatar."
 requires-python = ">=3.11"
 dependencies = [
-    "mcp==1.27.1",
+    "mcp==1.28.1",
     "requests==2.34.2",
 ]
 
