@@ -4,16 +4,16 @@ version = "0.1.0"
 description = "Host-side tooling for the Stack-chan voice avatar."
 requires-python = ">=3.11"
 dependencies = [
-    "mcp==1.27.1",
+    "mcp==1.28.1",
     "requests==2.34.2",
 ]
 
 [dependency-groups]
 dev = [
     "pyright==1.1.411",
-    "pytest==9.0.3",
+    "pytest==9.1.1",
     "pytest-cov==7.1.0",
-    "ruff==0.15.13",
+    "ruff==0.15.21",
 ]
 
 [tool.pytest.ini_options]
