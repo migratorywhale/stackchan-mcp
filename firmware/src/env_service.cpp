@@ -44,12 +44,14 @@ static constexpr uint32_t I2C_FREQ = 100000;   // Grove 线偏长，100kHz 稳
 static char s_lastError[64] = "";   // 最后一次读取失败的原因，走 HTTP 暴露（串口在启动后会哑）
 
 // QMP6988 calibration coefficients (loaded once in initEnvService)
-static float   s_qmpA0  = 0.0f;
-static float   s_qmpB00 = 0.0f;
-static float   s_qmpAt[3]  = {0.0f, 0.0f, 0.0f};   // a0..a2
-static float   s_qmpBt[2]  = {0.0f, 0.0f};          // bt1, bt2
-static float   s_qmpBp[10] = {};                     // bp1..bp10
-static float   s_qmpBtp    = 0.0f;
+// 2026/7/29 v2: 第一版是凭记忆写的假补偿(读数191.7hPa)。真实流程见数据手册§4.3:
+// ①OTP原始值要过仿射映射 K = A + S*OTP/32767 (每个系数A/S不同,下表)
+// ②a0/b00是20bit带符号(高16bit + 0xB8扩展字节各4bit),除16
+// ③ADC原始值带偏置: Dt = rawT - 2^23, Dp = rawP - 2^23
+static float   s_qmpA0  = 0.0f, s_qmpA1 = 0.0f, s_qmpA2 = 0.0f;
+static float   s_qmpB00 = 0.0f, s_qmpBt1 = 0.0f, s_qmpBt2 = 0.0f;
+static float   s_qmpBp1 = 0.0f, s_qmpB11 = 0.0f, s_qmpBp2 = 0.0f;
+static float   s_qmpB12 = 0.0f, s_qmpB21 = 0.0f, s_qmpBp3 = 0.0f;
 static bool    s_qmpCalOk  = false;
 
 // ── I2C probe ────────────────────────────────────────────────────────────────
@@ -170,30 +172,34 @@ static uint16_t be16u(const uint8_t* b) {
     return ((uint16_t)b[0] << 8) | b[1];
 }
 
+// OTP仿射映射：K = A + S * otp / 32767  (datasheet §4.3 Conversion factors)
+static float qmpCoef(int16_t otp, float A, float S) {
+    return A + S * (float)otp / 32767.0f;
+}
+
 // Load calibration coefficients from QMP6988 OTP registers (datasheet §4.3).
+// OTP布局 0xA0起25字节：b00,bt1,bt2,bp1,b11,bp2,b12,b21,bp3 各16bit BE，
+// 然后 a0(0xB2,20bit),a1,a2，最后 0xB8 = b00_a0_ex（b00低4bit<<4 | a0低4bit）。
 static bool qmpLoadCalibration(uint8_t addr) {
     uint8_t cal[25];
     if (!qmpReadBurst(addr, QMP_REG_CALIB, cal, 25)) return false;
 
-    // Compensation formulas follow QMP6988 datasheet Table 7.
-    s_qmpA0  = (float)be16s(cal + 18) / 16.0f + (float)(int8_t)cal[20] / 256.0f;
-    s_qmpB00 = (float)be16s(cal + 0);
+    // 20bit带符号的 a0/b00（高16bit拼上扩展字节的4bit，算术右移补符号）
+    int32_t b00_20 = ((int32_t)((be16u(cal + 0)  << 16) | ((cal[24] & 0xF0) << 8))) >> 12;
+    int32_t a0_20  = ((int32_t)((be16u(cal + 18) << 16) | ((cal[24] & 0x0F) << 12))) >> 12;
+    s_qmpB00 = (float)b00_20 / 16.0f;
+    s_qmpA0  = (float)a0_20  / 16.0f;
 
-    s_qmpAt[0]  = (float)(int8_t)cal[2]  / 32768.0f;
-    s_qmpAt[1]  = (float)be16s(cal + 3)  / 65536.0f;
-    s_qmpAt[2]  = (float)(int8_t)cal[5]  / 16777216.0f;
-
-    s_qmpBt[0] = (float)be16s(cal + 6)  / 32768.0f;
-    s_qmpBt[1] = (float)(int8_t)cal[8]  / 65536.0f;
-
-    s_qmpBtp   = (float)(int8_t)cal[9]  / 2097152.0f;
-
-    s_qmpBp[0] = (float)be16u(cal + 10) / 1048576.0f;
-    s_qmpBp[1] = (float)be16s(cal + 12) / 16384.0f;
-    s_qmpBp[2] = (float)(int8_t)cal[14] / 262144.0f;
-    s_qmpBp[3] = (float)be16s(cal + 15) / 32768.0f;
-    s_qmpBp[4] = (float)(int8_t)cal[17] / 262144.0f;
-    // bp5..bp9 not needed for standard compensation; zeroed already.
+    s_qmpBt1 = qmpCoef(be16s(cal + 2),  1.0e-01f,  9.1e-02f);
+    s_qmpBt2 = qmpCoef(be16s(cal + 4),  1.2e-08f,  1.2e-06f);
+    s_qmpBp1 = qmpCoef(be16s(cal + 6),  3.3e-02f,  1.9e-02f);
+    s_qmpB11 = qmpCoef(be16s(cal + 8),  2.1e-07f,  1.4e-07f);
+    s_qmpBp2 = qmpCoef(be16s(cal + 10), -6.3e-10f, 3.5e-10f);
+    s_qmpB12 = qmpCoef(be16s(cal + 12), 2.9e-13f,  7.6e-13f);
+    s_qmpB21 = qmpCoef(be16s(cal + 14), 2.1e-15f,  1.2e-14f);
+    s_qmpBp3 = qmpCoef(be16s(cal + 16), 1.3e-16f,  7.9e-17f);
+    s_qmpA1  = qmpCoef(be16s(cal + 20), -6.3e-03f, 4.3e-04f);
+    s_qmpA2  = qmpCoef(be16s(cal + 22), -1.9e-11f, 1.2e-10f);
 
     s_qmpCalOk = true;
     return true;
@@ -213,28 +219,27 @@ static bool qmpRead(uint8_t addr, float& pressure, float& tempOut) {
     uint8_t raw[6];
     if (!qmpReadBurst(addr, QMP_REG_PRESS_MSB, raw, 6)) return false;
 
-    // Raw 24-bit big-endian, unsigned
+    // Raw 24-bit，减 2^23 偏置得到带符号的 Dt/Dp（第一版漏了这步 → 191.7hPa）
     uint32_t rawP = ((uint32_t)raw[0] << 16) | ((uint32_t)raw[1] << 8) | raw[2];
     uint32_t rawT = ((uint32_t)raw[3] << 16) | ((uint32_t)raw[4] << 8) | raw[5];
+    float Dp = (float)((int32_t)rawP - 8388608);
+    float Dt = (float)((int32_t)rawT - 8388608);
 
-    // Datasheet §4.3.3 compensation
-    float Tr = s_qmpA0
-             + s_qmpAt[0] * (float)rawT
-             + s_qmpAt[1] * (float)rawT * (float)rawT
-             + s_qmpAt[2] * (float)rawT * (float)rawT * (float)rawT;
+    // Datasheet §4.3 compensation（Tr单位是256*°C，Pr单位是Pa）
+    float Tr = s_qmpA0 + s_qmpA1 * Dt + s_qmpA2 * Dt * Dt;
 
     float Pr = s_qmpB00
-             + s_qmpBt[0] * Tr
-             + s_qmpBt[1] * Tr * Tr
-             + s_qmpBtp  * (float)rawP * Tr
-             + s_qmpBp[0] * (float)rawP
-             + s_qmpBp[1] * (float)rawP * (float)rawP
-             + s_qmpBp[2] * (float)rawP * (float)rawP * (float)rawP
-             + s_qmpBp[3] * (float)rawP * Tr * Tr
-             + s_qmpBp[4] * (float)rawP * (float)rawP * Tr;
+             + s_qmpBt1 * Tr
+             + s_qmpBp1 * Dp
+             + s_qmpB11 * Tr * Dp
+             + s_qmpBt2 * Tr * Tr
+             + s_qmpBp2 * Dp * Dp
+             + s_qmpB12 * Dp * Tr * Tr
+             + s_qmpB21 * Dp * Dp * Tr
+             + s_qmpBp3 * Dp * Dp * Dp;
 
-    pressure = Pr / 100.0f;  // Pa → hPa
-    tempOut  = Tr;
+    pressure = Pr / 100.0f;   // Pa → hPa
+    tempOut  = Tr / 256.0f;   // 256*°C → °C
     return true;
 }
 
