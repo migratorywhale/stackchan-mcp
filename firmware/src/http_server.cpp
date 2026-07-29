@@ -542,6 +542,14 @@ static void handleSnapshot() {
     Serial.printf("[HTTP] GET /snapshot -> %u bytes JPEG\n", (unsigned)jpgLen);
 }
 
+// GET /env/debug — QMP6988校准字节+原始ADC快照，电脑端验算补偿公式用
+static void handleEnvDebug() {
+    // 先触发一次读取，保证rawP/rawT快照是新鲜的
+    float t, h, pr;
+    readEnv(t, h, pr);
+    server.send(200, "application/json", envDebugJson());
+}
+
 // ────────────────────────────────────────────
 // GET /env
 // → Temperature, humidity, and barometric pressure from onboard sensors
@@ -610,6 +618,7 @@ void initHttpServer() {
     server.on("/face",         HTTP_POST, handleFace);
     server.on("/face",         HTTP_GET,  handleFace);
     server.on("/env",          HTTP_GET,  handleEnv);
+    server.on("/env/debug",    HTTP_GET,  handleEnvDebug);
     server.begin();
     Serial.println("[HTTP] Server started on port 80");
 }

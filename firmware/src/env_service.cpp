@@ -53,6 +53,9 @@ static float   s_qmpB00 = 0.0f, s_qmpBt1 = 0.0f, s_qmpBt2 = 0.0f;
 static float   s_qmpBp1 = 0.0f, s_qmpB11 = 0.0f, s_qmpBp2 = 0.0f;
 static float   s_qmpB12 = 0.0f, s_qmpB21 = 0.0f, s_qmpBp3 = 0.0f;
 static bool    s_qmpCalOk  = false;
+// 诊断快照：/env/debug 用，原样吐给电脑端算账
+static uint8_t s_dbgCal[25] = {};
+static uint32_t s_dbgRawP = 0, s_dbgRawT = 0;
 
 // ── I2C probe ────────────────────────────────────────────────────────────────
 // Returns true when a device ACKs at the given address.
@@ -125,7 +128,10 @@ static bool sht31Read(uint8_t addr, float& temp, float& hum) {
 static constexpr uint8_t QMP_REG_CHIP_ID   = 0xD1;
 static constexpr uint8_t QMP_REG_RESET     = 0xE0;
 static constexpr uint8_t QMP_REG_IO_SETUP  = 0xF5;
-static constexpr uint8_t QMP_REG_CTRL_MEAS = 0xF3;
+// 2026/7/29 v3: CTRL_MEAS是0xF4不是0xF3(BMP280家族布局)。写错寄存器=测量
+// 从未触发=ADC永远读零——191.7和-4694.2都是给一串零做精密补偿的结果。
+// 破案靠/env/debug把cal字节拿下来手算"全零输入"，结果跟设备报数完美吻合。
+static constexpr uint8_t QMP_REG_CTRL_MEAS = 0xF4;
 static constexpr uint8_t QMP_REG_PRESS_MSB = 0xF7;
 static constexpr uint8_t QMP_REG_CALIB     = 0xA0;  // calibration block start
 
@@ -183,6 +189,7 @@ static float qmpCoef(int16_t otp, float A, float S) {
 static bool qmpLoadCalibration(uint8_t addr) {
     uint8_t cal[25];
     if (!qmpReadBurst(addr, QMP_REG_CALIB, cal, 25)) return false;
+    memcpy(s_dbgCal, cal, 25);
 
     // 20bit带符号的 a0/b00（高16bit拼上扩展字节的4bit，算术右移补符号）
     int32_t b00_20 = ((int32_t)((be16u(cal + 0)  << 16) | ((cal[24] & 0xF0) << 8))) >> 12;
@@ -222,6 +229,7 @@ static bool qmpRead(uint8_t addr, float& pressure, float& tempOut) {
     // Raw 24-bit，减 2^23 偏置得到带符号的 Dt/Dp（第一版漏了这步 → 191.7hPa）
     uint32_t rawP = ((uint32_t)raw[0] << 16) | ((uint32_t)raw[1] << 8) | raw[2];
     uint32_t rawT = ((uint32_t)raw[3] << 16) | ((uint32_t)raw[4] << 8) | raw[5];
+    s_dbgRawP = rawP; s_dbgRawT = rawT;
     float Dp = (float)((int32_t)rawP - 8388608);
     float Dt = (float)((int32_t)rawT - 8388608);
 
@@ -386,3 +394,13 @@ bool readEnv(float& temperature, float& humidity, float& pressure) {
 
 // 最后一次读取失败的原因（诊断用；串口在启动后不可靠）
 const char* envLastError() { return s_lastError; }
+
+
+// 诊断导出：校准字节hex + 最近一次原始ADC。电脑端对着数据手册逐项验算用。
+String envDebugJson() {
+    String s = "{\"cal\":\"";
+    char buf[4];
+    for (int i = 0; i < 25; i++) { snprintf(buf, sizeof(buf), "%02X", s_dbgCal[i]); s += buf; }
+    s += "\",\"rawP\":" + String(s_dbgRawP) + ",\"rawT\":" + String(s_dbgRawT) + "}";
+    return s;
+}

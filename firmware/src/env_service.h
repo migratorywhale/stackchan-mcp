@@ -1,5 +1,6 @@
 #ifndef ENV_SERVICE_H
 #define ENV_SERVICE_H
+#include <Arduino.h>
 
 /**
  * Stack-chan Environment Sensor Service
@@ -18,6 +19,9 @@ bool initEnvService();
 // Missing sensors produce NAN for their fields.
 // Returns false if no sensors are available at all.
 bool readEnv(float& temperature, float& humidity, float& pressure);
+
+// 诊断：校准字节+原始ADC的JSON快照
+String envDebugJson();
 
 // Returns true if at least one sensor was detected during initEnvService().
 bool isEnvAvailable();
