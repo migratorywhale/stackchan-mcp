@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple/DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>xyz.migratorybird.stackchan-voice-bridge</string>
+  <key>UserName</key>
+  <string>koke</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/koke/Projects/stackchan-mcp/.venv/bin/python</string>
+    <string>/Users/koke/Projects/stackchan-mcp/scripts/stackchan_voice_bridge.py</string>
+    <string>--lang</string>
+    <string>zh</string>
+    <string>--interval</string>
+    <string>1</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/koke/Projects/stackchan-mcp</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/koke</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/koke/Library/Logs/stackchan-voice-bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/koke/Library/Logs/stackchan-voice-bridge.error.log</string>
+</dict>
+</plist>

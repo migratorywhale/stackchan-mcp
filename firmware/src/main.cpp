@@ -14,6 +14,7 @@
 #include "servo_service.h"
 #include "camera_service.h"
 #include "audio_gate.h"
+#include "env_service.h"
 
 void setup() {
     Serial.begin(115200);
@@ -42,6 +43,10 @@ void setup() {
     if (!initCamera()) {
         Serial.println("[WARN] Camera init failed - vision disabled");
     }
+    if (!initEnvService()) {
+        Serial.println("[WARN] Env sensor init failed - no temperature/humidity/pressure");
+    }
+
 
     connectWiFi();
     initPlayback();

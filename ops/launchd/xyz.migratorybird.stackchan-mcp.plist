@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>xyz.migratorybird.stackchan-mcp</string>
+  <key>UserName</key>
+  <string>koke</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/koke/Projects/stackchan-mcp/.venv/bin/python</string>
+    <string>-m</string>
+    <string>mcp_server.server</string>
+    <string>--http</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8002</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/koke/Projects/stackchan-mcp</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/koke</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/koke/Library/Logs/stackchan-mcp.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/koke/Library/Logs/stackchan-mcp.error.log</string>
+</dict>
+</plist>

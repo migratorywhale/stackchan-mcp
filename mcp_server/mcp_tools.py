@@ -437,6 +437,46 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
             return f"❌ Error: {exc}"
 
     @mcp.tool()
+    def stackchan_sense() -> str:
+        """Read environmental sensor data from the robot: temperature, humidity, and barometric
+        pressure. Use this to understand the physical conditions around Stack-chan. A falling
+        barometric pressure reading often precedes weather changes and headaches — worth noting
+        when someone reports feeling unwell. Values are returned only for sensors that report
+        a valid reading; missing or NaN fields are silently omitted."""
+        audit_tool_call("stackchan_sense")
+        try:
+            data = client.read_env()
+            parts = []
+            temp = data.get("temperature")
+            if temp is not None:
+                try:
+                    if not (temp != temp):  # NaN check
+                        parts.append(f"🌡️ {float(temp):.1f}°C")
+                except (TypeError, ValueError):
+                    pass
+            humidity = data.get("humidity")
+            if humidity is not None:
+                try:
+                    if not (humidity != humidity):
+                        parts.append(f"💧 {float(humidity):.1f}%")
+                except (TypeError, ValueError):
+                    pass
+            pressure = data.get("pressure")
+            if pressure is not None:
+                try:
+                    if not (pressure != pressure):
+                        parts.append(f"🔽 {float(pressure):.1f} hPa")
+                except (TypeError, ValueError):
+                    pass
+            if not parts:
+                return "⚠️ No sensor data available"
+            return "  ".join(parts)
+        except requests.exceptions.ConnectionError:
+            return f"❌ Stack-chan offline (cannot reach {config.stackchan_ip})"
+        except Exception as exc:
+            return f"❌ Error: {exc}"
+
+    @mcp.tool()
     def stackchan_voice_inbox(limit: int = 10) -> str:
         audit_tool_call("stackchan_voice_inbox", limit=limit)
         try:

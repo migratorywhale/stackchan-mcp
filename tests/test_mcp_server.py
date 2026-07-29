@@ -63,6 +63,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 @pytest.fixture(autouse=True)
 def isolate_telemetry_log(monkeypatch, tmp_path):
     monkeypatch.setenv("STACKCHAN_OTEL_LOG", str(tmp_path / "otel.jsonl"))
+    monkeypatch.delenv("STACKCHAN_HTTP_TRANSPORT", raising=False)
 
 
 class FakeFastMCP:
@@ -1128,6 +1129,46 @@ def test_stackchan_client_posts_move_request(monkeypatch):
             {"json": {"x": 1, "y": 2, "speed": 3}, "timeout": 5},
         )
     ]
+
+
+def test_stackchan_client_uses_system_curl_for_local_network_transport(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout=b'{"success": true}\n200',
+            stderr=b"",
+        )
+
+    monkeypatch.setenv("STACKCHAN_HTTP_TRANSPORT", "curl")
+    monkeypatch.setattr("mcp_server.stackchan_client.subprocess.run", fake_run)
+
+    result = StackchanClient(make_config()).move(1, 2, 3)
+
+    assert result == {"success": True}
+    command, kwargs = calls[0]
+    assert command[0] == "/usr/bin/curl"
+    assert command[-1] == "http://192.0.2.20:80/move"
+    assert kwargs["input"] == b'{"x": 1, "y": 2, "speed": 3}'
+    assert kwargs["capture_output"] is True
+
+
+def test_stackchan_client_system_curl_preserves_binary_audio(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_HTTP_TRANSPORT", "curl")
+    monkeypatch.setattr(
+        "mcp_server.stackchan_client.subprocess.run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            returncode=0,
+            stdout=b"RIFF-audio-bytes\n200",
+            stderr=b"",
+        ),
+    )
+
+    audio = StackchanClient(make_config()).get_audio()
+
+    assert audio == b"RIFF-audio-bytes"
 
 
 def test_post_pcm_stream_posts_binary_payload_with_content_length(monkeypatch, tmp_path):
