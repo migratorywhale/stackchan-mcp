@@ -1,0 +1,62 @@
+name: Hardware report
+description: Report physical setup, wiring, servo, audio, or camera issues.
+title: "[Hardware]: "
+labels:
+  - hardware
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for device-specific problems such as wiring, boot behavior, audio playback, microphone capture, servos, camera output, or enclosure constraints.
+
+        Please redact private LAN IP addresses, Wi-Fi details, tokens, and public tunnel hostnames.
+        Avoid posting identifiable voice recordings or camera snapshots unless they are necessary and safe to share publicly.
+        Remember that `GET /audio` consumes and clears the pending recording buffer on the device.
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware setup
+      description: Device model, hats, servos, speakers, mic, power source, and notable add-ons.
+      placeholder: M5Stack CoreS3, 2x servos, external speaker, USB-C power bank
+    validations:
+      required: true
+  - type: textarea
+    id: wiring
+    attributes:
+      label: Wiring or assembly notes
+      description: Describe pin usage, connectors, mount, or anything unusual about the build.
+  - type: textarea
+    id: symptom
+    attributes:
+      label: Symptom
+      description: What happens on the real device?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Include power-on steps, API calls, and timing if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or observations
+      description: Serial logs, HTTP responses, or photos if needed. Remove secrets and private network details.
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware commit, branch, or release
+      placeholder: master @ abc1234
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy and safety checks
+      options:
+        - label: I removed secrets, Wi-Fi details, private LAN IPs, and public tunnel details from logs and attachments.
+          required: true
+        - label: I did not use or attach `GET /audio` output unless it was necessary and safe to share.
+          required: true
+        - label: I did not attach voice or camera data unless it is necessary and safe to share publicly.
+          required: true

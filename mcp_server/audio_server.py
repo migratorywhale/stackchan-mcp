@@ -30,6 +30,12 @@ class QuietHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        super().end_headers()
+
 
 def start_audio_server(port: int) -> None:
     global _http_server, _http_thread

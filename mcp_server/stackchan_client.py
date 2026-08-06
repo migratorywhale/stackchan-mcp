@@ -1,7 +1,11 @@
+import json
+import os
 import socket
 import struct
+import subprocess
 import time
 from contextlib import suppress
+from typing import Any
 
 import requests
 
@@ -21,6 +25,86 @@ class PcmPlaybackError(RuntimeError):
         self.started = started
 
 
+class CurlResponse:
+    """Small requests-compatible response for macOS system-curl transport."""
+
+    def __init__(self, status_code: int, content: bytes):
+        self.status_code = status_code
+        self.content = content
+
+    @property
+    def text(self) -> str:
+        return self.content.decode("utf-8", errors="replace")
+
+    def json(self) -> dict:
+        return json.loads(self.content)
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.HTTPError(
+                f"{self.status_code} Client Error",
+                response=self,
+            )
+
+
+def curl_request(
+    method: str,
+    url: str,
+    *,
+    timeout: float,
+    json_body: dict | None = None,
+    data: bytes | None = None,
+    headers: dict[str, str] | None = None,
+) -> CurlResponse:
+    """Call a local-network device through Apple's system curl.
+
+    On recent macOS releases, a launchd-owned Python interpreter can receive
+    ``Errno 65`` for LAN sockets even while ``/usr/bin/curl`` is allowed.
+    Keeping this transport explicit avoids changing normal requests behavior.
+    """
+
+    command = [
+        "/usr/bin/curl",
+        "--silent",
+        "--show-error",
+        "--max-time",
+        str(timeout),
+        "--request",
+        method.upper(),
+        "--write-out",
+        "\n%{http_code}",
+    ]
+    request_headers = dict(headers or {})
+    payload = data
+    if json_body is not None:
+        payload = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
+        request_headers.setdefault("Content-Type", "application/json")
+    for key, value in request_headers.items():
+        command.extend(["--header", f"{key}: {value}"])
+    if payload is not None:
+        command.extend(["--data-binary", "@-"])
+    command.append(url)
+
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed /usr/bin/curl path, no shell
+            command,
+            input=payload,
+            capture_output=True,
+            check=False,
+            timeout=max(1.0, timeout + 2.0),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise requests.ConnectionError(f"system curl failed: {exc}") from exc
+    if completed.returncode != 0:
+        error = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise requests.ConnectionError(error or f"system curl exited {completed.returncode}")
+
+    body, separator, status = completed.stdout.rpartition(b"\n")
+    if not separator or not status.isdigit():
+        raise requests.ConnectionError("system curl returned no HTTP status")
+    return CurlResponse(int(status), body)
+
+
 class StackchanClient:
     def __init__(self, config: StackchanConfig):
         self.config = config
@@ -29,10 +113,40 @@ class StackchanClient:
     def base_url(self) -> str:
         return f"http://{self.config.stackchan_ip}:{self.config.stackchan_port}"
 
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        timeout: float,
+        json_body: dict | None = None,
+        data: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ):
+        if os.environ.get("STACKCHAN_HTTP_TRANSPORT", "requests").lower() == "curl":
+            return curl_request(
+                method,
+                url,
+                timeout=timeout,
+                json_body=json_body,
+                data=data,
+                headers=headers,
+            )
+        request_method = getattr(requests, method.lower())
+        kwargs: dict[str, Any] = {"timeout": timeout}
+        if json_body is not None:
+            kwargs["json"] = json_body
+        if data is not None:
+            kwargs["data"] = data
+        if headers is not None:
+            kwargs["headers"] = headers
+        return request_method(url, **kwargs)
+
     def play(self, wav_url: str) -> dict:
-        return requests.post(
+        return self.request(
+            "post",
             f"{self.base_url}/play",
-            json={"voice_url": wav_url},
+            json_body={"voice_url": wav_url},
             timeout=self.config.http_play_timeout,
         ).json()
 
@@ -68,21 +182,30 @@ class StackchanClient:
         return result
 
     def get_audio(self) -> bytes | None:
-        resp = requests.get(f"{self.base_url}/audio", timeout=self.config.http_audio_timeout)
+        resp = self.request("get", f"{self.base_url}/audio", timeout=self.config.http_audio_timeout)
         if resp.status_code == 200:
             return resp.content
         return None
 
     def audio_status(self) -> dict:
-        return requests.get(f"{self.base_url}/audio/status", timeout=self.config.http_status_timeout).json()
+        return self.request(
+            "get",
+            f"{self.base_url}/audio/status",
+            timeout=self.config.http_status_timeout,
+        ).json()
 
     def playback_status(self) -> dict:
-        return requests.get(f"{self.base_url}/playback/status", timeout=self.config.http_status_timeout).json()
+        return self.request(
+            "get",
+            f"{self.base_url}/playback/status",
+            timeout=self.config.http_status_timeout,
+        ).json()
 
     def start_audio_session(self) -> dict:
-        return requests.post(
+        return self.request(
+            "post",
             f"{self.base_url}/audio/session",
-            json={
+            json_body={
                 "codec": "pcm_s16le",
                 "sample_rate": PCM_SAMPLE_RATE,
                 "channels": 1,
@@ -93,32 +216,54 @@ class StackchanClient:
         ).json()
 
     def stop_audio_session(self, session_id: str) -> dict:
-        return requests.delete(
+        return self.request(
+            "delete",
             f"{self.base_url}/audio/session/{session_id}",
             timeout=self.config.http_command_timeout,
         ).json()
 
     def move(self, x: float, y: float, speed: int) -> dict:
-        return requests.post(
+        return self.request(
+            "post",
             f"{self.base_url}/move",
-            json={"x": x, "y": y, "speed": speed},
+            json_body={"x": x, "y": y, "speed": speed},
             timeout=self.config.http_command_timeout,
         ).json()
 
     def gesture(self, gesture: str) -> dict:
-        return requests.post(f"{self.base_url}/{gesture}", timeout=self.config.http_command_timeout).json()
+        return self.request(
+            "post",
+            f"{self.base_url}/{gesture}",
+            timeout=self.config.http_command_timeout,
+        ).json()
 
     def set_face(self, face: str) -> dict:
-        return requests.post(
+        return self.request(
+            "post",
             f"{self.base_url}/face",
-            json={"face": face},
+            json_body={"face": face},
             timeout=self.config.http_command_timeout,
+        ).json()
+
+    def read_env(self) -> dict:
+        return self.request(
+            "get",
+            f"{self.base_url}/env",
+            timeout=self.config.http_status_timeout,
         ).json()
 
     def snapshot(self) -> tuple[bytes | None, int]:
         with suppress(Exception):
-            requests.get(f"{self.base_url}/snapshot", timeout=self.config.http_snapshot_warmup_timeout)
-        resp = requests.get(f"{self.base_url}/snapshot", timeout=self.config.http_snapshot_timeout)
+            self.request(
+                "get",
+                f"{self.base_url}/snapshot",
+                timeout=self.config.http_snapshot_warmup_timeout,
+            )
+        resp = self.request(
+            "get",
+            f"{self.base_url}/snapshot",
+            timeout=self.config.http_snapshot_timeout,
+        )
         if resp.status_code == 200:
             return resp.content, len(resp.content)
         return None, 0
@@ -161,7 +306,8 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
             f"&final={1 if final else 0}&mode=staged"
         )
         try:
-            resp = requests.post(
+            resp = client.request(
+                "post",
                 url,
                 data=segment,
                 headers={

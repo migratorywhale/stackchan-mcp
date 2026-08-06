@@ -78,6 +78,18 @@ This is the shared contract between the CoreS3 firmware and the MCP server.
 
 ## Diagnostics
 
+- `GET /env`
+  - Returns temperature, humidity, and barometric pressure when available.
+  - Success shape:
+    `{"success":true,"temperature":24.3,"humidity":58.2,"pressure":1013.2,"sensors":{"sht31":true,"qmp6988":true}}`
+  - Missing sensors or unavailable readings are returned as `null`.
+  - If no ENV sensor is detected, returns:
+    `{"success":false,"error":"no env sensor detected"}`.
+
+- `GET /env/debug`
+  - Returns raw environmental sensor diagnostics used to validate QMP6988
+    calibration and ADC readings on the host side.
+
 - `GET /servo/status`
 - `GET /playback/status`
   - Includes playback state, PCM queue depth, audio queue depth, download

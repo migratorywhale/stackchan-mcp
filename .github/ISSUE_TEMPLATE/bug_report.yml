@@ -1,0 +1,79 @@
+name: Bug report
+description: Report a reproducible software or integration defect.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug.
+
+        Please do not include API keys, Wi-Fi credentials, private LAN IP addresses, public tunnel hostnames, or other secrets.
+        Avoid attaching raw voice recordings, transcripts, or camera snapshots unless they are necessary and safe to share publicly.
+        Security issues should be reported through `SECURITY.md`, not in a public issue.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - MCP server
+        - Firmware
+        - Shared HTTP contract
+        - Documentation
+        - CI or tooling
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the bug and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: List the smallest sequence that reproduces the problem.
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit, branch, or release
+      placeholder: master @ abc1234
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include host OS, Python version, and device model if relevant.
+      placeholder: macOS 15, Python 3.13, M5Stack CoreS3
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy and safety checks
+      options:
+        - label: I removed secrets, private LAN IPs, and public tunnel details from logs and attachments.
+          required: true
+        - label: I did not include raw voice, transcript, or image data unless it is necessary and safe to share.
+          required: true
+        - label: I understand that `GET /audio` consumes the current recording buffer on the device.
+          required: false

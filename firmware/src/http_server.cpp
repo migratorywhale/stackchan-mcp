@@ -13,6 +13,7 @@
 #include "pcm_upload.h"
 #include "audio_gate.h"
 #include "pcm_stream_service.h"
+#include "env_service.h"
 
 static WebServer server(80);
 
@@ -541,6 +542,53 @@ static void handleSnapshot() {
     Serial.printf("[HTTP] GET /snapshot -> %u bytes JPEG\n", (unsigned)jpgLen);
 }
 
+// GET /env/debug — QMP6988校准字节+原始ADC快照，电脑端验算补偿公式用
+static void handleEnvDebug() {
+    // 先触发一次读取，保证rawP/rawT快照是新鲜的
+    float t, h, pr;
+    readEnv(t, h, pr);
+    server.send(200, "application/json", envDebugJson());
+}
+
+// ────────────────────────────────────────────
+// GET /env
+// → Temperature, humidity, and barometric pressure from onboard sensors
+// ────────────────────────────────────────────
+static void handleEnv() {
+    if (!isEnvAvailable()) {
+        server.send(200, "application/json",
+                    "{\"success\":false,\"error\":\"no env sensor detected\"}");
+        return;
+    }
+
+    float temperature = NAN, humidity = NAN, pressure = NAN;
+    bool ok = readEnv(temperature, humidity, pressure);
+    if (!ok) {
+        server.send(500, "application/json",
+                    String("{\"success\":false,\"error\":\"sensor read failed\",\"detail\":\"") + envLastError() + "\"}");
+        return;
+    }
+
+    JsonDocument doc;
+    doc["success"]     = true;
+    // Use null in JSON for NAN (sensor absent or read error)
+    if (isnan(temperature)) doc["temperature"] = nullptr;
+    else                    doc["temperature"] = roundf(temperature * 10.0f) / 10.0f;
+    if (isnan(humidity))    doc["humidity"]    = nullptr;
+    else                    doc["humidity"]    = roundf(humidity * 10.0f) / 10.0f;
+    if (isnan(pressure))    doc["pressure"]    = nullptr;
+    else                    doc["pressure"]    = roundf(pressure * 10.0f) / 10.0f;
+
+    JsonObject sensors = doc["sensors"].to<JsonObject>();
+    sensors["sht31"]   = isEnvAvailable() && !isnan(humidity);   // humidity only from SHT31
+    sensors["qmp6988"] = isEnvAvailable() && !isnan(pressure);   // pressure only from QMP6988
+
+    String body;
+    serializeJson(doc, body);
+    Serial.printf("[HTTP] GET /env -> t=%.1f h=%.1f p=%.1f\n", temperature, humidity, pressure);
+    server.send(200, "application/json", body);
+}
+
 // ────────────────────────────────────────────
 // 公開関数
 // ────────────────────────────────────────────
@@ -569,6 +617,8 @@ void initHttpServer() {
     server.on("/snapshot",     HTTP_GET,  handleSnapshot);
     server.on("/face",         HTTP_POST, handleFace);
     server.on("/face",         HTTP_GET,  handleFace);
+    server.on("/env",          HTTP_GET,  handleEnv);
+    server.on("/env/debug",    HTTP_GET,  handleEnvDebug);
     server.begin();
     Serial.println("[HTTP] Server started on port 80");
 }

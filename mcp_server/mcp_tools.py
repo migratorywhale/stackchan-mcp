@@ -3,6 +3,7 @@ import logging
 import os
 import shutil
 import time
+from typing import Any
 
 import requests
 
@@ -67,7 +68,7 @@ def check_audio_dir() -> dict[str, object]:
     }
 
 
-def build_health_report(client: StackchanClient, config: StackchanConfig) -> dict[str, object]:
+def build_health_report(client: Any, config: StackchanConfig) -> dict[str, object]:
     device: dict[str, object] = {
         "base_url": client.base_url,
         "ok": False,
@@ -97,7 +98,9 @@ def build_health_report(client: StackchanClient, config: StackchanConfig) -> dic
     return report
 
 
-def post_preferred_pcm_stream(client: StackchanClient, text: str, lang: str, config: StackchanConfig) -> dict:
+def post_preferred_pcm_stream(
+    client: StackchanClient, text: str, lang: str, config: StackchanConfig
+) -> dict:
     def pcm_chunks():
         return audio_processing.iter_fish_pcm_stream(text, lang, config)
 
@@ -122,7 +125,7 @@ def post_preferred_pcm_stream(client: StackchanClient, text: str, lang: str, con
     return result
 
 
-def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_cls):
+def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
     @mcp.tool()
     def stackchan_say(text: str, lang: str = "zh") -> str:
         request_id = new_request_id()
@@ -431,6 +434,46 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
                 f"heap={status.get('free_heap', '?')} "
                 f"psram={status.get('free_psram', '?')}"
             )
+        except requests.exceptions.ConnectionError:
+            return f"❌ Stack-chan offline (cannot reach {config.stackchan_ip})"
+        except Exception as exc:
+            return f"❌ Error: {exc}"
+
+    @mcp.tool()
+    def stackchan_sense() -> str:
+        """Read environmental sensor data from the robot: temperature, humidity, and barometric
+        pressure. Use this to understand the physical conditions around Stack-chan. A falling
+        barometric pressure reading often precedes weather changes and headaches — worth noting
+        when someone reports feeling unwell. Values are returned only for sensors that report
+        a valid reading; missing or NaN fields are silently omitted."""
+        audit_tool_call("stackchan_sense")
+        try:
+            data = client.read_env()
+            parts = []
+            temp = data.get("temperature")
+            if temp is not None:
+                try:
+                    if temp == temp:  # NaN check
+                        parts.append(f"🌡️ {float(temp):.1f}°C")
+                except (TypeError, ValueError):
+                    pass
+            humidity = data.get("humidity")
+            if humidity is not None:
+                try:
+                    if humidity == humidity:
+                        parts.append(f"💧 {float(humidity):.1f}%")
+                except (TypeError, ValueError):
+                    pass
+            pressure = data.get("pressure")
+            if pressure is not None:
+                try:
+                    if pressure == pressure:
+                        parts.append(f"🔽 {float(pressure):.1f} hPa")
+                except (TypeError, ValueError):
+                    pass
+            if not parts:
+                return "⚠️ No sensor data available"
+            return "  ".join(parts)
         except requests.exceptions.ConnectionError:
             return f"❌ Stack-chan offline (cannot reach {config.stackchan_ip})"
         except Exception as exc:

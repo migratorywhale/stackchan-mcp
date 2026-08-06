@@ -1,75 +1,60 @@
-# m5stack-push-avatar
+# Stack-chan Firmware
 
-**Push-based voice avatar firmware for M5Stack CoreS3**
+**M5Stack CoreS3 firmware for the Stack-chan MCP robot**
 
-PC/Mac から音声をプッシュ送信できる、M5Stack CoreS3 用アバターファームウェアです。  
-[m5stack-avatar](https://github.com/meganetaaan/m5stack-avatar) をベースに、外部サーバーからの push 型音声再生に対応しています。
+PC/Mac 上の MCP サーバーや補助ツールから、M5Stack CoreS3 上の Stack-chan を HTTP で制御するためのファームウェアです。
+音声再生、録音取得、表情表示、サーボ動作、カメラ撮影、環境センサー取得を担当します。
 
 ---
 
 ## ✨ 特徴
 
-- **Push 型音声再生**: PC/Mac から `POST /play` で音声URLを送るだけで即座に再生
-- **ポーリング不要**: M5Stack 側がサーバーを叩きに行かないため、レスポンスが速い
-- **デュアルネットワーク対応**: 自宅Wi-Fi（Mac）とスマホホットスポットを自動切り替え
-- **MCP モード対応**: Claude Desktop 等の MCP クライアントと連携可能
-- **プリトリガーバッファ**: 発話の頭切れを防ぐリングバッファ実装済み
-- **Arduino C++**: Moddable / TypeScript 不要、Arduino IDE または PlatformIO で書き込める
+- **HTTP 音声再生**: `POST /play` で WAV URL を再生、`POST /play/pcm` と TCP PCM ストリームで低遅延 PCM 再生
+- **録音の MCP pull モード**: `POST /mode` で録音状態を初期化し、`GET /audio/status` と `GET /audio` で取得
+- **表情・動作・視覚**: `POST /face`、`POST /move`、`POST /nod`、`POST /shake`、`GET /snapshot`
+- **診断エンドポイント**: `GET /playback/status`、`GET /servo/status`、`GET /env`、`GET /env/debug`
+- **Arduino / PlatformIO ベース**: CoreS3 向けの C++ ファームウェア
 
 ---
 
-## 🔧 動作確認済み環境
+## 🔧 対応ハードウェア
 
 | ハードウェア | 備考 |
 |-------------|------|
-| M5Stack CoreS3 Lite | CoreS3（通常版）でも動作するはず |
+| M5Stack CoreS3 | 推奨ターゲット |
+| Stack-chan 本体 + サーボ | 首振り動作に使用 |
+| M5Stack ENV III Unit | 温度・湿度・気圧の取得に対応 |
 
 ---
 
 ## ⚙️ セットアップ
 
-### 1. `config.h` を編集
+### 1. `src/config.h` を用意
 
-自宅環境とスマホホットスポットなど、最大2系統の Wi-Fi を設定します。
+例から設定ファイルを作成し、Wi-Fi など必要な値を設定します。
 
-```cpp
-// 自宅 Wi-Fi
-#define WIFI_SSID_0     "your-home-ssid"
-#define WIFI_PASSWORD_0 "your-home-password"
-
-// スマホホットスポット（外出時）
-#define WIFI_SSID_1     "YourHotspotName"
-#define WIFI_PASSWORD_1 "your-hotspot-password"
+```bash
+cp config.h.example src/config.h
 ```
 
-起動時に上から順に接続を試み、成功した Wi-Fi で HTTP API を公開します。  
-スマホホットスポットのみで使う場合は `WIFI_NETWORK_COUNT 1` にして `SSID_0` だけ設定してもOKです。
+`src/config.h` では少なくとも Wi-Fi 設定を見直してください。
+既存のローカル秘密情報は上書きせず、例ファイルをベースに編集します。
 
-### 2. 書き込み
+### 2. ビルドと書き込み
 
-**Arduino IDE の場合**
-
-必要なライブラリ（ライブラリマネージャーからインストール）：
-- M5Unified
-- m5stack-avatar
-- ArduinoJson
-
-ボード設定: `M5Stack CoreS3`
-
-**PlatformIO（VSCode）の場合**
-
-```ini
-; platformio.ini
-[env:m5stack-cores3]
-platform = espressif32@7.0.0
-board = m5stack-cores3
-framework = arduino
-build_flags = -O3 -flto
-lib_deps =
-    m5stack/M5Unified@0.2.15
-    meganetaaan/m5stack-avatar@0.10.0
-    bblanchon/ArduinoJson@7.4.3
+```bash
+pio run
+pio run -t upload
 ```
+
+シリアル確認:
+
+```bash
+pio device monitor
+```
+
+表情アセットを差し替える場合は、LittleFS への `uploadfs` ではなく、
+`scripts/generate_gif_assets.py` で `gif_assets.h` を再生成します。
 
 ---
 
@@ -77,23 +62,43 @@ lib_deps =
 
 | エンドポイント | 用途 |
 |--------------|------|
-| `POST /play` | 音声URLを受け取って再生 |
-| `POST /mode` | MCP 録音状態を初期化 |
+| `POST /play` | WAV URL を受け取って再生 |
+| `POST /play/pcm` | 24kHz mono s16le PCM を受け取って再生またはキュー投入 |
+| `POST /mode` | 録音状態を初期化 (`mode` は `mcp` のみ) |
 | `GET /audio/status` | 録音完了フラグを確認 |
 | `GET /audio` | 録音済み WAV を取得 |
+| `POST /move` / `POST /home` / `POST /nod` / `POST /shake` | 頭の向きとジェスチャー制御 |
+| `POST /face` / `GET /face` | 表情を変更 / 確認 |
+| `GET /snapshot` | カメラ JPEG を取得 |
+| `GET /playback/status` | 音声再生・PCM キュー診断 |
+| `GET /servo/status` | サーボ状態診断 |
+| `GET /env` | 温度・湿度・気圧を取得 |
+| `GET /env/debug` | 環境センサーの診断情報を取得 |
 
 ---
 
-## 🔌 連携バックエンド
+## 😀 表情アセット
 
-[yuno-chan-api](https://github.com/yukincom/yuno-chan-api) はこのファームウェアに対応したバックエンド実装です。  
-Whisper（STT）・VOICEVOX / Kokoro（TTS）・Gemini（AI）を組み合わせたホームアシスタントとして動作します。
+現在の表情は `firmware/src/gif_assets.h` にコンパイル済みアセットとして含まれます。
+`firmware/data/` へ GIF を置いて `uploadfs` する旧方式ではありません。
+
+独自表情へ差し替える場合は、リポジトリルートから次を実行します。
+
+```bash
+python3 scripts/generate_gif_assets.py
+cd firmware && pio run
+```
+
+入力は `firmware/data/A_calm.gif`、`B_thinking.gif` など、7表情すべてが
+必要です。`--check` を指定すると、書き込まずに生成済みヘッダーとの一致を
+確認できます。
 
 ---
 
 ## 🙏 クレジット
 
-- [m5stack-avatar](https://github.com/meganetaaan/m5stack-avatar) by meganetaaan
+- [Stack-chan](https://github.com/m5stack/StackChan)
+- [AnimatedGIF](https://github.com/bitbank2/AnimatedGIF)
 
 ---
 

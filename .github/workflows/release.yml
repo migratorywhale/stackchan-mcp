@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-release:
+    name: Verify and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Verify release tag policy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag_name="${GITHUB_REF_NAME}"
+          if [[ ! "${tag_name}" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]]; then
+            echo "Release tags must match vYYYY.MM.DD; got: ${tag_name}" >&2
+            exit 1
+          fi
+
+          git fetch --force --tags origin "+refs/heads/master:refs/remotes/origin/master"
+
+          tag_object_type="$(git for-each-ref "refs/tags/${tag_name}" --format='%(objecttype)')"
+          if [[ "${tag_object_type}" != "tag" ]]; then
+            echo "Release tags must be annotated; ${tag_name} is ${tag_object_type:-missing}." >&2
+            exit 1
+          fi
+
+          tag_commit="$(git rev-list -n 1 "${tag_name}")"
+          master_commit="$(git rev-parse "refs/remotes/origin/master")"
+
+          if [[ "${tag_commit}" != "${master_commit}" ]]; then
+            echo "Release tag ${tag_name} must point to origin/master HEAD." >&2
+            echo "tag commit:    ${tag_commit}" >&2
+            echo "origin/master: ${master_commit}" >&2
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      - name: Install PlatformIO
+        run: python -m pip install platformio==6.1.18
+
+      - name: Run release quality gates
+        run: make ci-local
+
+      - name: Prepare release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          cp firmware/.pio/build/m5stack-cores3/firmware.bin dist/stackchan-firmware.bin
+          cp firmware/.pio/build/m5stack-cores3/firmware.elf dist/stackchan-firmware.elf
+          cp LICENSE dist/LICENSE
+          cp THIRD_PARTY_NOTICES.md dist/THIRD_PARTY_NOTICES.md
+          uv build --out-dir dist
+          uv run cyclonedx-py environment .venv/bin/python --pyproject pyproject.toml --output-reproducible --output-format JSON --output-file dist/python-sbom.cdx.json
+          (
+            cd firmware
+            pio pkg list -e m5stack-cores3
+          ) > dist/platformio-packages.txt
+          cd dist
+          sha256sum \
+            stackchan-firmware.bin \
+            stackchan-firmware.elf \
+            LICENSE \
+            THIRD_PARTY_NOTICES.md \
+            stackchan_tools-*.whl \
+            stackchan_tools-*.tar.gz \
+            python-sbom.cdx.json \
+            platformio-packages.txt > SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          dist/stackchan-firmware.bin
+          dist/stackchan-firmware.elf
+          dist/LICENSE
+          dist/THIRD_PARTY_NOTICES.md
+          dist/stackchan_tools-*.whl
+          dist/stackchan_tools-*.tar.gz
+          dist/python-sbom.cdx.json
+          dist/platformio-packages.txt
+          dist/SHA256SUMS
+          --verify-tag
+          --generate-notes
+          --title "$GITHUB_REF_NAME"
