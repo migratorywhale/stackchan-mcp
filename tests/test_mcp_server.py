@@ -6,10 +6,12 @@ import logging
 import os
 import struct
 import sys
+import threading
 import types
 import wave
+from http.server import ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import requests
@@ -18,7 +20,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from mcp_server import audio_processing
+from mcp_server import audio_processing, audio_server
 from mcp_server.audio_server import audio_url
 from mcp_server.listening import capture_ready_recording, format_listen_result
 from mcp_server.mcp_tools import (
@@ -156,12 +158,16 @@ def assert_mcp_json_serializable(value: Any) -> None:
     json.dumps(mcp_json_payload(value))
 
 
+def stackchan_client_double(client: object) -> StackchanClient:
+    return cast(StackchanClient, client)
+
+
 def test_server_entrypoint_registers_expected_tools(monkeypatch):
     fake_mcp_package = types.ModuleType("mcp")
     fake_mcp_server = types.ModuleType("mcp.server")
     fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
-    fake_fastmcp.FastMCP = FakeFastMCP
-    fake_fastmcp.Image = lambda data, format: {"data": data, "format": format}
+    cast(Any, fake_fastmcp).FastMCP = FakeFastMCP
+    cast(Any, fake_fastmcp).Image = lambda data, format: {"data": data, "format": format}
 
     monkeypatch.setitem(sys.modules, "mcp", fake_mcp_package)
     monkeypatch.setitem(sys.modules, "mcp.server", fake_mcp_server)
@@ -170,6 +176,7 @@ def test_server_entrypoint_registers_expected_tools(monkeypatch):
 
     module_path = REPO_ROOT / "mcp_server" / "server.py"
     spec = importlib.util.spec_from_file_location("mcp_server.server_under_test", module_path)
+    assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -186,6 +193,7 @@ def test_server_entrypoint_registers_expected_tools(monkeypatch):
         "stackchan_home",
         "stackchan_status",
         "stackchan_health",
+        "stackchan_sense",
         "stackchan_config_summary",
         "stackchan_playback_status",
         "stackchan_voice_inbox",
@@ -269,6 +277,7 @@ def test_registered_mcp_tools_return_json_serializable_content(monkeypatch, tmp_
         "stackchan_home": {},
         "stackchan_status": {},
         "stackchan_health": {},
+        "stackchan_sense": {},
         "stackchan_config_summary": {},
         "stackchan_playback_status": {},
         "stackchan_voice_inbox": {"limit": 10},
@@ -777,6 +786,87 @@ def test_voice_upload_rate_limiter_limits_by_client():
     assert limiter.allow("192.0.2.1", now=161.1) is True
 
 
+def test_voice_upload_health_payload_omits_sensitive_runtime_details(tmp_path):
+    payload = stackchan_voice_upload_server.build_health_payload(
+        stackchan_voice_upload_server.ServerOptions(
+            lang="zh",
+            max_bytes=1024,
+            inbox_path=tmp_path / "voice_inbox.jsonl",
+            wake_url="http://127.0.0.1:3200/wake",
+            wake_session_id="117067d6-1111-2222-3333-444444444444",
+            wake_session_title="private room",
+            wake_token="agent-token",
+            wake_model="opus",
+            wake_timeout=3,
+            wake_retries=1,
+            wake_retry_delay=0.5,
+            wake_force=True,
+            wake_quiet_minutes=2,
+            prompt_prefix="[前端语音输入] ",
+            wake_words=("小塔", "机器人"),
+            upload_token="secret-token-for-test",
+            upload_rate_per_minute=12,
+            upload_rate_window_seconds=60,
+            allowed_origins=("https://example.com",),
+        )
+    )
+
+    assert payload["frontend_enabled"] is True
+    assert payload["inbox_enabled"] is True
+    assert "wake_session_id" not in payload
+    assert "wake_session_title" not in payload
+    assert "inbox" not in payload
+    assert "wake_words" not in payload["config"]
+    assert "allowed_origins" not in payload["config"]
+
+
+@pytest.mark.parametrize(
+    ("host", "is_allowed_without_token"),
+    [
+        ("127.0.0.1", True),
+        ("::1", True),
+        ("localhost", True),
+        ("0.0.0" + ".0", False),
+        ("192.0.2.50", False),
+        ("stackchan.local", False),
+    ],
+)
+def test_voice_upload_token_required_for_non_loopback_bind(host, is_allowed_without_token):
+    parser = argparse.ArgumentParser()
+
+    if is_allowed_without_token:
+        stackchan_voice_upload_server.validate_upload_token_requirement(host, "", parser)
+    else:
+        with pytest.raises(SystemExit, match="2"):
+            stackchan_voice_upload_server.validate_upload_token_requirement(host, "", parser)
+
+    stackchan_voice_upload_server.validate_upload_token_requirement(host, "configured-token", parser)
+
+
+def test_audio_server_disables_cache_and_blocks_parent_traversal(monkeypatch, tmp_path):
+    monkeypatch.setattr(audio_server, "AUDIO_DIR", tmp_path)
+    (tmp_path / "hello.wav").write_bytes(b"hello")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), audio_server.QuietHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+
+    try:
+        ok_response = requests.get(f"{base_url}/hello.wav", timeout=5)
+        blocked_response = requests.get(f"{base_url}/../secret.txt", timeout=5)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+    assert ok_response.status_code == 200
+    assert ok_response.headers["Cache-Control"] == "no-store"
+    assert ok_response.headers["Pragma"] == "no-cache"
+    assert ok_response.headers["X-Content-Type-Options"] == "nosniff"
+    assert blocked_response.status_code == 404
+
+
 def test_voice_upload_wake_words_preserve_activation_name():
     matched, prompt_text, wake_word = stackchan_frontend_wake.match_wake_word(
         "小塔，请看看窗外。",
@@ -1021,7 +1111,12 @@ def test_voice_inbox_mcp_tools(monkeypatch, tmp_path):
     monkeypatch.setenv("STACKCHAN_VOICE_INBOX", str(inbox))
 
     mcp = FakeFastMCP()
-    register_tools(mcp, object(), make_config(), lambda data, format: {"data": data, "format": format})
+    register_tools(
+        mcp,
+        stackchan_client_double(object()),
+        make_config(),
+        lambda data, format: {"data": data, "format": format},
+    )
 
     assert "测试" in mcp.tools["stackchan_voice_inbox"]()
     assert "cleared" in mcp.tools["stackchan_voice_inbox_clear"]()
@@ -1757,7 +1852,7 @@ def test_capture_ready_recording_does_not_consume_audio_when_not_ready(tmp_path)
         def get_audio(self):
             raise AssertionError("GET /audio consumes the device buffer and should not be called")
 
-    result = capture_ready_recording(FakeClient(), make_config(), audio_dir=tmp_path)
+    result = capture_ready_recording(stackchan_client_double(FakeClient()), make_config(), audio_dir=tmp_path)
 
     assert result == {
         "ready": False,
@@ -1783,7 +1878,7 @@ def test_capture_ready_recording_writes_wav_and_transcribes(monkeypatch, tmp_pat
 
     monkeypatch.setattr(audio_processing, "transcribe_audio", fake_transcribe)
 
-    result = capture_ready_recording(FakeClient(), make_config(), audio_dir=tmp_path)
+    result = capture_ready_recording(stackchan_client_double(FakeClient()), make_config(), audio_dir=tmp_path)
 
     assert result["ready"] is True
     assert result["consumed"] is True
@@ -1803,7 +1898,9 @@ def test_capture_ready_recording_requires_fish_key_before_consuming_audio(tmp_pa
             raise AssertionError("GET /audio should not be called without ASR credentials")
 
     result = capture_ready_recording(
-        FakeClient(),
+        stackchan_client_double(FakeClient()),
+        # capture_ready_recording only needs the small FakeClient surface in this test.
+        # Cast keeps the production signature strict while allowing a focused test double.
         make_config(fish_audio_key=""),
         audio_dir=tmp_path,
     )
@@ -1812,6 +1909,45 @@ def test_capture_ready_recording_requires_fish_key_before_consuming_audio(tmp_pa
     assert result["consumed"] is False
     assert "Fish Audio key is not configured" in result["error"]
     assert "Fish Audio key is not configured" in format_listen_result(result)
+
+
+def test_stackchan_sense_formats_available_environment_values():
+    class FakeClient:
+        def read_env(self):
+            return {
+                "temperature": 25.125,
+                "humidity": 60,
+                "pressure": 1008.3,
+            }
+
+    mcp = FakeFastMCP()
+    register_tools(mcp, FakeClient(), make_config(), lambda data, format: {"data": data, "format": format})
+
+    result = mcp.tools["stackchan_sense"]()
+
+    assert result == "🌡️ 25.1°C  💧 60.0%  🔽 1008.3 hPa"
+
+
+def test_stackchan_sense_omits_nan_and_reports_missing_or_failed_reads():
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        def read_env(self):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "temperature": float("nan"),
+                    "humidity": None,
+                    "pressure": "bad",
+                }
+            raise RuntimeError("sensor bus offline")
+
+    mcp = FakeFastMCP()
+    register_tools(mcp, FakeClient(), make_config(), lambda data, format: {"data": data, "format": format})
+
+    assert mcp.tools["stackchan_sense"]() == "⚠️ No sensor data available"
+    assert mcp.tools["stackchan_sense"]() == "❌ Error: sensor bus offline"
 
 
 def test_playback_status_formats_runtime_diagnostics():

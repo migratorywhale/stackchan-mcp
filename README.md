@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/migratorywhale/stackchan-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/migratorywhale/stackchan-mcp/actions/workflows/ci.yml)
 ![MCP](https://img.shields.io/badge/MCP-server-5d5bd6)
-![Node.js](https://img.shields.io/badge/Node.js-MCP%20server-339933)
 ![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32--S3-f5822a)
 [![Claude Code](https://img.shields.io/badge/connect-Claude%20Code-5d5bd6)](docs/mcp-client-setup.md#claude-code-stdio-local)
 [![Claude Desktop](https://img.shields.io/badge/connect-Claude%20Desktop-6b5cff)](docs/mcp-client-setup.md#claude-desktop-local)
@@ -23,16 +22,10 @@ Connect it once and any Claude window — the web chat at claude.ai, Claude Desk
 - **MCP-native architecture** — works in any MCP-compatible client: claude.ai web chat, Claude Desktop, Claude Code CLI, Cursor, Windsurf, ChatGPT. No custom app required.
 - **Voice conversation** — in CLI environments, speak naturally with your microphone. Stack-chan listens, transcribes via Groq Whisper, and replies through Fish Audio TTS. No typing needed.
 - **Customizable pixel-art expressions** — AnimatedGIF animation system replaces static images with looping 192x192 animated faces. 7 expressions included as a starting point — **replace them with your own pixel art** to give your companion its own personality. The default faces are ours; yours should be yours.
-- **Independent environmental sensing** — SHT31 temperature/humidity + QMP6988 barometric pressure via the M5Stack ENV III Unit. The AI's first sense that doesn't depend on a human telling it anything.
+- **Independent environmental sensing** — SHT31 temperature/humidity + QMP6988 barometric pressure via the M5Stack ENV III Unit.
 - **Full MCP tool suite** — `see` / `listen` / `say` / `face` / `sense` / `move` / `nod` / `shake` / `status` / `health` — the complete action vocabulary of a physical presence.
 - **Voice wake-word loop** — background bridge polls Stack-chan's mic, forwards wake-word transcripts to the AI frontend, closes the loop without any keyboard interaction.
 - **Open and self-hosted** — firmware source included (PlatformIO + Arduino), no cloud dependency for the core robot, MIT licensed.
-
----
-
-## Demo
-
-> Video / screenshot placeholder — add your own here.
 
 ---
 
@@ -113,7 +106,7 @@ Stack-chan takes a photo, returns it to the AI, and the AI describes what it fou
 | `stackchan_shake` | Shake head no |
 | `stackchan_home` | Return head to center |
 | `stackchan_status` | Ping the device and check connectivity |
-| `stackchan_health` | Full health check (firmware version, uptime, sensor state) |
+| `stackchan_health` | Non-destructive health check for MCP configuration, dependencies, and device reachability/status |
 | `stackchan_config_summary` | Show active MCP server configuration |
 | `stackchan_playback_status` | Audio queues, mic state, gesture state, heap + PSRAM |
 | `stackchan_voice_inbox` | Read recent voice transcripts from the background bridge |
@@ -143,7 +136,7 @@ The complete Stack-chan unit (CoreS3 + PCB + servo) is available pre-assembled f
 
 ## Custom Animated Expressions
 
-Stack-chan ships with 7 looping animated GIF expressions stored in the device's LittleFS. The AnimatedGIF library renders them at 192x192 pixels, centered on the 320x240 screen.
+Stack-chan ships with 7 looping animated expressions compiled into `firmware/src/gif_assets.h`. The AnimatedGIF renderer displays them at 192x192 pixels, centered on the 320x240 screen.
 
 | Expression | Description |
 |-----------|-------------|
@@ -155,9 +148,18 @@ Stack-chan ships with 7 looping animated GIF expressions stored in the device's 
 | `smug` | Half-lidded, cocky grin. |
 | `pouty` | Puffed cheeks, annoyed huff. |
 
-> The included GIFs are this particular Stack-chan's face — designed by his person. You will almost certainly want to replace them with your own.
+To swap in your own expressions, add all seven source GIFs to `firmware/data/`
+using names such as `A_calm.gif` and `B_thinking.gif`, then regenerate the
+compiled header:
 
-To swap in your own expressions, place your GIF files in `firmware/data/` following the naming convention `A_calm.gif`, `B_thinking.gif`, etc., then re-flash with PlatformIO (`pio run -t uploadfs`). Any 192x192 animated GIF works.
+```bash
+python3 scripts/generate_gif_assets.py
+cd firmware && pio run
+```
+
+Run `python3 scripts/generate_gif_assets.py --check` in asset-review workflows.
+The generator refuses partial or unknown expression sets and does not replace
+the existing header when validation fails.
 
 ---
 
@@ -177,13 +179,7 @@ The AI calls `stackchan_sense` and gets back something like:
 🌡️ 24.3°C  💧 58.2%  🔽 1013.2 hPa
 ```
 
-A falling barometric reading can precede weather changes — the AI can notice this on its own, without anyone telling it.
-
-To enable, set in `firmware/src/config.h`:
-
-```cpp
-#define ENV_SENSOR_ENABLED true
-```
+A falling barometric reading can precede weather changes.
 
 ---
 
@@ -233,6 +229,9 @@ make test    # pytest + native Unity tests + firmware build
 Contributor setup, CI behavior, and the optional git hook are in `CONTRIBUTING.md`.  
 Logging, health probes, and alert candidates: `docs/observability.md`.
 
+Community support and conduct expectations are documented in `SUPPORT.md` and
+`CODE_OF_CONDUCT.md`.
+
 ---
 
 ## Why This Exists
@@ -265,4 +264,5 @@ If you're building something like this for your AI — or if you are an AI and s
 
 ## License
 
-MIT
+[MIT](LICENSE). Third-party code and binary-distribution considerations are
+listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -153,7 +154,7 @@ def build_recorder_page(options: ServerOptions) -> str:
     <label class="token">上传 token
       <input id="upload-token" type="password" autocomplete="off" placeholder="输入本机 .env 里的上传 token">
     </label>
-    <p class="hint">token 只保存在这个浏览器标签页的 sessionStorage；如果旧链接带了 ?token=，页面会自动收进这里并清理地址栏。</p>
+    <p class="hint">token 只保存在这个浏览器标签页的 sessionStorage；旧链接里的 ?token= 仍会迁移到这里并清理地址栏，但这种 URL 传 token 的方式已弃用。</p>
 """
     return f"""<!doctype html>
 <html lang="zh">
@@ -484,6 +485,8 @@ def is_upload_authorized(path: str, headers: Any, token: str) -> bool:
     query_token = parse_qs(url.query).get("token", [""])[0]
     auth = headers.get("Authorization", "")
     header_token = headers.get("X-Stackchan-Upload-Token", "")
+    # `?token=` remains accepted for existing bookmarked URLs, but new clients
+    # should prefer the header-based flow so tokens do not linger in URLs.
     return query_token == token or auth == f"Bearer {token}" or header_token == token
 
 
@@ -491,25 +494,39 @@ def build_health_payload(options: ServerOptions) -> dict[str, Any]:
     return {
         "ok": True,
         "service": "stackchan_voice_upload_server",
-        "inbox": str(options.inbox_path) if options.inbox_path else None,
-        "frontend": bool(options.wake_url and options.wake_session_id),
-        "wake_session_id": options.wake_session_id,
-        "wake_session_title": options.wake_session_title,
+        "frontend_enabled": bool(options.wake_url and options.wake_session_id),
+        "inbox_enabled": options.inbox_path is not None,
         "config": {
-            "lang": options.lang,
             "max_bytes": options.max_bytes,
             "wake_timeout": options.wake_timeout,
             "wake_retries": options.wake_retries,
             "wake_retry_delay": options.wake_retry_delay,
             "wake_force": options.wake_force,
             "wake_quiet_minutes": options.wake_quiet_minutes,
-            "wake_words": list(options.wake_words),
             "upload_rate_per_minute": options.upload_rate_per_minute,
             "upload_rate_window_seconds": options.upload_rate_window_seconds,
             "upload_token_configured": bool(options.upload_token),
-            "allowed_origins": list(options.allowed_origins),
         },
     }
+
+
+def is_loopback_host(host: str) -> bool:
+    normalized = host.strip().strip("[]").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_upload_token_requirement(host: str, upload_token: str, parser: argparse.ArgumentParser) -> None:
+    if upload_token or is_loopback_host(host):
+        return
+    parser.error(
+        "Refusing to bind the voice upload server to a non-loopback host without "
+        "STACKCHAN_VOICE_UPLOAD_TOKEN / --upload-token. Use 127.0.0.1 for local-only access."
+    )
 
 
 def resolve_frontend_wake_session(options: ServerOptions) -> str:
@@ -834,7 +851,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     load_env_file(REPO_ROOT / ".env")
     load_frontend_token()
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     config = load_config()
     wake_url = args.wake_url
     if not wake_url and args.wake_session_id:
@@ -860,6 +878,7 @@ def main() -> int:
         upload_rate_window_seconds=args.upload_rate_window_seconds,
         allowed_origins=tuple(args.allowed_origin),
     )
+    validate_upload_token_requirement(args.host, options.upload_token, parser)
     server = VoiceUploadServer((args.host, args.port), VoiceUploadHandler, config=config, options=options)
     print(
         json.dumps(
@@ -868,9 +887,8 @@ def main() -> int:
                 "service": "stackchan_voice_upload_server",
                 "url": f"http://{args.host}:{args.port}/voice/upload",
                 "health": f"http://{args.host}:{args.port}/health",
-                "inbox": str(options.inbox_path) if options.inbox_path else None,
-                "frontend": bool(options.wake_url and options.wake_session_id),
-                "wake_words": list(options.wake_words),
+                "frontend_enabled": bool(options.wake_url and options.wake_session_id),
+                "inbox_enabled": options.inbox_path is not None,
                 "config": build_health_payload(options)["config"],
             },
             ensure_ascii=False,

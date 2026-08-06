@@ -28,8 +28,14 @@ The MCP HTTP helper starts only the local MCP server by default. Public
 cloudflared tunnel startup requires `STACKCHAN_ENABLE_PUBLIC_MCP_TUNNEL=1`.
 Treat any public MCP URL as sensitive operational infrastructure.
 
-Voice upload endpoints should use `STACKCHAN_VOICE_UPLOAD_TOKEN` whenever they
-are reachable from another device or through a tunnel.
+Voice upload endpoints require `STACKCHAN_VOICE_UPLOAD_TOKEN` whenever the
+receiver binds a non-loopback address. Send it with the
+`X-Stackchan-Upload-Token` header; query-string tokens are deprecated because
+URLs can leak through browser history and copied links.
+
+The generated-WAV server listens on the LAN so the device can fetch speech
+audio. Responses are marked `no-store`, but the endpoint is not authenticated.
+Keep its port inside a trusted network and remove generated audio promptly.
 
 ## Dependency Updates
 

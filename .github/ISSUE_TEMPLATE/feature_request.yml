@@ -1,0 +1,58 @@
+name: Feature request
+description: Propose a new capability or improvement.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem first, then the proposed change.
+
+        Do not post secrets, private LAN IP addresses, or public tunnel hostnames.
+        If the request has security implications, use the process in `SECURITY.md` instead of a public issue.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Request area
+      options:
+        - MCP server
+        - Firmware
+        - Hardware integration
+        - Documentation
+        - Developer tooling
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What limitation or pain point are you trying to address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Explain the change you want and how it would help.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: List workarounds or other approaches you considered.
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware or deployment context
+      description: Note the CoreS3 setup, add-ons, or network assumptions if relevant.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy and safety checks
+      options:
+        - label: I removed secrets, private LAN IPs, and public tunnel details from any examples or attachments.
+          required: true
+        - label: I did not attach voice recordings, transcripts, or camera images unless they are necessary and safe to share publicly.
+          required: true

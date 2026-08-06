@@ -81,15 +81,16 @@ Local Network permission; fix the permission first.
 
 ## Headless Mac mini services
 
-LaunchDaemon templates that still run the processes as the `koke` user live in:
+Generic LaunchDaemon examples live in:
 
 ```text
-ops/launchd/xyz.migratorybird.stackchan-mcp.plist
-ops/launchd/xyz.migratorybird.stackchan-voice-bridge.plist
+ops/launchd/xyz.stackchan.mcp.plist.example
+ops/launchd/xyz.stackchan.voice-bridge.plist.example
 ```
 
-Keep the equivalent user LaunchAgents unloaded or moved aside while these
-Daemons are installed, otherwise login may start duplicate processes.
+Replace the username and absolute project paths before installation. Keep the
+equivalent user LaunchAgents unloaded or moved aside while these Daemons are
+installed, otherwise login may start duplicate processes.
 
 ## Rollback
 

@@ -4,6 +4,12 @@ Thanks for helping improve `stackchan-mcp`. This project touches both host-side
 Python tooling and firmware that runs on a physical M5Stack CoreS3, so small,
 well-tested changes are easiest to review.
 
+By submitting a contribution, you certify that you created it or otherwise
+have the right to submit it under this repository's MIT License. Record the
+source and license of third-party code, generated assets, and artwork in
+`THIRD_PARTY_NOTICES.md`; do not copy material whose redistribution terms are
+unknown.
+
 ## Before You Open A Pull Request
 
 Run the smallest useful check while iterating, then run the broader gate before

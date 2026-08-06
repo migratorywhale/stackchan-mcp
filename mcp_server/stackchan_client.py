@@ -5,6 +5,7 @@ import struct
 import subprocess
 import time
 from contextlib import suppress
+from typing import Any
 
 import requests
 
@@ -132,7 +133,7 @@ class StackchanClient:
                 headers=headers,
             )
         request_method = getattr(requests, method.lower())
-        kwargs = {"timeout": timeout}
+        kwargs: dict[str, Any] = {"timeout": timeout}
         if json_body is not None:
             kwargs["json"] = json_body
         if data is not None:

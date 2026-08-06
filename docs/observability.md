@@ -63,8 +63,9 @@ PCM under `/tmp/stackchan_audio/diag_<session>.pcm`.
 - yaw and pitch feedback fields when diagnosing movement.
 
 The voice upload `/health` payload is the best host-side receiver snapshot.
-Use it to verify the listening host/port, inbox path, frontend forwarding
-settings, wake-word mode, upload limits, and max upload size.
+Use it to verify whether inbox and frontend forwarding are enabled plus the
+non-sensitive upload limits and maximum upload size. It intentionally omits
+paths, session identifiers, titles, wake words, origins, and tokens.
 
 ## Alert Candidates
 

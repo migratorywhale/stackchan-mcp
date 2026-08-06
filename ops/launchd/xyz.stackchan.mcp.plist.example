@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>xyz.migratorybird.stackchan-mcp</string>
+  <string>xyz.stackchan.mcp</string>
   <key>UserName</key>
-  <string>koke</string>
+  <string>REPLACE_WITH_MACOS_USERNAME</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/koke/Projects/stackchan-mcp/.venv/bin/python</string>
+    <string>/ABSOLUTE/PATH/TO/stackchan-mcp/.venv/bin/python</string>
     <string>-m</string>
     <string>mcp_server.server</string>
     <string>--http</string>
@@ -18,11 +18,11 @@
     <string>8002</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/koke/Projects/stackchan-mcp</string>
+  <string>/ABSOLUTE/PATH/TO/stackchan-mcp</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
-    <string>/Users/koke</string>
+    <string>/Users/REPLACE_WITH_MACOS_USERNAME</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
@@ -33,8 +33,8 @@
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>/Users/koke/Library/Logs/stackchan-mcp.log</string>
+  <string>/Users/REPLACE_WITH_MACOS_USERNAME/Library/Logs/stackchan-mcp.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/koke/Library/Logs/stackchan-mcp.error.log</string>
+  <string>/Users/REPLACE_WITH_MACOS_USERNAME/Library/Logs/stackchan-mcp.error.log</string>
 </dict>
 </plist>

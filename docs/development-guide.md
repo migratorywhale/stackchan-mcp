@@ -342,6 +342,9 @@ It uses RMS thresholds to trigger recording and to end after silence.
   reads project-root `.env` and respects `STACKCHAN_VOICE_UPLOAD_HOST`,
   `STACKCHAN_VOICE_UPLOAD_PORT`, `STACKCHAN_VOICE_UPLOAD_LOG`, and
   `STACKCHAN_VOICE_UPLOAD_PIDFILE`.
+- The receiver refuses to bind a non-loopback host unless
+  `STACKCHAN_VOICE_UPLOAD_TOKEN` is configured. Loopback-only development keeps
+  the token optional for compatibility.
 - Both voice paths read `AGENT_HOST_TOKEN` from `STACKCHAN_FRONTEND_ENV` when
   `STACKCHAN_FRONTEND_TOKEN` is unset. This avoids copying the frontend token
   into the Stack-chan repo.
@@ -373,8 +376,9 @@ It uses RMS thresholds to trigger recording and to end after silence.
 - For phone tests, set `STACKCHAN_VOICE_UPLOAD_TOKEN`, open the recorder as
   `https://...trycloudflare.com/`, and enter the token in the page. The page
   sends it as `X-Stackchan-Upload-Token`; unauthenticated uploads receive HTTP
-  401. Older `?token=...` links remain accepted for compatibility, but the page
-  moves that token into `sessionStorage` and cleans the address bar.
+  401. Older `?token=...` links remain accepted for compatibility, but they are
+  deprecated; the page moves that token into `sessionStorage` and cleans the
+  address bar.
 - For daily phone use, point your own HTTPS route or reverse proxy at
   `http://localhost:8767` and set `STACKCHAN_VOICE_PUBLIC_URL` to that public
   recorder URL. If you use Cloudflare's default certificate coverage, keep the

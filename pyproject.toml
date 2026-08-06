@@ -2,11 +2,25 @@
 name = "stackchan-tools"
 version = "0.1.0"
 description = "Host-side tooling for the Stack-chan voice avatar."
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
+keywords = ["mcp", "m5stack", "robotics", "stack-chan"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+]
 dependencies = [
     "mcp==1.27.1",
     "requests==2.34.2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/migratorywhale/stackchan-mcp"
+Issues = "https://github.com/migratorywhale/stackchan-mcp/issues"
+Source = "https://github.com/migratorywhale/stackchan-mcp"
 
 [dependency-groups]
 dev = [

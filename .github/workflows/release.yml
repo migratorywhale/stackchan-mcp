@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-release:
+    name: Verify and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      - name: Install PlatformIO
+        run: python -m pip install platformio==6.1.18
+
+      - name: Run release quality gates
+        run: make ci-local
+
+      - name: Prepare firmware artifacts
+        run: |
+          mkdir -p dist
+          cp firmware/.pio/build/m5stack-cores3/firmware.bin dist/stackchan-firmware.bin
+          cp firmware/.pio/build/m5stack-cores3/firmware.elf dist/stackchan-firmware.elf
+          cd dist
+          sha256sum stackchan-firmware.bin stackchan-firmware.elf > SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          dist/stackchan-firmware.bin
+          dist/stackchan-firmware.elf
+          dist/SHA256SUMS
+          --verify-tag
+          --generate-notes
+          --title "$GITHUB_REF_NAME"

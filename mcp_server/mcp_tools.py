@@ -3,6 +3,7 @@ import logging
 import os
 import shutil
 import time
+from typing import Any
 
 import requests
 
@@ -67,7 +68,7 @@ def check_audio_dir() -> dict[str, object]:
     }
 
 
-def build_health_report(client: StackchanClient, config: StackchanConfig) -> dict[str, object]:
+def build_health_report(client: Any, config: StackchanConfig) -> dict[str, object]:
     device: dict[str, object] = {
         "base_url": client.base_url,
         "ok": False,
@@ -97,7 +98,9 @@ def build_health_report(client: StackchanClient, config: StackchanConfig) -> dic
     return report
 
 
-def post_preferred_pcm_stream(client: StackchanClient, text: str, lang: str, config: StackchanConfig) -> dict:
+def post_preferred_pcm_stream(
+    client: StackchanClient, text: str, lang: str, config: StackchanConfig
+) -> dict:
     def pcm_chunks():
         return audio_processing.iter_fish_pcm_stream(text, lang, config)
 
@@ -122,7 +125,7 @@ def post_preferred_pcm_stream(client: StackchanClient, text: str, lang: str, con
     return result
 
 
-def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_cls):
+def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
     @mcp.tool()
     def stackchan_say(text: str, lang: str = "zh") -> str:
         request_id = new_request_id()
@@ -450,21 +453,21 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
             temp = data.get("temperature")
             if temp is not None:
                 try:
-                    if not (temp != temp):  # NaN check
+                    if temp == temp:  # NaN check
                         parts.append(f"🌡️ {float(temp):.1f}°C")
                 except (TypeError, ValueError):
                     pass
             humidity = data.get("humidity")
             if humidity is not None:
                 try:
-                    if not (humidity != humidity):
+                    if humidity == humidity:
                         parts.append(f"💧 {float(humidity):.1f}%")
                 except (TypeError, ValueError):
                     pass
             pressure = data.get("pressure")
             if pressure is not None:
                 try:
-                    if not (pressure != pressure):
+                    if pressure == pressure:
                         parts.append(f"🔽 {float(pressure):.1f} hPa")
                 except (TypeError, ValueError):
                     pass

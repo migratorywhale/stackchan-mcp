@@ -16,6 +16,14 @@ FORBIDDEN_TRACKED_FILES = {
     ".env",
     "firmware/src/config.h",
 }
+REQUIRED_PUBLIC_FILES = {
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "THIRD_PARTY_NOTICES.md",
+}
 
 TOKEN_ASSIGNMENT_RE = re.compile(
     r"""(?<![A-Za-z0-9_${])
@@ -31,6 +39,8 @@ TRYCLOUDFLARE_RE = re.compile(r"https?://(?!\.\.\.)([A-Za-z0-9-]+)\.trycloudflar
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 ACTION_USE_RE = re.compile(r"^\s*uses:\s*(?P<target>[^#\s]+)", re.MULTILINE)
 PINNED_ACTION_RE = re.compile(r"@[0-9a-fA-F]{40}$")
+EXACT_PIO_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*(?:[-+][A-Za-z0-9.-]+)?")
+LOCAL_MACOS_USER_PATH_RE = re.compile(r"/" r"Users/(?!REPLACE_WITH_)[^/\s<]+")
 
 # Retired tunnel hostnames that must never reappear in tracked files. Built from
 # split literals below so this module's own source never contains the
@@ -61,6 +71,7 @@ PLACEHOLDER_VALUES = {
 def main() -> int:
     errors: list[str] = []
     files = tracked_files()
+    check_required_public_files(files, errors)
 
     for path in files:
         if path.name == "CLAUDE.md":
@@ -73,6 +84,7 @@ def main() -> int:
         check_public_tunnel_urls(path, text, errors)
         check_tokens(path, text, errors)
         check_forbidden_hostnames(path, text, errors)
+        check_local_macos_paths(path, text, errors)
         if path.match(".github/workflows/*.yml") or path.match(".github/workflows/*.yaml"):
             check_action_pins(path, text, errors)
 
@@ -117,6 +129,14 @@ def check_forbidden_path(path: Path, errors: list[str]) -> None:
         errors.append(f"{rel} must not be tracked; keep local env files untracked")
     if path.match("deploy/macos/*.plist") and not path.name.endswith(".plist.example"):
         errors.append(f"{rel} must not be tracked; commit only plist examples")
+    if path.match("ops/launchd/*.plist") and not path.name.endswith(".plist.example"):
+        errors.append(f"{rel} must not be tracked; commit only plist examples")
+
+
+def check_required_public_files(files: list[Path], errors: list[str]) -> None:
+    tracked = {relpath(path) for path in files}
+    for required in sorted(REQUIRED_PUBLIC_FILES - tracked):
+        errors.append(f"required public project file is missing: {required}")
 
 
 def check_private_ips(path: Path, text: str, errors: list[str]) -> None:
@@ -164,6 +184,11 @@ def check_forbidden_hostnames(path: Path, text: str, errors: list[str]) -> None:
             errors.append(f"{relpath(path)} contains retired tunnel hostname '{substring}...'")
 
 
+def check_local_macos_paths(path: Path, text: str, errors: list[str]) -> None:
+    if LOCAL_MACOS_USER_PATH_RE.search(text):
+        errors.append(f"{relpath(path)} contains a deployment-specific macOS user path")
+
+
 def check_action_pins(path: Path, text: str, errors: list[str]) -> None:
     for match in ACTION_USE_RE.finditer(text):
         target = match.group("target").strip("\"'")
@@ -181,7 +206,8 @@ def check_python_dependency_pins(errors: list[str]) -> None:
             dependencies.extend(item for item in group if isinstance(item, str))
 
     for dep in dependencies:
-        if "==" not in dep:
+        _, separator, version = dep.partition("==")
+        if not separator or not version or "*" in version or any(op in version for op in "<>=~^"):
             errors.append(f"pyproject.toml dependency must use exact == pin: {dep}")
 
 
@@ -192,7 +218,7 @@ def check_platformio_dependency_pins(errors: list[str]) -> None:
     for section in parser.sections():
         if parser.has_option(section, "platform"):
             platform = parser.get(section, "platform").strip()
-            if platform and "@" not in platform:
+            if platform and not has_exact_pio_version(platform):
                 errors.append(f"firmware/platformio.ini {section}.platform must be pinned: {platform}")
 
         if not parser.has_option(section, "lib_deps"):
@@ -201,8 +227,15 @@ def check_platformio_dependency_pins(errors: list[str]) -> None:
             dep = dep.strip()
             if not dep or dep.startswith(("#", ";")):
                 continue
-            if "@" not in dep:
+            if not has_exact_pio_version(dep):
                 errors.append(f"firmware/platformio.ini {section}.lib_deps must be pinned: {dep}")
+
+
+def has_exact_pio_version(spec: str) -> bool:
+    if "@" not in spec:
+        return False
+    version = spec.rsplit("@", 1)[1].strip()
+    return bool(EXACT_PIO_VERSION_RE.fullmatch(version))
 
 
 def relpath(path: Path) -> str:
