@@ -11,6 +11,14 @@ def test_platformio_versions_must_be_exact() -> None:
     assert not ci_security_audit.has_exact_pio_version("vendor/library")
 
 
+def test_python_versions_must_be_exact() -> None:
+    assert ci_security_audit.has_exact_python_version("mcp==1.28.1")
+    assert ci_security_audit.has_exact_python_version("setuptools==80.9.0")
+    assert not ci_security_audit.has_exact_python_version("mcp>=1.28.1")
+    assert not ci_security_audit.has_exact_python_version("mcp==1.*")
+    assert not ci_security_audit.has_exact_python_version("mcp")
+
+
 def test_local_macos_paths_reject_real_users_but_allow_template() -> None:
     errors: list[str] = []
     path = ci_security_audit.ROOT / "example.plist"

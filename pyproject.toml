@@ -8,12 +8,11 @@ requires-python = ">=3.11"
 keywords = ["mcp", "m5stack", "robotics", "stack-chan"]
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
 ]
 dependencies = [
-    "mcp==1.27.1",
+    "mcp==1.28.1",
     "requests==2.34.2",
 ]
 
@@ -24,10 +23,28 @@ Source = "https://github.com/migratorywhale/stackchan-mcp"
 
 [dependency-groups]
 dev = [
+    "cyclonedx-bom==7.3.1",
+    "pip-audit==2.10.1",
     "pyright==1.1.411",
     "pytest==9.0.3",
     "pytest-cov==7.1.0",
     "ruff==0.15.13",
+]
+
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["mcp_server"]
+
+[tool.uv]
+constraint-dependencies = [
+    "cryptography==50.0.0",
+    "pydantic-settings==2.14.2",
+    "PyJWT==2.13.0",
+    "python-multipart==0.0.31",
+    "starlette==1.3.1",
 ]
 
 [tool.pytest.ini_options]

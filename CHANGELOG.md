@@ -19,9 +19,16 @@ firmware compatibility scheme is introduced.
 - Public examples no longer contain deployment-specific launchd identifiers or
   absolute user paths.
 - AnimatedGIF is pinned exactly for reproducible PlatformIO resolution.
+- Unused direct firmware dependencies were removed while keeping the resolved
+  transitive dependency inventory documented.
+- Releases now require annotated `vYYYY.MM.DD` tags at `origin/master` HEAD and
+  publish checksums, license notices, Python packages and SBOM, and the
+  PlatformIO package inventory.
 
 ### Security
 
 - Public MCP tunnel startup remains opt-in and requires bearer-token
   authentication.
 - Non-loopback voice-upload deployments require an upload token.
+- Known vulnerabilities in the locked Python runtime dependency set were
+  upgraded, and CI now audits production dependencies continuously.

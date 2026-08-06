@@ -28,11 +28,16 @@ The principal directly declared projects are:
 
 - MCP Python SDK: <https://github.com/modelcontextprotocol/python-sdk>
 - Requests: <https://github.com/psf/requests>
-- M5Unified and related M5Stack libraries: <https://github.com/m5stack>
-- m5stack-avatar: <https://github.com/meganetaaan/m5stack-avatar>
+- M5Unified, M5GFX, and StackChan-BSP: <https://github.com/m5stack>
 - ArduinoJson: <https://github.com/bblanchon/ArduinoJson>
-- IRremoteESP8266: <https://github.com/crankyoldgit/IRremoteESP8266>
 - AnimatedGIF: <https://github.com/bitbank2/AnimatedGIF>
+
+The current firmware dependency graph also resolves additional PlatformIO
+packages transitively through the directly declared libraries above. At the
+time of writing, that includes M5Unit-NFC, M5UnitUnified, M5HAL, M5Utility,
+and IRremoteESP8266 (LGPL-2.1-or-later via `StackChan-BSP`). Distributors must
+review the resolved lockstep package set in their build output, not just the
+direct declarations in `firmware/platformio.ini`.
 
 ## Face artwork
 

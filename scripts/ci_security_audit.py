@@ -201,14 +201,25 @@ def check_action_pins(path: Path, text: str, errors: list[str]) -> None:
 def check_python_dependency_pins(errors: list[str]) -> None:
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     dependencies = list(data.get("project", {}).get("dependencies", []))
+    dependencies.extend(data.get("build-system", {}).get("requires", []))
     for group in data.get("dependency-groups", {}).values():
         if isinstance(group, list):
             dependencies.extend(item for item in group if isinstance(item, str))
+    dependencies.extend(data.get("tool", {}).get("uv", {}).get("constraint-dependencies", []))
 
     for dep in dependencies:
-        _, separator, version = dep.partition("==")
-        if not separator or not version or "*" in version or any(op in version for op in "<>=~^"):
+        if not has_exact_python_version(dep):
             errors.append(f"pyproject.toml dependency must use exact == pin: {dep}")
+
+
+def has_exact_python_version(spec: str) -> bool:
+    _, separator, version = spec.partition("==")
+    return bool(
+        separator
+        and version
+        and "*" not in version
+        and not any(op in version for op in "<>=~^")
+    )
 
 
 def check_platformio_dependency_pins(errors: list[str]) -> None:
