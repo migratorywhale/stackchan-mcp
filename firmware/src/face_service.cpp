@@ -215,13 +215,10 @@ void setFaceExpression(FaceExpression expr) {
 }
 
 void setMouthOpen(float ratio) {
-    // Lip sync: toggle between calm and happy during speech.
-    if (!isTalking) return;
-
-    WhaleFace target = (ratio > 0.15f) ? WHALE_HAPPY : WHALE_CALM;
-    if (target != currentFace) {
-        switchToFace(target);
-    }
+    // Lip sync disabled for AnimatedGIF faces — pixel art has no mouth
+    // animation, and switching GIFs causes visible flicker (close + open + redraw).
+    // Keep the function signature for API compatibility.
+    (void)ratio;
 }
 
 void setWhaleFace(WhaleFace face) {
