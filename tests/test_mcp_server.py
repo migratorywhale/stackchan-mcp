@@ -759,7 +759,7 @@ def test_voice_upload_token_authorization():
         {},
         "secret-token",
     )
-    assert stackchan_voice_upload_server.is_upload_authorized(
+    assert not stackchan_voice_upload_server.is_upload_authorized(
         "/voice/upload?token=secret-token",
         {},
         "secret-token",
@@ -772,6 +772,11 @@ def test_voice_upload_token_authorization():
     assert stackchan_voice_upload_server.is_upload_authorized(
         "/voice/upload",
         {"X-Stackchan-Upload-Token": "secret-token"},
+        "secret-token",
+    )
+    assert not stackchan_voice_upload_server.is_upload_authorized(
+        "/voice/upload",
+        {"Authorization": "Basic secret-token"},
         "secret-token",
     )
 

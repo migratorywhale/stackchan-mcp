@@ -376,9 +376,9 @@ It uses RMS thresholds to trigger recording and to end after silence.
 - For phone tests, set `STACKCHAN_VOICE_UPLOAD_TOKEN`, open the recorder as
   `https://...trycloudflare.com/`, and enter the token in the page. The page
   sends it as `X-Stackchan-Upload-Token`; unauthenticated uploads receive HTTP
-  401. Older `?token=...` links remain accepted for compatibility, but they are
-  deprecated; the page moves that token into `sessionStorage` and cleans the
-  address bar.
+  401. When an older recorder bookmark contains `?token=...`, the page moves
+  that token into `sessionStorage` and cleans the address bar. The upload API
+  never accepts query-string tokens.
 - For daily phone use, point your own HTTPS route or reverse proxy at
   `http://localhost:8767` and set `STACKCHAN_VOICE_PUBLIC_URL` to that public
   recorder URL. If you use Cloudflare's default certificate coverage, keep the
