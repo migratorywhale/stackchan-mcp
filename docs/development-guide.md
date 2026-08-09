@@ -347,7 +347,9 @@ It uses RMS thresholds to trigger recording and to end after silence.
   the token optional for compatibility.
 - Both voice paths read `AGENT_HOST_TOKEN` from `STACKCHAN_FRONTEND_ENV` when
   `STACKCHAN_FRONTEND_TOKEN` is unset. This avoids copying the frontend token
-  into the Stack-chan repo.
+  into the Stack-chan repo. The file-backed token is resolved immediately before
+  each frontend forward, so relay token rotation does not require restarting the
+  long-running voice bridge or upload receiver.
 - The voice paths intentionally do not guess the active frontend room. Use
   `STACKCHAN_FRONTEND_SESSION_ID=<uuid>` when the voice prompt should enter a
   specific frontend session; omit it for inbox-only capture.

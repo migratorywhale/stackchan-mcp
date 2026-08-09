@@ -56,6 +56,7 @@ from scripts.stackchan_voice_bridge import (
     forward_event_to_frontend,
     load_env_file,
     load_frontend_token,
+    resolve_frontend_token,
     should_append_to_inbox,
 )
 
@@ -608,6 +609,20 @@ def test_voice_bridge_loads_frontend_token_from_agent_host_env(monkeypatch, tmp_
     load_frontend_token()
 
     assert os.environ["STACKCHAN_FRONTEND_TOKEN"] == "agent-secret"
+
+
+def test_voice_bridge_reloads_rotated_frontend_token(monkeypatch, tmp_path):
+    env_path = tmp_path / "relay.env"
+    env_path.write_text("AGENT_HOST_TOKEN=first-token\n", encoding="utf-8")
+    monkeypatch.delenv("STACKCHAN_FRONTEND_TOKEN", raising=False)
+    monkeypatch.setenv("STACKCHAN_FRONTEND_ENV", str(env_path))
+
+    assert resolve_frontend_token() == "first-token"
+
+    env_path.write_text("AGENT_HOST_TOKEN=rotated-token\n", encoding="utf-8")
+
+    assert resolve_frontend_token() == "rotated-token"
+    assert resolve_frontend_token("explicit-token") == "explicit-token"
 
 
 def test_voice_bridge_only_appends_non_empty_transcripts_to_inbox():

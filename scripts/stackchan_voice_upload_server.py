@@ -36,7 +36,7 @@ from scripts.stackchan_frontend_wake import (  # noqa: E402
 )
 from scripts.stackchan_voice_bridge import (  # noqa: E402
     load_env_file,
-    load_frontend_token,
+    resolve_frontend_token,
     resolve_wake_session,
     should_append_to_inbox,
 )
@@ -685,7 +685,7 @@ class VoiceUploadHandler(BaseHTTPRequestHandler):
                 event,
                 wake_url=self.voice_server.options.wake_url,
                 session_id=wake_session_id,
-                token=self.voice_server.options.wake_token,
+                token=resolve_frontend_token(self.voice_server.options.wake_token),
                 model=self.voice_server.options.wake_model,
                 timeout=self.voice_server.options.wake_timeout,
                 retries=self.voice_server.options.wake_retries,
@@ -852,7 +852,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     load_env_file(REPO_ROOT / ".env")
-    load_frontend_token()
     parser = build_parser()
     args = parser.parse_args()
     config = load_config()

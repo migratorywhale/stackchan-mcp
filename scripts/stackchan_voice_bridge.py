@@ -47,15 +47,13 @@ def load_env_file(path: Path) -> None:
         os.environ[key] = value
 
 
-def load_frontend_token() -> None:
-    if os.environ.get("STACKCHAN_FRONTEND_TOKEN"):
-        return
+def read_frontend_token_file() -> str:
     env_path_raw = os.environ.get("STACKCHAN_FRONTEND_ENV", "")
     if not env_path_raw:
-        return
+        return ""
     env_path = Path(env_path_raw)
     if not env_path.exists():
-        return
+        return ""
 
     for raw_line in env_path.read_text().splitlines():
         line = raw_line.strip()
@@ -68,8 +66,23 @@ def load_frontend_token() -> None:
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
         if value:
-            os.environ["STACKCHAN_FRONTEND_TOKEN"] = value
+            return value
+        return ""
+    return ""
+
+
+def load_frontend_token() -> None:
+    if os.environ.get("STACKCHAN_FRONTEND_TOKEN"):
         return
+    value = read_frontend_token_file()
+    if value:
+        os.environ["STACKCHAN_FRONTEND_TOKEN"] = value
+
+
+def resolve_frontend_token(configured_token: str = "") -> str:
+    if configured_token:
+        return configured_token
+    return read_frontend_token_file() or os.environ.get("STACKCHAN_FRONTEND_TOKEN", "")
 
 
 def utc_now() -> str:
@@ -112,7 +125,7 @@ def forward_event_to_frontend(event: dict[str, Any], args: argparse.Namespace) -
         event,
         wake_url=wake_url,
         session_id=wake_session_id,
-        token=args.wake_token,
+        token=resolve_frontend_token(args.wake_token),
         model=args.wake_model,
         timeout=args.wake_timeout,
         retries=args.wake_retries,
@@ -229,7 +242,6 @@ def main() -> int:
     from mcp_server.voice_inbox import append_event, resolve_inbox_path
 
     load_env_file(REPO_ROOT / ".env")
-    load_frontend_token()
     args = build_parser().parse_args()
     config = load_config()
     client = StackchanClient(config)
