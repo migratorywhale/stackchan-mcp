@@ -362,6 +362,7 @@ static void handlePlaybackStatus() {
     PcmStreamStatus stream = getPcmStreamStatus();
     ServoStatus servo = getServoStatus();
     AudioGateStatus audio = getAudioGateStatus();
+    MicRuntimeStatus mic = getMicRuntimeStatus();
 
     JsonDocument doc;
     bool streamActive = stream.active || stream.playing;
@@ -408,6 +409,15 @@ static void handlePlaybackStatus() {
     doc["started_ms"] = playback.startedMs;
     doc["deadline_ms"] = playback.deadlineMs;
     doc["mic_state"] = getMicStateName();
+    doc["mic_enabled"] = mic.enabled;
+    doc["mic_running"] = mic.running;
+    doc["mic_last_rms"] = mic.lastRms;
+    doc["mic_recent_peak_rms"] = mic.recentPeakRms;
+    doc["mic_last_frame_ms"] = mic.lastFrameMs;
+    doc["mic_frame_count"] = mic.frameCount;
+    doc["mic_record_failure_count"] = mic.recordFailureCount;
+    doc["mic_trigger_count"] = mic.triggerCount;
+    doc["mic_stored_recording_count"] = mic.storedRecordingCount;
     doc["mic_resume_requested"] = playback.micResumeRequested;
     doc["servo_ready"] = servo.ready;
     doc["gesture_active"] = servo.gestureActive;

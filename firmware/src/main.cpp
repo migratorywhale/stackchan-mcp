@@ -54,6 +54,8 @@ void setup() {
     initHttpServer();
 }
 void loop() {
+    static uint32_t lastMicResumeAttemptMs = 0;
+
     M5StackChan.update();
     handleHttpServer();
     serviceWiFi();
@@ -62,14 +64,24 @@ void loop() {
     updatePlayback();
     updateMicrophone();
 
+    // Playback can stop the microphone before the normal completion path has
+    // a chance to request a resume. Keep the request latched until begin()
+    // succeeds so one transient failure cannot leave the device deaf.
+    if (!M5.Mic.isRunning()) {
+        requestMicResume();
+    }
+
     // マイク再開（完了検知より前に置く）
     if (shouldResumeMic()) {
-        clearMicResumeRequest();
-        if (!M5.Mic.isRunning()) {
+        if (M5.Mic.isRunning()) {
+            clearMicResumeRequest();
+        } else if (millis() - lastMicResumeAttemptMs >= 1000) {
+            lastMicResumeAttemptMs = millis();
             if (initMicrophone()) {
+                clearMicResumeRequest();
                 Serial.println("[MIC] Mic resumed after playback");
             } else {
-                Serial.println("[MIC] Mic resume failed");
+                Serial.println("[MIC] Mic resume failed; retrying");
             }
         }
     }

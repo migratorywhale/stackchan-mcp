@@ -40,6 +40,14 @@ static size_t recorded_samples = 0;
 static MicState mic_state = MIC_IDLE;
 static uint32_t trigger_start_ms = 0;
 static uint32_t silence_start_ms = 0;
+static float last_rms = 0.0f;
+static float recent_peak_rms = 0.0f;
+static uint32_t peak_window_start_ms = 0;
+static uint32_t last_frame_ms = 0;
+static uint32_t frame_count = 0;
+static uint32_t record_failure_count = 0;
+static uint32_t trigger_count = 0;
+static uint32_t stored_recording_count = 0;
 
 // プリトリガーリングバッファ
 static int16_t pre_trigger_buf[PRE_TRIGGER_BUFFER_SAMPLES];
@@ -65,6 +73,20 @@ const char* getMicStateName() {
         case MIC_SENDING: return "sending";
         default: return "unknown";
     }
+}
+
+MicRuntimeStatus getMicRuntimeStatus() {
+    MicRuntimeStatus status;
+    status.enabled = M5.Mic.isEnabled();
+    status.running = M5.Mic.isRunning();
+    status.lastRms = last_rms;
+    status.recentPeakRms = recent_peak_rms;
+    status.lastFrameMs = last_frame_ms;
+    status.frameCount = frame_count;
+    status.recordFailureCount = record_failure_count;
+    status.triggerCount = trigger_count;
+    status.storedRecordingCount = stored_recording_count;
+    return status;
 }
 
 static bool isValidAudio(int16_t* audio_data, size_t sample_count) {
@@ -158,7 +180,7 @@ bool initMicrophone() {
 }
 
 void updateMicrophone() {
-    if (!M5.Mic.isEnabled()) return;
+    if (!M5.Mic.isEnabled() || !M5.Mic.isRunning()) return;
     if (!record_buffer) return;
     if (isPlaybackActive()) return;
 
@@ -166,11 +188,23 @@ void updateMicrophone() {
     if (!audioGateEnter("mic-record", 0)) return;
     bool recorded = M5.Mic.record(frame, MIC_FRAME_SAMPLES, MIC_SAMPLE_RATE);
     audioGateLeave("mic-record");
-    if (!recorded) return;
+    if (!recorded) {
+        record_failure_count++;
+        return;
+    }
     size_t got = MIC_FRAME_SAMPLES;
 
     float rms = calcRmsNorm(frame, got);
     uint32_t now = millis();
+    last_rms = rms;
+    last_frame_ms = now;
+    frame_count++;
+    if (peak_window_start_ms == 0 || now - peak_window_start_ms >= 2000) {
+        peak_window_start_ms = now;
+        recent_peak_rms = rms;
+    } else if (rms > recent_peak_rms) {
+        recent_peak_rms = rms;
+    }
 
     if (mic_state == MIC_IDLE || mic_state == MIC_TRIGGERING) {
         for (size_t i = 0; i < got; i++) {
@@ -183,6 +217,7 @@ void updateMicrophone() {
     switch (mic_state) {
         case MIC_IDLE:
             if (rms > MIC_TRIGGER_RMS) {
+                trigger_count++;
                 trigger_start_ms = now;
                 mic_state = MIC_TRIGGERING;
             }
@@ -244,6 +279,7 @@ void updateMicrophone() {
 
                 bool ok = storeRecordingForMcp(record_buffer, recorded_samples);
                 Serial.printf("[MIC] Store recording result=%s\n", ok ? "OK" : "NG");
+                if (ok) stored_recording_count++;
                 if (!ok) setFaceExpression(FACE_IDLE);
                 mic_state = MIC_IDLE;
             }
