@@ -429,7 +429,10 @@ Important environment variables:
   file and waits for rsync to finish before sending `/play`, so the device cannot
   race an asynchronous directory mirror.
 - `STACKCHAN_AUDIO_PUBLISH_TIMEOUT_SEC`: timeout for that synchronous publish;
-  default `20` seconds.
+  default `20` seconds per attempt.
+- `STACKCHAN_AUDIO_PUBLISH_ATTEMPTS`: bounded retry count for transient SSH,
+  Tailscale, or host-wake failures; default `2`, clamped to `1..3`. A timed-out
+  attempt terminates its full rsync/ssh process group before retrying.
 - `TTS_ENGINE`: `fish-audio` or `edge-tts`.
 - `FISH_AUDIO_KEY`: required for Fish Audio TTS/ASR.
 - `EDGE_TTS_BIN`: path to `edge-tts` when using the edge TTS fallback.

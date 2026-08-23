@@ -124,6 +124,7 @@ class StackchanConfig:
     mcp_auth_token: str = ""
     audio_publish_target: str = ""
     audio_publish_timeout: float = 20.0
+    audio_publish_attempts: int = 2
 
 
 VALID_AUDIO_MODES = {"auto", "pcm", "wav"}
@@ -162,6 +163,7 @@ def config_summary(config: StackchanConfig) -> dict[str, Any]:
             "save_pcm": config.save_pcm,
             "publish_configured": bool(config.audio_publish_target),
             "publish_timeout": config.audio_publish_timeout,
+            "publish_attempts": config.audio_publish_attempts,
         },
         "pcm": {
             "transport": config.pcm_transport,
@@ -320,5 +322,10 @@ def load_config() -> StackchanConfig:
         audio_publish_timeout=env_float_any(
             ("STACKCHAN_AUDIO_PUBLISH_TIMEOUT", "STACKCHAN_AUDIO_PUBLISH_TIMEOUT_SEC"),
             20.0,
+        ),
+        audio_publish_attempts=clamp_int(
+            env_int("STACKCHAN_AUDIO_PUBLISH_ATTEMPTS", 2),
+            1,
+            3,
         ),
     )

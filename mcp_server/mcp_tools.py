@@ -224,6 +224,7 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                     wav_path,
                     config.audio_publish_target,
                     config.audio_publish_timeout,
+                    config.audio_publish_attempts,
                 )
                 wav_timing["publish"] = timing_ms(t0)
             baseline_started_ms = None

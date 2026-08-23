@@ -46,6 +46,11 @@ The old `xyz.migratorybird.audio-push` polling LaunchAgent is disabled in the
 two-host deployment to avoid duplicate concurrent transfers. Its script remains
 available as a rollback mechanism.
 
+If a transient Tailscale, SSH, or host-wake delay exhausts one publish attempt,
+the MCP terminates the entire rsync/ssh process group and retries once by
+default. This keeps the synchronous ordering guarantee without leaving an
+orphaned transfer that may complete after the tool already reported failure.
+
 ## Verification
 
 - Python MCP tests: `95 passed`.
@@ -53,3 +58,30 @@ available as a rollback mechanism.
 - A live short TTS request published the same SHA-256 on mini and MacBook.
 - MacBook `5061` log returned HTTP 200 for the new filename.
 - Device `started_ms` advanced and the microphone resumed recording afterward.
+
+## Follow-up: bounded publish timeout (2026-08-24)
+
+At 00:36 JST, a later speech request generated a valid 405,636-byte WAV on the
+mini but returned `audio publish timed out after 20s`. The MacBook HTTP log had
+no matching request, so this failure happened before `/play` and was separate
+from both the firmware download recovery and the earlier 404 race. A later
+publish over the same route completed in 3.77 seconds with matching SHA-256
+hashes on both hosts, supporting a transient SSH/Tailscale or host-wake delay
+rather than a persistent path or credential failure.
+
+The publisher now gives transient failures one bounded retry. Each attempt runs
+rsync and ssh in a new process group; timeout cleanup terminates that entire
+group before the retry, preventing a late orphan transfer from violating the
+publish-before-play result. The retry count is configurable and clamped to at
+most three.
+
+Follow-up verification:
+
+- Full Python suite: `104 passed`.
+- Focused publish tests cover cleanup, retry success, and retry exhaustion.
+- Ruff and Pyright passed.
+- Publish-only live check: 405,636 bytes, matching SHA-256 across mini and
+  MacBook; no device playback was triggered.
+- MCP LaunchDaemon restarted with `publish_attempts=2`.
+- The old `audio-push` job/process count is zero; one MacBook audio wait server
+  remains active.
