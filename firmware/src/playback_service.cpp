@@ -40,6 +40,7 @@ static uint32_t s_nextAudioSequence = 0;
 #define MAX_QUEUED_PCM_BYTES  (2 * 1024 * 1024)
 #define SPEAKER_PLAYBACK_CHANNEL 0
 #define MAX_AUDIO_QUEUE_DEPTH 16
+#define DOWNLOAD_WATCHDOG_MS 60000
 
 // ── FreeRTOS: URLをCore 0に渡すキュー
 //    StringはFreeRTOSキューに乗せられないのでchar配列で渡す
@@ -62,7 +63,9 @@ struct DownloadedAudio {
 static std::queue<PcmBuffer> s_pcmQueue;
 static size_t s_pcmQueuedBytes = 0;
 static QueueHandle_t s_downloadCompleteQueue = nullptr;
+static TaskHandle_t s_downloadTaskHandle = nullptr;
 static bool s_downloadInFlight = false;
+static unsigned long s_downloadStartedMs = 0;
 static unsigned long s_lastSpeakerEndMs = 0;
 static uint8_t* s_stagedPcmData = nullptr;
 static size_t s_stagedPcmSize = 0;
@@ -72,6 +75,15 @@ static long s_stagedPcmNextSeq = 0;
 
 static void processAudioQueue();
 static void clearStagedPcmPlayback();
+
+static bool publishDownloadResult(const DownloadedAudio& completed) {
+    if (!s_downloadCompleteQueue) {
+        return false;
+    }
+    // A single download is allowed in flight. Preserve its only completion
+    // event so the main loop can always clear s_downloadInFlight.
+    return xQueueSend(s_downloadCompleteQueue, &completed, portMAX_DELAY) == pdTRUE;
+}
 
 static bool hasPendingPlaybackWork() {
     return s_downloadInFlight || !s_audioQueue.empty() || !s_pcmQueue.empty() || isPcmStreamActive();
@@ -204,21 +216,20 @@ static void downloadTask(void* arg) {
         uint8_t* data = nullptr;
         size_t   size = 0;
 
-        if (downloadVoice(String(url), &data, &size)) {
-            DownloadedAudio completed = {data, size, true};
-            if (!s_downloadCompleteQueue ||
-                xQueueSend(s_downloadCompleteQueue, &completed, 0) != pdTRUE) {
-                Serial.println("[DOWNLOAD] Complete queue full; dropping audio");
+        bool success = downloadVoice(String(url), &data, &size);
+        DownloadedAudio completed = {data, size, success};
+        if (!publishDownloadResult(completed)) {
+            Serial.println("[DOWNLOAD] Completion queue unavailable");
+            if (data) {
                 free(data);
-                continue;
             }
+            continue;
+        }
+
+        if (success) {
             Serial.printf("[DOWNLOAD] Ready: %u bytes\n", (unsigned)size);
         } else {
             Serial.println("[DOWNLOAD] Failed");
-            DownloadedAudio completed = {nullptr, 0, false};
-            if (s_downloadCompleteQueue) {
-                xQueueSend(s_downloadCompleteQueue, &completed, 0);
-            }
         }
     }
 }
@@ -228,20 +239,37 @@ static void downloadTask(void* arg) {
 // ════════════════════════════════════════
 void initPlayback() {
     s_downloadQueue = xQueueCreate(4, sizeof(char) * MAX_URL_LEN);
-    s_downloadCompleteQueue = xQueueCreate(2, sizeof(DownloadedAudio));
+    s_downloadCompleteQueue = xQueueCreate(1, sizeof(DownloadedAudio));
     if (!s_downloadQueue || !s_downloadCompleteQueue) {
         Serial.println("[PLAY] Failed to create playback queues");
+        if (s_downloadQueue) {
+            vQueueDelete(s_downloadQueue);
+            s_downloadQueue = nullptr;
+        }
+        if (s_downloadCompleteQueue) {
+            vQueueDelete(s_downloadCompleteQueue);
+            s_downloadCompleteQueue = nullptr;
+        }
         return;
     }
-    xTaskCreatePinnedToCore(
+    BaseType_t created = xTaskCreatePinnedToCore(
         downloadTask,
         "downloadTask",
         8192,
         nullptr,
         1,
-        nullptr,
+        &s_downloadTaskHandle,
         1   // Core 1
     );
+    if (created != pdPASS) {
+        Serial.println("[PLAY] Failed to create download task");
+        vQueueDelete(s_downloadQueue);
+        vQueueDelete(s_downloadCompleteQueue);
+        s_downloadQueue = nullptr;
+        s_downloadCompleteQueue = nullptr;
+        s_downloadTaskHandle = nullptr;
+        return;
+    }
     Serial.println("[PLAY] Download task started on Core 1");
     logAudioMemory("play-init");
 }
@@ -251,8 +279,8 @@ void initPlayback() {
 //  enqueueAudioTask()から呼ばれる
 // ════════════════════════════════════════
 static bool startPlayback(const AudioTask& task) {
-    if (!s_downloadQueue) {
-        Serial.println("[PLAY] Queue not initialized!");
+    if (!s_downloadQueue || !s_downloadCompleteQueue || !s_downloadTaskHandle) {
+        Serial.println("[PLAY] Download pipeline not initialized");
         return false;
     }
     if (s_downloadInFlight) {
@@ -266,6 +294,7 @@ static bool startPlayback(const AudioTask& task) {
         return false;
     }
     s_downloadInFlight = true;
+    s_downloadStartedMs = millis();
     setFaceExpression(FACE_THINKING);
     Serial.printf("[PLAY] Queued for download: %s\n", url);
     return true;
@@ -355,6 +384,7 @@ static void checkPendingPlayback() {
         return;
     }
     s_downloadInFlight = false;
+    s_downloadStartedMs = 0;
     if (!completed.success || !startDownloadedWavPlayback(completed.data, completed.size)) {
         setFaceExpression(FACE_IDLE);
         processAudioQueue();
@@ -578,6 +608,8 @@ PlaybackStatus getPlaybackStatus() {
     status.audioQueueDepth = s_audioQueue.size();
     status.downloadQueueDepth = s_downloadQueue ? uxQueueMessagesWaiting(s_downloadQueue) : 0;
     status.downloadInFlight = s_downloadInFlight;
+    status.downloadAgeMs = s_downloadInFlight ? millis() - s_downloadStartedMs : 0;
+    status.downloadWatchdogMs = DOWNLOAD_WATCHDOG_MS;
     status.micResumeRequested = s_micResumeRequested;
     status.startedMs = s_playbackStartMs;
     status.deadlineMs = s_playbackDeadlineMs;
@@ -676,6 +708,15 @@ static bool notifyPlaybackFinished() {
 
 void updatePlayback() {
     checkPendingPlayback();
+
+    if (s_downloadInFlight && millis() - s_downloadStartedMs > DOWNLOAD_WATCHDOG_MS) {
+        Serial.printf("[DOWNLOAD] Watchdog expired after %u ms; restarting device\n",
+                      (unsigned)(millis() - s_downloadStartedMs));
+        Serial.flush();
+        delay(100);
+        ESP.restart();
+    }
+
     updateLipSync();
 
     if (s_isPlaying &&

@@ -405,6 +405,8 @@ static void handlePlaybackStatus() {
     doc["audio_queue_depth"] = playback.audioQueueDepth;
     doc["download_queue_depth"] = playback.downloadQueueDepth;
     doc["download_in_flight"] = playback.downloadInFlight;
+    doc["download_age_ms"] = playback.downloadAgeMs;
+    doc["download_watchdog_ms"] = playback.downloadWatchdogMs;
     doc["started_ms"] = playback.startedMs;
     doc["deadline_ms"] = playback.deadlineMs;
     doc["mic_state"] = getMicStateName();

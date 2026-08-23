@@ -265,6 +265,10 @@ The legacy immediate HTTP PCM segment path remains available for direct tests:
 - WAV playback treats an active device-side download as a pending playback, so
   additional `/play` requests are held in the logical audio queue instead of
   being dropped by the lower-level download queue.
+- WAV downloads use bounded connect, inactivity, and total-transfer timeouts.
+  The worker publishes exactly one success or failure completion event, and a
+  60-second watchdog restarts the device only if that normal recovery path
+  cannot clear the in-flight state.
 - The logical WAV queue accepts up to 16 pending items. Additional `/play`
   requests return `503 {"success":false,"error":"play queue full"}`.
 - Queued WAV items keep priority ordering; items with the same priority are
@@ -444,7 +448,8 @@ The server writes generated and captured media under `/tmp/stackchan_audio`.
 `stackchan_playback_status()` calls firmware `GET /playback/status` and is the
 preferred live diagnostic for playback bugs because it does not consume
 recordings and reports queue depth, PCM state, microphone state, gesture state,
-heap, and PSRAM.
+heap, and PSRAM. For WAV download failures, compare `download_in_flight` with
+`download_age_ms`; `download_watchdog_ms` reports the final recovery threshold.
 
 Run in stdio mode:
 
