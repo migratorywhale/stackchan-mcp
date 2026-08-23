@@ -4,8 +4,9 @@
 #include "audio_download.h"
 #include "wav_parser.h"
 
-#define DOWNLOAD_TIMEOUT_MS   10000
-#define MAX_WAV_BYTES         (4 * 1024 * 1024)
+#define DOWNLOAD_TIMEOUT_MS       10000
+#define DOWNLOAD_TOTAL_TIMEOUT_MS 30000
+#define MAX_WAV_BYTES             (4 * 1024 * 1024)
 
 bool downloadVoice(const String& url, uint8_t** outData, size_t* outSize) {
     HTTPClient http;
@@ -15,6 +16,7 @@ bool downloadVoice(const String& url, uint8_t** outData, size_t* outSize) {
     *outSize = 0;
 
     http.begin(url);
+    http.setConnectTimeout(DOWNLOAD_TIMEOUT_MS);
     http.setTimeout(DOWNLOAD_TIMEOUT_MS);
     int httpCode = http.GET();
 
@@ -40,8 +42,13 @@ bool downloadVoice(const String& url, uint8_t** outData, size_t* outSize) {
 
     WiFiClient* stream = http.getStreamPtr();
     size_t bytesRead = 0;
+    unsigned long downloadStartedMs = millis();
     unsigned long lastProgressMs = millis();
     while (bytesRead < (size_t)len) {
+        if (millis() - downloadStartedMs > DOWNLOAD_TOTAL_TIMEOUT_MS) {
+            Serial.println("[DOWNLOAD] Total timeout");
+            break;
+        }
         size_t available = stream->available();
         if (available) {
             size_t toRead = min(available, (size_t)(len - bytesRead));

@@ -95,5 +95,7 @@ This is the shared contract between the CoreS3 firmware and the MCP server.
   - Includes playback state, PCM queue depth, audio queue depth, download
     queue depth, UDP/TCP PCM stream state, and whether a WAV download is
     currently in flight.
+  - `download_age_ms` reports the age of the active WAV download, or `0` when
+    idle. `download_watchdog_ms` reports the automatic recovery threshold.
 - `GET /snapshot`
   - Returns a JPEG image.
