@@ -424,6 +424,12 @@ Important environment variables:
 - `STACKCHAN_PORT`: device HTTP port, usually `80`.
 - `MAC_IP`: host IP used in generated audio URLs.
 - `AUDIO_SERVE_PORT`: local HTTP port used to serve generated WAV files.
+- `STACKCHAN_AUDIO_PUBLISH_TARGET`: optional rsync destination for deployments
+  where the WAV HTTP server runs on another host. The MCP publishes the current
+  file and waits for rsync to finish before sending `/play`, so the device cannot
+  race an asynchronous directory mirror.
+- `STACKCHAN_AUDIO_PUBLISH_TIMEOUT_SEC`: timeout for that synchronous publish;
+  default `20` seconds.
 - `TTS_ENGINE`: `fish-audio` or `edge-tts`.
 - `FISH_AUDIO_KEY`: required for Fish Audio TTS/ASR.
 - `EDGE_TTS_BIN`: path to `edge-tts` when using the edge TTS fallback.

@@ -8,6 +8,7 @@ from typing import Any
 import requests
 
 from . import audio_processing
+from .audio_publish import publish_wav
 from .audio_server import AUDIO_DIR, audio_url, start_audio_server
 from .listening import capture_ready_recording, format_listen_result
 from .stackchan_client import (
@@ -217,6 +218,14 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
             t0 = time.perf_counter()
             audio_processing.validate_playback_wav(wav_path)
             wav_timing["validate"] = timing_ms(t0)
+            if config.audio_publish_target:
+                t0 = time.perf_counter()
+                publish_wav(
+                    wav_path,
+                    config.audio_publish_target,
+                    config.audio_publish_timeout,
+                )
+                wav_timing["publish"] = timing_ms(t0)
             baseline_started_ms = None
             baseline_playing = False
             try:

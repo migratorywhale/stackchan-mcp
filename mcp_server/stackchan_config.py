@@ -122,6 +122,8 @@ class StackchanConfig:
     fish_audio_model_zh: str
     fish_audio_model_en: str
     mcp_auth_token: str = ""
+    audio_publish_target: str = ""
+    audio_publish_timeout: float = 20.0
 
 
 VALID_AUDIO_MODES = {"auto", "pcm", "wav"}
@@ -158,6 +160,8 @@ def config_summary(config: StackchanConfig) -> dict[str, Any]:
             "serve_port": config.audio_serve_port,
             "mode": config.audio_mode,
             "save_pcm": config.save_pcm,
+            "publish_configured": bool(config.audio_publish_target),
+            "publish_timeout": config.audio_publish_timeout,
         },
         "pcm": {
             "transport": config.pcm_transport,
@@ -312,4 +316,9 @@ def load_config() -> StackchanConfig:
         fish_audio_model_zh=os.environ.get("FISH_AUDIO_MODEL_ZH", ""),
         fish_audio_model_en=os.environ.get("FISH_AUDIO_MODEL_EN", ""),
         mcp_auth_token=os.environ.get("STACKCHAN_MCP_AUTH_TOKEN", ""),
+        audio_publish_target=os.environ.get("STACKCHAN_AUDIO_PUBLISH_TARGET", ""),
+        audio_publish_timeout=env_float_any(
+            ("STACKCHAN_AUDIO_PUBLISH_TIMEOUT", "STACKCHAN_AUDIO_PUBLISH_TIMEOUT_SEC"),
+            20.0,
+        ),
     )
