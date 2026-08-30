@@ -8,11 +8,12 @@
 #include "config_loader.h"
 #include "mic_service.h"
 #include "wifi_manager.h"
+#include "wifi_portal.h"
 #include "playback_service.h"
 #include "pcm_stream_service.h"
 #include "face_service.h"
 #include "servo_service.h"
-#include "camera_service.h"
+#include "touch_service.h"
 #include "audio_gate.h"
 #include "env_service.h"
 
@@ -22,8 +23,17 @@ void setup() {
 
     M5StackChan.begin();
     M5.Display.setBrightness(DISPLAY_BRIGHTNESS);
-    initAudioGate();
 
+    // ── BtnA チェック：開機時に押したまま → 強制配网模式 ──────────────────
+    // M5.update() を一度呼んでボタン状態を読み取る
+    M5.update();
+    if (M5.BtnA.isPressed()) {
+        Serial.println("[SETUP] BtnA held at boot -> forcing WiFi portal");
+        // portal は内部で ESP.restart() するので戻らない
+        runWifiPortal();
+    }
+
+    initAudioGate();
     initFace();
 
     Serial.println("\n=== Stack-chan firmware ===");
@@ -40,23 +50,31 @@ void setup() {
         Serial.println("[WARN] Servo init failed - head movement disabled");
     }
 
-    if (!initCamera()) {
-        Serial.println("[WARN] Camera init failed - vision disabled");
+    if (!initTouchService()) {
+        Serial.println("[WARN] Touch sensor unavailable");
     }
     if (!initEnvService()) {
         Serial.println("[WARN] Env sensor init failed - no temperature/humidity/pressure");
     }
 
+    // ── WiFi 接続シーケンス ────────────────────────────────────────────────
+    // connectWiFi() が false を返したら全部失敗 → 配网 portal に入る
+    if (!connectWiFi()) {
+        Serial.println("[SETUP] WiFi failed -> starting captive portal");
+        // portal は内部で ESP.restart() するので戻らない
+        runWifiPortal();
+    }
 
-    connectWiFi();
     initPlayback();
     initPcmStreamService();
     initHttpServer();
 }
+
 void loop() {
     static uint32_t lastMicResumeAttemptMs = 0;
 
     M5StackChan.update();
+    updateTouchService();
     handleHttpServer();
     serviceWiFi();
     updateServoGesture();

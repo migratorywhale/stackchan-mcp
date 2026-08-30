@@ -14,6 +14,7 @@
 #include "audio_gate.h"
 #include "pcm_stream_service.h"
 #include "env_service.h"
+#include "touch_service.h"
 
 static WebServer server(80);
 
@@ -215,12 +216,17 @@ static void handleMode() {
 
 // ────────────────────────────────────────────
 // GET /audio/status
-// → {"ready": true/false, "mode": "mcp"}
+// → Recording state plus the monotonic touch-petting event counter.
 // ────────────────────────────────────────────
 static void handleAudioStatus() {
+    TouchRuntimeStatus touch = getTouchRuntimeStatus();
     String body = "{\"ready\":";
     body += hasLastRecording() ? "true" : "false";
-    body += ",\"mode\":\"mcp\"}";
+    body += ",\"mode\":\"mcp\",\"source\":\"";
+    body += recordingSourceName(getLastRecordingSource());
+    body += "\",\"touch_pet_count\":";
+    body += String(touch.petCount);
+    body += "}";
     server.send(200, "application/json", body);
 }
 
@@ -347,6 +353,33 @@ static void handleServoStatus() {
     JsonObject pitch = doc["pitch"].to<JsonObject>();
     addFeedback(yaw, status.yaw);
     addFeedback(pitch, status.pitch);
+
+    String body;
+    serializeJson(doc, body);
+    server.send(200, "application/json", body);
+}
+
+// ────────────────────────────────────────────
+// GET /touch/status
+// → Si12T touch-strip state and camera handoff diagnostics
+// ────────────────────────────────────────────
+static void handleTouchStatus() {
+    TouchRuntimeStatus status = getTouchRuntimeStatus();
+    JsonDocument doc;
+    doc["available"] = status.available;
+    doc["suspended"] = status.suspended;
+    doc["petting_active"] = status.pettingActive;
+    JsonArray intensities = doc["intensities"].to<JsonArray>();
+    for (uint8_t intensity : status.intensities) {
+        intensities.add(intensity);
+    }
+    doc["last_event"] = status.lastEvent;
+    doc["last_event_ms"] = status.lastEventMs;
+    doc["pet_count"] = status.petCount;
+    doc["suppressed_pet_count"] = status.suppressedPetCount;
+    doc["record_request_count"] = status.recordRequestCount;
+    doc["record_start_failure_count"] = status.recordStartFailureCount;
+    doc["resume_failure_count"] = status.resumeFailureCount;
 
     String body;
     serializeJson(doc, body);
@@ -625,6 +658,7 @@ void initHttpServer() {
     server.on("/nod",          HTTP_POST, handleNod);
     server.on("/shake",        HTTP_POST, handleShake);
     server.on("/servo/status", HTTP_GET,  handleServoStatus);
+    server.on("/touch/status", HTTP_GET,  handleTouchStatus);
     server.on("/playback/status", HTTP_GET, handlePlaybackStatus);
     server.on("/snapshot",     HTTP_GET,  handleSnapshot);
     server.on("/face",         HTTP_POST, handleFace);

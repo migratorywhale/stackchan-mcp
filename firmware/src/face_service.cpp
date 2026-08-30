@@ -19,6 +19,7 @@ static int            gif_src_height     = 0;
 // ── Face tracking ──────────────────────────────────────────────────────────
 static WhaleFace currentFace = WHALE_CALM;
 static bool      isTalking   = false;
+static uint32_t  faceCommandRevision = 0;
 
 // ── GIF asset table ────────────────────────────────────────────────────────
 struct GifAsset { const uint8_t* data; size_t len; };
@@ -209,6 +210,7 @@ void setFaceExpression(FaceExpression expr) {
             break;
     }
 
+    ++faceCommandRevision;
     if (target != currentFace) {
         switchToFace(target);
     }
@@ -223,9 +225,14 @@ void setMouthOpen(float ratio) {
 
 void setWhaleFace(WhaleFace face) {
     isTalking = false;
+    ++faceCommandRevision;
     switchToFace(face);
 }
 
 const char* getCurrentFaceName() {
     return whaleFaceName(currentFace);
+}
+
+uint32_t getFaceCommandRevision() {
+    return faceCommandRevision;
 }

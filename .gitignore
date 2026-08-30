@@ -28,6 +28,7 @@ build/
 .env.*
 !.env.example
 firmware/src/config.h
+firmware/src/config.h.bak-*
 deploy/macos/*.plist
 
 # PlatformIO

@@ -53,9 +53,14 @@ from scripts import (
     stackchan_voice_upload_server,
 )
 from scripts.stackchan_voice_bridge import (
+    TouchPetTracker,
+    acquire_consumer_lock,
+    build_touch_pet_event,
+    default_consumer_lock_path,
     forward_event_to_frontend,
     load_env_file,
     load_frontend_token,
+    recording_source_from_result,
     resolve_frontend_token,
     should_append_to_inbox,
 )
@@ -630,6 +635,166 @@ def test_voice_bridge_only_appends_non_empty_transcripts_to_inbox():
     assert not should_append_to_inbox({"type": "transcript", "text": ""})
     assert not should_append_to_inbox({"type": "transcript", "text": "   "})
     assert not should_append_to_inbox({"type": "idle", "text": "小记，你好。"})
+
+
+def test_voice_bridge_reads_touch_source_from_audio_status():
+    assert recording_source_from_result({"status": {"source": "touch"}}) == "touch"
+    assert recording_source_from_result({"status": {"source": "voice"}}) == "voice"
+    assert recording_source_from_result({"status": {}}) == "voice"
+
+
+def test_voice_bridge_touch_recording_bypasses_wake_word_and_uses_touch_prefix(monkeypatch):
+    forwarded = {}
+
+    def fake_forward(event, **kwargs):
+        forwarded["event"] = event
+        forwarded.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr("scripts.stackchan_voice_bridge.forward_to_frontend", fake_forward)
+    args = argparse.Namespace(
+        wake_session_id="117067d6-1111-2222-3333-444444444444",
+        wake_session_title="",
+        wake_url="http://127.0.0.1:3200/wake",
+        wake_token="agent-token",
+        wake_model="",
+        wake_timeout=3,
+        wake_retries=0,
+        wake_retry_delay=0,
+        wake_no_force=False,
+        wake_quiet_minutes=0,
+        prompt_prefix="[Stack-chan语音输入] ",
+        touch_prompt_prefix="[Stack-chan语音输入] （触摸）",
+        wake_words="小塔,机器人",
+    )
+    event = {
+        "type": "transcript",
+        "source": "stackchan_touch",
+        "recording_source": "touch",
+        "text": "不带唤醒词也要送达",
+    }
+
+    result = forward_event_to_frontend(event, args)
+
+    assert result == {"ok": True}
+    assert forwarded["event"] == event
+    assert forwarded["prompt_prefix"] == "[Stack-chan语音输入] （触摸）"
+    assert forwarded["wake_words"] == ()
+    assert forwarded["source"] == "stackchan_touch"
+
+
+def test_touch_pet_tracker_emits_only_new_counts_and_rebaselines_after_restart():
+    tracker = TouchPetTracker()
+
+    assert tracker.observe({"touch_pet_count": 7}) == 0
+    assert tracker.observe({"touch_pet_count": 7}) == 0
+    assert tracker.observe({"touch_pet_count": 9}) == 2
+    assert tracker.observe({"touch_pet_count": 1}) == 0
+    assert tracker.observe({"touch_pet_count": 2}) == 1
+    assert tracker.observe({}) == 0
+
+
+def test_touch_pet_tracker_drains_a_counter_jump_across_polls():
+    tracker = TouchPetTracker(max_events_per_poll=3)
+
+    assert tracker.observe({"touch_pet_count": 1}) == 0
+    assert tracker.observe({"touch_pet_count": 7}) == 3
+    assert tracker.observe({"touch_pet_count": 7}) == 3
+    assert tracker.observe({"touch_pet_count": 7}) == 0
+
+
+def test_touch_pet_tracker_bounds_a_corrupt_or_stale_counter_jump():
+    tracker = TouchPetTracker(max_events_per_poll=3, max_backlog=6)
+
+    assert tracker.observe({"touch_pet_count": 1}) == 0
+    assert tracker.observe({"touch_pet_count": 100}) == 3
+    assert tracker.observe({"touch_pet_count": 100}) == 3
+    assert tracker.observe({"touch_pet_count": 100}) == 0
+
+
+def test_voice_bridge_forwards_touch_pet_without_prefix_or_wake_word(monkeypatch):
+    forwarded = {}
+
+    def fake_forward(event, **kwargs):
+        forwarded["event"] = event
+        forwarded.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr("scripts.stackchan_voice_bridge.forward_to_frontend", fake_forward)
+    args = argparse.Namespace(
+        wake_session_id="117067d6-1111-2222-3333-444444444444",
+        wake_session_title="",
+        wake_url="http://127.0.0.1:3200/wake",
+        wake_token="agent-token",
+        wake_model="",
+        wake_timeout=3,
+        wake_retries=0,
+        wake_retry_delay=0,
+        wake_no_force=False,
+        wake_quiet_minutes=0,
+        prompt_prefix="[Stack-chan语音输入] ",
+        touch_prompt_prefix="[Stack-chan语音输入] （触摸）",
+        wake_words="小塔,机器人",
+    )
+    event = build_touch_pet_event()
+
+    result = forward_event_to_frontend(event, args)
+
+    assert result == {"ok": True}
+    assert forwarded["event"] == event
+    assert forwarded["prompt_prefix"] == ""
+    assert forwarded["wake_words"] == ()
+    assert forwarded["source"] == "stackchan_touch_strip"
+
+
+def test_voice_bridge_consumer_lock_waits_then_records_owner(monkeypatch, tmp_path, capsys):
+    lock_path = tmp_path / "voice-bridge.lock"
+    attempts = 0
+
+    def fake_flock(_fd, _flags):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise BlockingIOError
+
+    monkeypatch.setattr("scripts.stackchan_voice_bridge.fcntl.flock", fake_flock)
+    monkeypatch.setattr("scripts.stackchan_voice_bridge.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("scripts.stackchan_voice_bridge.os.getpid", lambda: 4242)
+
+    lock_handle = acquire_consumer_lock(lock_path, wait_interval=0)
+    try:
+        assert attempts == 2
+        assert lock_path.read_text(encoding="utf-8") == "4242\n"
+        standby = json.loads(capsys.readouterr().out)
+        assert standby["type"] == "standby"
+        assert standby["lock_file"] == str(lock_path)
+    finally:
+        lock_handle.close()
+
+
+def test_voice_bridge_consumer_lock_can_fail_fast(monkeypatch, tmp_path, capsys):
+    lock_path = tmp_path / "voice-bridge.lock"
+    monkeypatch.setattr(
+        "scripts.stackchan_voice_bridge.fcntl.flock",
+        lambda _fd, _flags: (_ for _ in ()).throw(BlockingIOError()),
+    )
+
+    assert acquire_consumer_lock(lock_path, wait=False) is None
+    busy = json.loads(capsys.readouterr().out)
+    assert busy["type"] == "busy"
+    assert busy["lock_file"] == str(lock_path)
+
+
+def test_voice_bridge_default_lock_is_namespaced_by_target(monkeypatch, tmp_path):
+    monkeypatch.setattr("scripts.stackchan_voice_bridge.Path.home", lambda: tmp_path)
+
+    first = default_consumer_lock_path("192.0.2.10", 80)
+    same = default_consumer_lock_path("192.0.2.10", 80)
+    second = default_consumer_lock_path("192.0.2.11", 80)
+
+    assert first == same
+    assert first != second
+    assert first.parent == tmp_path / "Library" / "Caches" / "stackchan"
 
 
 def test_voice_upload_processes_wav_into_transcript_event(monkeypatch, tmp_path):

@@ -3,7 +3,7 @@
 **M5Stack CoreS3 firmware for the Stack-chan MCP robot**
 
 PC/Mac 上の MCP サーバーや補助ツールから、M5Stack CoreS3 上の Stack-chan を HTTP で制御するためのファームウェアです。
-音声再生、録音取得、表情表示、サーボ動作、カメラ撮影、環境センサー取得を担当します。
+音声再生、録音取得、表情表示、サーボ動作、トップのタッチストリップ、カメラ撮影、環境センサー取得を担当します。
 
 ---
 
@@ -12,7 +12,8 @@ PC/Mac 上の MCP サーバーや補助ツールから、M5Stack CoreS3 上の S
 - **HTTP 音声再生**: `POST /play` で WAV URL を再生、`POST /play/pcm` と TCP PCM ストリームで低遅延 PCM 再生
 - **録音の MCP pull モード**: `POST /mode` で録音状態を初期化し、`GET /audio/status` と `GET /audio` で取得
 - **表情・動作・視覚**: `POST /face`、`POST /move`、`POST /nod`、`POST /shake`、`GET /snapshot`
-- **診断エンドポイント**: `GET /playback/status`、`GET /servo/status`、`GET /env`、`GET /env/debug`
+- **タッチ操作**: タップでウェイクワード不要の録音を開始し、往復スワイプで撫で動作（5 秒間の happy 表情 + 首振り）
+- **診断エンドポイント**: `GET /playback/status`、`GET /servo/status`、`GET /touch/status`、`GET /env`、`GET /env/debug`
 - **Arduino / PlatformIO ベース**: CoreS3 向けの C++ ファームウェア
 
 ---
@@ -65,15 +66,20 @@ pio device monitor
 | `POST /play` | WAV URL を受け取って再生 |
 | `POST /play/pcm` | 24kHz mono s16le PCM を受け取って再生またはキュー投入 |
 | `POST /mode` | 録音状態を初期化 (`mode` は `mcp` のみ) |
-| `GET /audio/status` | 録音完了フラグを確認 |
+| `GET /audio/status` | 録音完了フラグと録音元 (`voice` / `touch`) を確認 |
 | `GET /audio` | 録音済み WAV を取得 |
 | `POST /move` / `POST /home` / `POST /nod` / `POST /shake` | 頭の向きとジェスチャー制御 |
 | `POST /face` / `GET /face` | 表情を変更 / 確認 |
 | `GET /snapshot` | カメラ JPEG を取得 |
 | `GET /playback/status` | 音声再生・PCM キュー診断 |
 | `GET /servo/status` | サーボ状態診断 |
+| `GET /touch/status` | タッチ強度、録音開始回数、直近ジェスチャー、カメラ後の I2C 復帰失敗回数 |
 | `GET /env` | 温度・湿度・気圧を取得 |
 | `GET /env/debug` | 環境センサーの診断情報を取得 |
+
+CoreS3 のカメラ SCCB と内部 I2C（タッチ・環境センサー）は GPIO 11/12 を共有します。
+そのためカメラは常時起動せず、`GET /snapshot` の間だけタッチを停止して使用し、
+成功・失敗のどちらでも内部 I2C とタッチドライバーを復帰させます。
 
 ---
 

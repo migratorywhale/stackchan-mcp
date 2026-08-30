@@ -1,53 +1,99 @@
 // wifi_manager.cpp
+//
+// 连接优先级：
+//   1. NVS 里用户配网存的凭证（Preferences, namespace "wifi"）
+//   2. config.h 里的 WIFI_SSID_0 / WIFI_SSID_1（硬编码备用）
+//
+// 每个网络超时 15 秒。
+// 全部失败返回 false，main.cpp 负责调用 runWifiPortal()。
 
 #include <M5Unified.h>
 #include <WiFi.h>
+#include <Preferences.h>
 #include "wifi_manager.h"
 #include "config_loader.h"
 
-// ネットワーク定義（config.h の定数を配列にまとめる）
-struct NetworkConfig {
-    const char* ssid;
-    const char* password;
-};
+#define WIFI_CONNECT_TIMEOUT_MS  15000   // 每个网络的超时（ms）
+#define WIFI_RECONNECT_INTERVAL_MS 5000  // serviceWiFi() 重连间隔
 
-static const NetworkConfig NETWORKS[WIFI_NETWORK_COUNT] = {
-    { WIFI_SSID_0, WIFI_PASSWORD_0 },
-    { WIFI_SSID_1, WIFI_PASSWORD_1 },
-};
+// 内部：尝试连接一个 SSID，超时 WIFI_CONNECT_TIMEOUT_MS。
+// 返回 true = 连上。
+static bool tryConnect(const char* ssid, const char* password) {
+    if (!ssid || strlen(ssid) == 0) return false;
 
-#define WIFI_RECONNECT_INTERVAL_MS 5000
+    Serial.printf("[WIFI] Trying: %s\n", ssid);
+    WiFi.begin(ssid, (password && strlen(password) > 0) ? password : nullptr);
 
-void connectWiFi() {
-    Serial.println("\nConnecting to WiFi...");
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - start >= WIFI_CONNECT_TIMEOUT_MS) {
+            WiFi.disconnect(false);
+            Serial.printf("[WIFI] Timeout: %s\n", ssid);
+            return false;
+        }
+        delay(250);
+        Serial.print(".");
+    }
+    Serial.printf("\n[WIFI] Connected: %s  IP: %s\n",
+                  ssid, WiFi.localIP().toString().c_str());
+    // 连网成功toast：屏幕短暂显示SSID+IP（约3秒），随后被脸覆盖。
+    // 出门/回国场景下让人一眼确认它上的是哪个网。
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(0x07E0);  // 绿色
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(10, 90);
+    M5.Display.printf("WiFi OK!\n\n  %s\n\n  %s", ssid, WiFi.localIP().toString().c_str());
+    delay(3000);
+    return true;
+}
+
+bool connectWiFi() {
+    Serial.println("\n[WIFI] Starting connection sequence");
     WiFi.mode(WIFI_STA);
 
-    for (int i = 0; i < WIFI_NETWORK_COUNT; i++) {
-        Serial.printf("[WIFI] 試行 %d/%d: %s\n", i + 1, WIFI_NETWORK_COUNT, NETWORKS[i].ssid);
+    // ── 1. NVS 保存的用户凭证（优先）────────────────────────────────────────
+    {
+        Preferences prefs;
+        prefs.begin("wifi", true);   // read-only
+        String nvsSsid = prefs.getString("ssid", "");
+        String nvsPass = prefs.getString("pass", "");
+        prefs.end();
 
-        WiFi.begin(NETWORKS[i].ssid, NETWORKS[i].password);
-
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-            delay(500);
-            Serial.print(".");
-            attempts++;
+        if (nvsSsid.length() > 0) {
+            Serial.printf("[WIFI] NVS credentials found: %s\n", nvsSsid.c_str());
+            if (tryConnect(nvsSsid.c_str(), nvsPass.c_str())) {
+                return true;
+            }
+            Serial.println("[WIFI] NVS credentials failed, trying hardcoded networks");
+        } else {
+            Serial.println("[WIFI] No NVS credentials");
         }
-
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("\n[WIFI] 接続成功: %s\n", NETWORKS[i].ssid);
-            Serial.printf("[WIFI] IP: %s\n", WiFi.localIP().toString().c_str());
-
-            return;
-        }
-
-        // このネットワークに繋がらなかった → 次を試す
-        WiFi.disconnect();
-        Serial.printf("\n[WIFI] %s に接続できませんでした\n", NETWORKS[i].ssid);
     }
 
-    // 全部失敗
-    Serial.println("[WIFI] ❌ すべてのネットワークへの接続に失敗しました");
+    // ── 2. config.h の硬编码网络（依次尝试）────────────────────────────────
+
+    struct NetEntry { const char* ssid; const char* pass; };
+    static const NetEntry NETWORKS[WIFI_NETWORK_COUNT] = {
+#if WIFI_NETWORK_COUNT >= 1
+        { WIFI_SSID_0, WIFI_PASSWORD_0 },
+#endif
+#if WIFI_NETWORK_COUNT >= 2
+        { WIFI_SSID_1, WIFI_PASSWORD_1 },
+#endif
+#if WIFI_NETWORK_COUNT >= 3
+        { WIFI_SSID_2, WIFI_PASSWORD_2 },
+#endif
+    };
+
+    for (int i = 0; i < WIFI_NETWORK_COUNT; i++) {
+        if (tryConnect(NETWORKS[i].ssid, NETWORKS[i].pass)) {
+            return true;
+        }
+    }
+
+    // ── 全部失败 ──────────────────────────────────────────────────────────────
+    Serial.println("[WIFI] All networks failed");
+    return false;
 }
 
 void serviceWiFi() {
