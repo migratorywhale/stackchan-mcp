@@ -47,6 +47,40 @@ jobs:
           uv export --locked --no-dev --no-hashes -o "$tmp_requirements"
           uv run --locked pip-audit -r "$tmp_requirements"
 
+  dependency-submission:
+    name: dependency-submission
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Build dependency snapshot
+        run: >-
+          python scripts/build_dependency_snapshot.py
+          --output "$RUNNER_TEMP/dependency-snapshot.json"
+          --job-id "${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          --correlator "${GITHUB_WORKFLOW}_${GITHUB_JOB}"
+
+      - name: Submit dependency snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh api --method POST
+          -H "X-GitHub-Api-Version: 2026-03-10"
+          "repos/${GITHUB_REPOSITORY}/dependency-graph/snapshots"
+          --input "$RUNNER_TEMP/dependency-snapshot.json"
+
   dependency-review:
     name: dependency-review
     runs-on: ubuntu-latest
