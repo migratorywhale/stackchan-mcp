@@ -251,8 +251,11 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                     wav_timing["playback_wait"] = timing_ms(t0)
                     if not start_result.get("started"):
                         status = start_result.get("status", {})
+                        # 2026/9/2假红教训：队列ack成功后轮询未确认≠没播。
+                        # 高延迟链路(exit node/蜂窝)下短句常在轮询间隙播完。降级为⚠️，不再报❌。
                         return (
-                            "❌ Play was queued but playback did not start: "
+                            "⚠️ Play queued OK; start not confirmed within poll window "
+                            "(likely latency — clip may have already played): "
                             f"kind={status.get('kind', '?')} "
                             f"playing={status.get('playing', '?')} "
                             f"current_bytes={status.get('current_bytes', '?')} "
