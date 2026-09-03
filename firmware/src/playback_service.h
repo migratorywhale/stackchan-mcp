@@ -27,6 +27,8 @@ struct PlaybackStatus {
     size_t audioQueueDepth = 0;
     size_t downloadQueueDepth = 0;
     bool downloadInFlight = false;
+    unsigned long downloadAgeMs = 0;
+    unsigned long downloadWatchdogMs = 0;
     bool micResumeRequested = false;
     unsigned long startedMs = 0;
     unsigned long deadlineMs = 0;

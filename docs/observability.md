@@ -50,8 +50,16 @@ PCM under `/tmp/stackchan_audio/diag_<session>.pcm`.
 - `playing`, `kind`, and `pcm_session` for stuck playback sessions.
 - `queued_pcm_segments`, `queued_pcm_bytes`, and `audio_queue_depth` for queue
   growth.
-- `mic_state` and `mic_resume_requested` for microphone recovery after
-  playback.
+- `download_in_flight` and `download_age_ms` for a stalled WAV transfer;
+  `download_watchdog_ms` is the device's final automatic recovery threshold.
+- `mic_state`, `mic_running`, and `mic_resume_requested` for microphone
+  recovery after playback. The voice-trigger state can remain `idle` even
+  when capture is stopped, so `mic_running=true` is the authoritative healthy
+  listener signal.
+- `mic_frame_count` and `mic_last_frame_ms` for live capture progress;
+  `mic_recent_peak_rms` against the configured trigger threshold; and
+  `mic_record_failure_count`, `mic_trigger_count`, and
+  `mic_stored_recording_count` to separate capture, VAD, and storage failures.
 - `gesture` for stuck servo gestures.
 - `free_heap` and `free_psram` for memory pressure after repeated playback or
   capture cycles.
@@ -74,6 +82,8 @@ Keep alerts deployment-local. Good first alerts are:
 - Firmware probes fail for more than one or two polling intervals.
 - `/playback/status` reports growing PCM or audio queues while `playing` does
   not clear.
+- `download_in_flight=true` approaches `download_watchdog_ms` instead of
+  clearing after a transfer failure.
 - `free_heap` or `free_psram` drops steadily across repeated playback cycles.
 - Upload receiver `/health` fails while the public recorder URL is expected to
   be live.

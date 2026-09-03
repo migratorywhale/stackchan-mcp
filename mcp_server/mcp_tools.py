@@ -8,6 +8,7 @@ from typing import Any
 import requests
 
 from . import audio_processing
+from .audio_publish import publish_wav
 from .audio_server import AUDIO_DIR, audio_url, start_audio_server
 from .listening import capture_ready_recording, format_listen_result
 from .stackchan_client import (
@@ -217,6 +218,15 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
             t0 = time.perf_counter()
             audio_processing.validate_playback_wav(wav_path)
             wav_timing["validate"] = timing_ms(t0)
+            if config.audio_publish_target:
+                t0 = time.perf_counter()
+                publish_wav(
+                    wav_path,
+                    config.audio_publish_target,
+                    config.audio_publish_timeout,
+                    config.audio_publish_attempts,
+                )
+                wav_timing["publish"] = timing_ms(t0)
             baseline_started_ms = None
             baseline_playing = False
             try:
@@ -241,8 +251,11 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                     wav_timing["playback_wait"] = timing_ms(t0)
                     if not start_result.get("started"):
                         status = start_result.get("status", {})
+                        # 2026/9/2假红教训：队列ack成功后轮询未确认≠没播。
+                        # 高延迟链路(exit node/蜂窝)下短句常在轮询间隙播完。降级为⚠️，不再报❌。
                         return (
-                            "❌ Play was queued but playback did not start: "
+                            "⚠️ Play queued OK; start not confirmed within poll window "
+                            "(likely latency — clip may have already played): "
                             f"kind={status.get('kind', '?')} "
                             f"playing={status.get('playing', '?')} "
                             f"current_bytes={status.get('current_bytes', '?')} "

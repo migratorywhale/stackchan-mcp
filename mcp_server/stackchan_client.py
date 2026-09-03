@@ -175,6 +175,10 @@ class StackchanClient:
             started_ms = last_status.get("started_ms")
             if baseline_started_ms is not None and started_ms != baseline_started_ms:
                 return {"started": True, "status": last_status}
+            # 基线读取失败(None)时的兜底：只要观察到非零started_ms就视为已开始。
+            # 短句在高延迟链路上可能在两次轮询之间开始并结束，只认playing会漏判。
+            if baseline_started_ms is None and started_ms:
+                return {"started": True, "status": last_status, "unconfirmed_baseline": True}
             time.sleep(interval)
         result = {"started": False, "status": last_status}
         if last_error:

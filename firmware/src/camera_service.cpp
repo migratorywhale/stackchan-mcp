@@ -1,4 +1,5 @@
 #include "camera_service.h"
+#include "touch_service.h"
 #include "esp_camera.h"
 #include "img_converters.h"
 #include <M5Unified.h>
@@ -25,10 +26,7 @@
 
 static bool cameraReady = false;
 
-bool initCamera() {
-    // Release M5Unified's internal I2C bus — it shares pins 11/12 with camera SCCB
-    M5.In_I2C.release();
-
+static bool initCamera() {
     camera_config_t config;
     memset(&config, 0, sizeof(config));
 
@@ -74,45 +72,71 @@ bool initCamera() {
     return true;
 }
 
-bool captureJpeg(uint8_t** outBuf, size_t* outLen, int quality) {
-    if (!cameraReady) {
-        Serial.println("[CAM] Not initialized");
-        return false;
-    }
-
-    // With CAMERA_GRAB_WHEN_EMPTY, the driver captures one frame immediately after
-    // esp_camera_fb_return(). That frame sits in the DMA buffer until the next
-    // fb_get() — potentially minutes later. Discard it to force a fresh capture.
-    camera_fb_t* stale = esp_camera_fb_get();
-    if (!stale) {
-        Serial.println("[CAM] Stale flush failed");
-        return false;
-    }
-    esp_camera_fb_return(stale);
-
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) {
-        Serial.println("[CAM] Capture failed");
-        return false;
-    }
-
-    // Convert RGB565 to JPEG
-    bool ok = frame2jpg(fb, quality, outBuf, outLen);
-    esp_camera_fb_return(fb);
-
-    if (!ok) {
-        Serial.println("[CAM] JPEG conversion failed");
-        return false;
-    }
-
-    Serial.printf("[CAM] Captured JPEG: %u bytes\n", (unsigned)*outLen);
-    return true;
-}
-
-void deinitCamera() {
+static void deinitCamera() {
     if (cameraReady) {
         esp_camera_deinit();
         cameraReady = false;
         Serial.println("[CAM] Deinitialized");
     }
+}
+
+bool captureJpeg(uint8_t** outBuf, size_t* outLen, int quality) {
+    if (!outBuf || !outLen) {
+        return false;
+    }
+    *outBuf = nullptr;
+    *outLen = 0;
+
+    // GC0308 SCCB and M5.In_I2C both use GPIO 11/12. Keep the camera lazy so
+    // touch and environmental sensors own the bus between snapshots.
+    suspendTouchService();
+    const bool busReleased = M5.In_I2C.release();
+    if (!busReleased) {
+        Serial.println("[CAM] Internal I2C release failed; camera start aborted");
+        if (!resumeTouchService()) {
+            Serial.println("[CAM] Internal I2C also failed to recover after release failure");
+        }
+        return false;
+    }
+
+    bool captureOk = false;
+    if (initCamera()) {
+        // With CAMERA_GRAB_WHEN_EMPTY, the driver captures one frame immediately
+        // after esp_camera_fb_return(). Discard it to force a fresh capture.
+        camera_fb_t* stale = esp_camera_fb_get();
+        if (!stale) {
+            Serial.println("[CAM] Stale flush failed");
+        } else {
+            esp_camera_fb_return(stale);
+
+            camera_fb_t* fb = esp_camera_fb_get();
+            if (!fb) {
+                Serial.println("[CAM] Capture failed");
+            } else {
+                captureOk = frame2jpg(fb, quality, outBuf, outLen);
+                esp_camera_fb_return(fb);
+                if (!captureOk) {
+                    Serial.println("[CAM] JPEG conversion failed");
+                }
+            }
+        }
+    }
+
+    deinitCamera();
+    const bool touchRestored = resumeTouchService();
+
+    if (!captureOk || !touchRestored) {
+        if (*outBuf) {
+            free(*outBuf);
+            *outBuf = nullptr;
+        }
+        *outLen = 0;
+        if (!touchRestored) {
+            Serial.println("[CAM] Snapshot rejected because internal I2C/touch did not recover");
+        }
+        return false;
+    }
+
+    Serial.printf("[CAM] Captured JPEG: %u bytes\n", (unsigned)*outLen);
+    return true;
 }

@@ -4,6 +4,7 @@
 static uint8_t* s_wavBuf = nullptr;
 static size_t s_wavSize = 0;
 static bool s_wavReady = false;
+static RecordingSource s_recordingSource = RecordingSource::NONE;
 
 void clearLastRecording() {
     if (s_wavBuf) {
@@ -12,9 +13,10 @@ void clearLastRecording() {
     s_wavBuf = nullptr;
     s_wavSize = 0;
     s_wavReady = false;
+    s_recordingSource = RecordingSource::NONE;
 }
 
-bool storeLastRecording(const uint8_t* wav, size_t size) {
+bool storeLastRecording(const uint8_t* wav, size_t size, RecordingSource source) {
     clearLastRecording();
 
     s_wavBuf = (uint8_t*)ps_malloc(size);
@@ -25,7 +27,9 @@ bool storeLastRecording(const uint8_t* wav, size_t size) {
     memcpy(s_wavBuf, wav, size);
     s_wavSize = size;
     s_wavReady = true;
-    Serial.printf("[REC] Stored recording: %u bytes\n", (unsigned)size);
+    s_recordingSource = source;
+    Serial.printf("[REC] Stored recording: %u bytes source=%s\n",
+                  (unsigned)size, recordingSourceName(source));
     return true;
 }
 
@@ -42,6 +46,19 @@ RecordingSnapshot getLastRecording() {
     return snapshot;
 }
 
+RecordingSource getLastRecordingSource() {
+    return hasLastRecording() ? s_recordingSource : RecordingSource::NONE;
+}
+
+const char* recordingSourceName(RecordingSource source) {
+    switch (source) {
+        case RecordingSource::VOICE: return "voice";
+        case RecordingSource::TOUCH: return "touch";
+        default: return "none";
+    }
+}
+
 void markLastRecordingConsumed() {
     s_wavReady = false;
+    s_recordingSource = RecordingSource::NONE;
 }

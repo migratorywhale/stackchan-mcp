@@ -30,8 +30,10 @@ Treat any public MCP URL as sensitive operational infrastructure.
 
 Voice upload endpoints require `STACKCHAN_VOICE_UPLOAD_TOKEN` whenever the
 receiver binds a non-loopback address. Send it with the
-`X-Stackchan-Upload-Token` header; query-string tokens are deprecated because
-URLs can leak through browser history and copied links.
+`X-Stackchan-Upload-Token` header. The recorder page can migrate a token from
+an older bookmarked URL into `sessionStorage`, but the upload API rejects
+query-string tokens because URLs can leak through browser history and copied
+links.
 
 The generated-WAV server listens on the LAN so the device can fetch speech
 audio. Responses are marked `no-store`, but the endpoint is not authenticated.

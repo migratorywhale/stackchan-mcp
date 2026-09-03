@@ -51,7 +51,10 @@ This is the shared contract between the CoreS3 firmware and the MCP server.
   - Clears any previous recording. Recording behavior is always MCP pull mode.
 
 - `GET /audio/status`
-  - Returns `{"ready":true|false,"mode":"mcp"}`.
+  - Returns `{"ready":true|false,"mode":"mcp","source":"voice|touch|none"}`.
+  - `source=touch` marks a recording explicitly started by tapping the top
+    touch strip. The host bridge uses this marker to bypass wake-word matching
+    and forwards the transcript with the `（触摸）` prefix.
 
 - `GET /audio`
   - Returns the latest WAV recording.
@@ -76,6 +79,22 @@ This is the shared contract between the CoreS3 firmware and the MCP server.
 - `GET /face`
   - Returns `{"face":"<name>"}`.
 
+## Touch Strip
+
+- The three-zone Si12T strip on top of Stack-chan is polled by the firmware.
+- A short tap starts a forced microphone recording without waiting for the
+  normal RMS trigger. The user has up to four seconds to begin speaking; after
+  speech starts, the normal silence and maximum-duration rules end recording.
+  Audio playback, PCM streaming, or another recording causes the request to be
+  rejected instead of interrupting the active path.
+- A forward swipe followed by a backward swipe, or the reverse order, within
+  1500 ms is treated as petting. While audio and recording are idle, petting
+  shows the `happy` face for five seconds and starts the non-blocking shake
+  gesture. Touch never starts speech or a network request.
+- The CoreS3 camera shares GPIO 11/12 with the internal I2C bus. `/snapshot`
+  temporarily suspends touch, uses the camera, then restores the I2C bus and
+  reinitializes the Si12T on every success and failure path.
+
 ## Diagnostics
 
 - `GET /env`
@@ -91,9 +110,16 @@ This is the shared contract between the CoreS3 firmware and the MCP server.
     calibration and ADC readings on the host side.
 
 - `GET /servo/status`
+- `GET /touch/status`
+  - Returns whether the Si12T is available or temporarily suspended, the
+    current front/middle/back intensity values, the latest click/hold/swipe or
+    petting event, recording request/failure counters, pet counters, and
+    `resume_failure_count` for camera handoff failures.
 - `GET /playback/status`
   - Includes playback state, PCM queue depth, audio queue depth, download
     queue depth, UDP/TCP PCM stream state, and whether a WAV download is
     currently in flight.
+  - `download_age_ms` reports the age of the active WAV download, or `0` when
+    idle. `download_watchdog_ms` reports the automatic recovery threshold.
 - `GET /snapshot`
   - Returns a JPEG image.

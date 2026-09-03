@@ -28,6 +28,7 @@ build/
 .env.*
 !.env.example
 firmware/src/config.h
+firmware/src/config.h.bak-*
 deploy/macos/*.plist
 
 # PlatformIO
@@ -52,3 +53,4 @@ stackchan_audio/
 .stackchan_audio/
 stackchan_otel.jsonl
 voice_inbox.jsonl
+relink.sh

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import html
 import ipaddress
 import json
@@ -17,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
 from typing import Any, cast
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -35,7 +36,7 @@ from scripts.stackchan_frontend_wake import (  # noqa: E402
 )
 from scripts.stackchan_voice_bridge import (  # noqa: E402
     load_env_file,
-    load_frontend_token,
+    resolve_frontend_token,
     resolve_wake_session,
     should_append_to_inbox,
 )
@@ -481,13 +482,14 @@ def process_uploaded_wav(
 def is_upload_authorized(path: str, headers: Any, token: str) -> bool:
     if not token:
         return True
-    url = urlparse(path)
-    query_token = parse_qs(url.query).get("token", [""])[0]
     auth = headers.get("Authorization", "")
     header_token = headers.get("X-Stackchan-Upload-Token", "")
-    # `?token=` remains accepted for existing bookmarked URLs, but new clients
-    # should prefer the header-based flow so tokens do not linger in URLs.
-    return query_token == token or auth == f"Bearer {token}" or header_token == token
+    bearer_token = auth.removeprefix("Bearer ") if auth.startswith("Bearer ") else ""
+
+    def matches(candidate: str) -> bool:
+        return bool(candidate) and hmac.compare_digest(candidate.encode(), token.encode())
+
+    return matches(bearer_token) or matches(header_token)
 
 
 def build_health_payload(options: ServerOptions) -> dict[str, Any]:
@@ -683,7 +685,7 @@ class VoiceUploadHandler(BaseHTTPRequestHandler):
                 event,
                 wake_url=self.voice_server.options.wake_url,
                 session_id=wake_session_id,
-                token=self.voice_server.options.wake_token,
+                token=resolve_frontend_token(self.voice_server.options.wake_token),
                 model=self.voice_server.options.wake_model,
                 timeout=self.voice_server.options.wake_timeout,
                 retries=self.voice_server.options.wake_retries,
@@ -822,7 +824,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("STACKCHAN_VOICE_UPLOAD_TOKEN", ""),
         help=(
             "Optional token required for POST /voice/upload. The recorder page sends it as "
-            "X-Stackchan-Upload-Token; ?token=... is accepted only for backward compatibility."
+            "X-Stackchan-Upload-Token. Query-string tokens are never accepted for uploads."
         ),
     )
     parser.add_argument(
@@ -850,7 +852,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     load_env_file(REPO_ROOT / ".env")
-    load_frontend_token()
     parser = build_parser()
     args = parser.parse_args()
     config = load_config()

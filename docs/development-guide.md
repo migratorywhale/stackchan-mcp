@@ -265,6 +265,10 @@ The legacy immediate HTTP PCM segment path remains available for direct tests:
 - WAV playback treats an active device-side download as a pending playback, so
   additional `/play` requests are held in the logical audio queue instead of
   being dropped by the lower-level download queue.
+- WAV downloads use bounded connect, inactivity, and total-transfer timeouts.
+  The worker publishes exactly one success or failure completion event, and a
+  60-second watchdog restarts the device only if that normal recovery path
+  cannot clear the in-flight state.
 - The logical WAV queue accepts up to 16 pending items. Additional `/play`
   requests return `503 {"success":false,"error":"play queue full"}`.
 - Queued WAV items keep priority ordering; items with the same priority are
@@ -347,7 +351,9 @@ It uses RMS thresholds to trigger recording and to end after silence.
   the token optional for compatibility.
 - Both voice paths read `AGENT_HOST_TOKEN` from `STACKCHAN_FRONTEND_ENV` when
   `STACKCHAN_FRONTEND_TOKEN` is unset. This avoids copying the frontend token
-  into the Stack-chan repo.
+  into the Stack-chan repo. The file-backed token is resolved immediately before
+  each frontend forward, so relay token rotation does not require restarting the
+  long-running voice bridge or upload receiver.
 - The voice paths intentionally do not guess the active frontend room. Use
   `STACKCHAN_FRONTEND_SESSION_ID=<uuid>` when the voice prompt should enter a
   specific frontend session; omit it for inbox-only capture.
@@ -376,9 +382,9 @@ It uses RMS thresholds to trigger recording and to end after silence.
 - For phone tests, set `STACKCHAN_VOICE_UPLOAD_TOKEN`, open the recorder as
   `https://...trycloudflare.com/`, and enter the token in the page. The page
   sends it as `X-Stackchan-Upload-Token`; unauthenticated uploads receive HTTP
-  401. Older `?token=...` links remain accepted for compatibility, but they are
-  deprecated; the page moves that token into `sessionStorage` and cleans the
-  address bar.
+  401. When an older recorder bookmark contains `?token=...`, the page moves
+  that token into `sessionStorage` and cleans the address bar. The upload API
+  never accepts query-string tokens.
 - For daily phone use, point your own HTTPS route or reverse proxy at
   `http://localhost:8767` and set `STACKCHAN_VOICE_PUBLIC_URL` to that public
   recorder URL. If you use Cloudflare's default certificate coverage, keep the
@@ -418,6 +424,15 @@ Important environment variables:
 - `STACKCHAN_PORT`: device HTTP port, usually `80`.
 - `MAC_IP`: host IP used in generated audio URLs.
 - `AUDIO_SERVE_PORT`: local HTTP port used to serve generated WAV files.
+- `STACKCHAN_AUDIO_PUBLISH_TARGET`: optional rsync destination for deployments
+  where the WAV HTTP server runs on another host. The MCP publishes the current
+  file and waits for rsync to finish before sending `/play`, so the device cannot
+  race an asynchronous directory mirror.
+- `STACKCHAN_AUDIO_PUBLISH_TIMEOUT_SEC`: timeout for that synchronous publish;
+  default `20` seconds per attempt.
+- `STACKCHAN_AUDIO_PUBLISH_ATTEMPTS`: bounded retry count for transient SSH,
+  Tailscale, or host-wake failures; default `2`, clamped to `1..3`. A timed-out
+  attempt terminates its full rsync/ssh process group before retrying.
 - `TTS_ENGINE`: `fish-audio` or `edge-tts`.
 - `FISH_AUDIO_KEY`: required for Fish Audio TTS/ASR.
 - `EDGE_TTS_BIN`: path to `edge-tts` when using the edge TTS fallback.
@@ -444,7 +459,8 @@ The server writes generated and captured media under `/tmp/stackchan_audio`.
 `stackchan_playback_status()` calls firmware `GET /playback/status` and is the
 preferred live diagnostic for playback bugs because it does not consume
 recordings and reports queue depth, PCM state, microphone state, gesture state,
-heap, and PSRAM.
+heap, and PSRAM. For WAV download failures, compare `download_in_flight` with
+`download_age_ms`; `download_watchdog_ms` reports the final recovery threshold.
 
 Run in stdio mode:
 

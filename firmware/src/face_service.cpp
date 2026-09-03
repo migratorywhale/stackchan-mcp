@@ -19,6 +19,7 @@ static int            gif_src_height     = 0;
 // ── Face tracking ──────────────────────────────────────────────────────────
 static WhaleFace currentFace = WHALE_CALM;
 static bool      isTalking   = false;
+static uint32_t  faceCommandRevision = 0;
 
 // ── GIF asset table ────────────────────────────────────────────────────────
 struct GifAsset { const uint8_t* data; size_t len; };
@@ -209,26 +210,29 @@ void setFaceExpression(FaceExpression expr) {
             break;
     }
 
+    ++faceCommandRevision;
     if (target != currentFace) {
         switchToFace(target);
     }
 }
 
 void setMouthOpen(float ratio) {
-    // Lip sync: toggle between calm and happy during speech.
-    if (!isTalking) return;
-
-    WhaleFace target = (ratio > 0.15f) ? WHALE_HAPPY : WHALE_CALM;
-    if (target != currentFace) {
-        switchToFace(target);
-    }
+    // Lip sync disabled for AnimatedGIF faces — pixel art has no mouth
+    // animation, and switching GIFs causes visible flicker (close + open + redraw).
+    // Keep the function signature for API compatibility.
+    (void)ratio;
 }
 
 void setWhaleFace(WhaleFace face) {
     isTalking = false;
+    ++faceCommandRevision;
     switchToFace(face);
 }
 
 const char* getCurrentFaceName() {
     return whaleFaceName(currentFace);
+}
+
+uint32_t getFaceCommandRevision() {
+    return faceCommandRevision;
 }

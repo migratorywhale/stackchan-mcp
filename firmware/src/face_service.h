@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #include "face_names.h"
 
 // Expression types (state-based, used by mic/audio services)
@@ -16,3 +18,6 @@ void setFaceExpression(FaceExpression expr);
 void setMouthOpen(float ratio);  // 0.0~1.0 for lip sync
 void setWhaleFace(WhaleFace face);  // Direct face control
 const char* getCurrentFaceName();
+// Advances on every face command, including a same-face reassertion. This lets
+// temporary effects avoid restoring over a newer owner's explicit command.
+uint32_t getFaceCommandRevision();

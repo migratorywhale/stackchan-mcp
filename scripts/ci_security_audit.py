@@ -40,6 +40,7 @@ IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 ACTION_USE_RE = re.compile(r"^\s*uses:\s*(?P<target>[^#\s]+)", re.MULTILINE)
 PINNED_ACTION_RE = re.compile(r"@[0-9a-fA-F]{40}$")
 EXACT_PIO_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*(?:[-+][A-Za-z0-9.-]+)?")
+GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 LOCAL_MACOS_USER_PATH_RE = re.compile(r"/" r"Users/(?!REPLACE_WITH_)[^/\s<]+")
 
 # Retired tunnel hostnames that must never reappear in tracked files. Built from
@@ -243,10 +244,16 @@ def check_platformio_dependency_pins(errors: list[str]) -> None:
 
 
 def has_exact_pio_version(spec: str) -> bool:
-    if "@" not in spec:
-        return False
-    version = spec.rsplit("@", 1)[1].strip()
-    return bool(EXACT_PIO_VERSION_RE.fullmatch(version))
+    # Registry deps: owner/name@<exact semver>.
+    if "@" in spec:
+        version = spec.rsplit("@", 1)[1].strip()
+        return bool(EXACT_PIO_VERSION_RE.fullmatch(version))
+    # VCS deps: <url>#<ref>. Only a full 40-hex commit SHA is immutable;
+    # branch names and tags are rejected on purpose.
+    if "#" in spec:
+        ref = spec.rsplit("#", 1)[1].strip()
+        return bool(GIT_SHA_RE.fullmatch(ref))
+    return False
 
 
 def relpath(path: Path) -> str:
