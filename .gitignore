@@ -53,3 +53,4 @@ stackchan_audio/
 .stackchan_audio/
 stackchan_otel.jsonl
 voice_inbox.jsonl
+relink.sh
