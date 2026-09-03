@@ -42,7 +42,7 @@ current WAV and waits for successful completion before sending `/play`. Rsync's
 normal temporary-file rename keeps the destination atomic. Publication has a
 bounded timeout and failures are returned before any playback request is sent.
 
-The old `xyz.migratorybird.audio-push` polling LaunchAgent is disabled in the
+The old `<your-reverse-dns>.audio-push` polling LaunchAgent is disabled in the
 two-host deployment to avoid duplicate concurrent transfers. Its script remains
 available as a rollback mechanism.
 

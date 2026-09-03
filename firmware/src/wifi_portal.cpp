@@ -43,7 +43,7 @@ static void drawPortalScreen() {
     M5.Display.setTextColor(0x07FF);
     M5.Display.setCursor(10, 78);
     M5.Display.print("Open:  ");
-    M5.Display.println("192.168.4.1");
+    M5.Display.println(WiFi.softAPIP().toString());
 
     // Steps (large enough for phone camera)
     M5.Display.setTextSize(2);
@@ -204,7 +204,7 @@ void runWifiPortal() {
 
     // Captive-portal redirect: phones probe random URLs to detect a portal
     portalServer.onNotFound([&]() {
-        portalServer.sendHeader("Location", "http://192.168.4.1/", true);
+        portalServer.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
         portalServer.send(302, "text/plain", "");
     });
 

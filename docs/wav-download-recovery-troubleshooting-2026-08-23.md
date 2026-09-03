@@ -14,7 +14,7 @@
   repository drift because it used stale hard-coded Wi-Fi and PNG faces, while
   the deployed device had NVS Wi-Fi and GIF faces.
 - The active source was recovered from the Mac mini checkout at
-  `/Users/koke/Projects/stackchan-mcp`. A full 16 MB flash backup was saved on
+  `~/Projects/stackchan-mcp`. A full 16 MB flash backup was saved on
   the MacBook before restoring the active firmware line.
 - Source inspection found that `downloadTask()` used non-blocking completion
   queue writes. If the success or failure result was dropped,
