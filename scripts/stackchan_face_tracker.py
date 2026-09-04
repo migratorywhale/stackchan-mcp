@@ -31,8 +31,8 @@ logger = logging.getLogger("stackchan.face_tracker")
 class OpenCvFaceDetector:
     def __init__(self, *, min_face_pixels: int = 36):
         try:
-            import cv2
-            import numpy as np
+            import cv2  # pyright: ignore[reportMissingImports]
+            import numpy as np  # pyright: ignore[reportMissingImports]
         except ImportError as exc:
             raise RuntimeError(
                 "Face tracking needs the optional dependencies; run "
