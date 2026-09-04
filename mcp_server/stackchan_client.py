@@ -226,11 +226,21 @@ class StackchanClient:
             timeout=self.config.http_command_timeout,
         ).json()
 
-    def move(self, x: float, y: float, speed: int) -> dict:
+    def move(
+        self,
+        x: float,
+        y: float,
+        speed: int,
+        *,
+        interrupt_gesture: bool = True,
+    ) -> dict:
+        body: dict[str, float | int | bool] = {"x": x, "y": y, "speed": speed}
+        if not interrupt_gesture:
+            body["interrupt_gesture"] = False
         return self.request(
             "post",
             f"{self.base_url}/move",
-            json_body={"x": x, "y": y, "speed": speed},
+            json_body=body,
             timeout=self.config.http_command_timeout,
         ).json()
 
@@ -256,21 +266,61 @@ class StackchanClient:
             timeout=self.config.http_status_timeout,
         ).json()
 
-    def snapshot(self) -> tuple[bytes | None, int]:
-        with suppress(Exception):
-            self.request(
-                "get",
-                f"{self.base_url}/snapshot",
-                timeout=self.config.http_snapshot_warmup_timeout,
-            )
+    def servo_status(self) -> dict:
+        return self.request(
+            "get",
+            f"{self.base_url}/servo/status",
+            timeout=self.config.http_status_timeout,
+        ).json()
+
+    def start_camera_session(self, idle_timeout_ms: int = 5000) -> dict:
+        return self.request(
+            "post",
+            f"{self.base_url}/camera/session",
+            json_body={"idle_timeout_ms": idle_timeout_ms},
+            timeout=self.config.http_snapshot_timeout,
+        ).json()
+
+    def stop_camera_session(self) -> dict:
+        return self.request(
+            "delete",
+            f"{self.base_url}/camera/session",
+            timeout=self.config.http_snapshot_timeout,
+        ).json()
+
+    def camera_status(self) -> dict:
+        return self.request(
+            "get",
+            f"{self.base_url}/camera/status",
+            timeout=self.config.http_status_timeout,
+        ).json()
+
+    def snapshot_once(
+        self,
+        *,
+        preview: bool = True,
+        camera_session: bool = False,
+        timeout: float | None = None,
+    ) -> tuple[bytes | None, int]:
+        query = f"preview={1 if preview else 0}"
+        if camera_session:
+            query += "&session=1"
         resp = self.request(
             "get",
-            f"{self.base_url}/snapshot",
-            timeout=self.config.http_snapshot_timeout,
+            f"{self.base_url}/snapshot?{query}",
+            timeout=self.config.http_snapshot_timeout if timeout is None else timeout,
         )
         if resp.status_code == 200:
             return resp.content, len(resp.content)
         return None, 0
+
+    def snapshot(self) -> tuple[bytes | None, int]:
+        with suppress(Exception):
+            self.snapshot_once(
+                preview=False,
+                timeout=self.config.http_snapshot_warmup_timeout,
+            )
+        return self.snapshot_once(preview=True)
 
 
 def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_processing) -> dict:

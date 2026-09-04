@@ -16,6 +16,7 @@
 #include "touch_service.h"
 #include "audio_gate.h"
 #include "env_service.h"
+#include "camera_service.h"
 
 void setup() {
     Serial.begin(115200);
@@ -73,7 +74,13 @@ void setup() {
 void loop() {
     static uint32_t lastMicResumeAttemptMs = 0;
 
-    M5StackChan.update();
+    updateCameraService();
+    // The GC0308 owns the internal I2C pins during a burst session. The BSP
+    // update polls the top touch sensor on that bus, so leave it paused until
+    // the host ends the session or the firmware watchdog expires it.
+    if (!isCameraSessionActive()) {
+        M5StackChan.update();
+    }
     updateTouchService();
     handleHttpServer();
     serviceWiFi();
