@@ -582,6 +582,10 @@ static void handleSnapshot() {
         return;
     }
 
+    if (!showCameraPreview(jpgBuf, jpgLen)) {
+        Serial.println("[HTTP] Camera preview unavailable; returning JPEG normally");
+    }
+
     server.send_P(200, "image/jpeg", (const char*)jpgBuf, jpgLen);
     free(jpgBuf);
     Serial.printf("[HTTP] GET /snapshot -> %u bytes JPEG\n", (unsigned)jpgLen);

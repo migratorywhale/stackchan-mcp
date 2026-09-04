@@ -7,6 +7,9 @@
 #include <AnimatedGIF.h>
 #include <M5Unified.h>
 #include <SPIFFS.h>
+#include <atomic>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 // ── GIF engine state ───────────────────────────────────────────────────────
 static AnimatedGIF gif;
@@ -15,6 +18,13 @@ static size_t         current_gif_len    = 0;
 static volatile bool  gif_changed        = false;
 static int            gif_src_width      = 0;
 static int            gif_src_height     = 0;
+static SemaphoreHandle_t display_mutex    = nullptr;
+
+// The HTTP server runs on the Arduino loop task while GIF rendering runs on
+// core 1. A short preview gate and display mutex keep both from drawing at
+// once, then force the newest face state to be redrawn when the preview ends.
+static std::atomic<bool>     camera_preview_active{false};
+static std::atomic<uint32_t> camera_preview_until_ms{0};
 
 // ── Face tracking ──────────────────────────────────────────────────────────
 static WhaleFace currentFace = WHALE_CALM;
@@ -54,6 +64,20 @@ static const int NUM_GIF_ASSETS = 7;
 // We use fixed-point: scale_num=5, scale_den=4 (= 1.25x).
 #define SCALE_NUM 5
 #define SCALE_DEN 4
+
+static bool previewDeadlineReached(uint32_t now, uint32_t deadline) {
+    return static_cast<int32_t>(now - deadline) >= 0;
+}
+
+static bool takeDisplay(TickType_t timeout) {
+    return display_mutex == nullptr || xSemaphoreTake(display_mutex, timeout) == pdTRUE;
+}
+
+static void releaseDisplay() {
+    if (display_mutex != nullptr) {
+        xSemaphoreGive(display_mutex);
+    }
+}
 
 static void GIFDraw(GIFDRAW* pDraw) {
     int srcW = pDraw->iWidth;
@@ -113,8 +137,32 @@ static void faceTask(void* param) {
     gif.begin(GIF_PALETTE_RGB565_LE);
 
     while (true) {
+        if (camera_preview_active.load()) {
+            const uint32_t deadline = camera_preview_until_ms.load();
+            if (!previewDeadlineReached(millis(), deadline)) {
+                vTaskDelay(pdMS_TO_TICKS(25));
+                continue;
+            }
+
+            camera_preview_active.store(false);
+            gif_changed = true;
+        }
+
         if (gif_changed) {
             gif.close();
+
+            if (!takeDisplay(portMAX_DELAY)) {
+                vTaskDelay(pdMS_TO_TICKS(25));
+                continue;
+            }
+
+            // A preview may have started while this task was waiting for the
+            // display. Leave the GIF closed and retry after the preview.
+            if (camera_preview_active.load()) {
+                releaseDisplay();
+                continue;
+            }
+
             M5.Display.fillScreen(TFT_BLACK);
 
             if (current_gif_data != nullptr) {
@@ -133,14 +181,28 @@ static void faceTask(void* param) {
                 }
             }
             gif_changed = false;
+            releaseDisplay();
         }
 
         if (current_gif_data != nullptr) {
+            if (!takeDisplay(portMAX_DELAY)) {
+                vTaskDelay(pdMS_TO_TICKS(25));
+                continue;
+            }
+
+            // Recheck after acquiring the display so a camera preview cannot
+            // be immediately overwritten by a GIF frame.
+            if (camera_preview_active.load()) {
+                releaseDisplay();
+                continue;
+            }
+
             int frameResult = gif.playFrame(true, nullptr);
             if (frameResult == 0) {
                 // End of animation — reset to loop.
                 gif.reset();
             }
+            releaseDisplay();
         } else {
             vTaskDelay(pdMS_TO_TICKS(50));
         }
@@ -171,6 +233,11 @@ void initFace() {
     current_gif_len  = GIF_ASSETS[WHALE_CALM].len;
     gif_changed      = true;
     currentFace      = WHALE_CALM;
+
+    display_mutex = xSemaphoreCreateMutex();
+    if (display_mutex == nullptr) {
+        Serial.println("[FACE] Display mutex allocation failed; camera preview disabled");
+    }
 
     // Spawn animation task on core 1 (core 0 handles WiFi/BT).
     xTaskCreatePinnedToCore(faceTask, "face_gif", 8192, nullptr, 1, nullptr, 1);
@@ -235,4 +302,39 @@ const char* getCurrentFaceName() {
 
 uint32_t getFaceCommandRevision() {
     return faceCommandRevision;
+}
+
+bool showCameraPreview(const uint8_t* jpegData, size_t jpegLen, uint32_t durationMs) {
+    if (jpegData == nullptr || jpegLen == 0 || display_mutex == nullptr) {
+        return false;
+    }
+
+    camera_preview_until_ms.store(millis() + durationMs);
+    camera_preview_active.store(true);
+
+    if (!takeDisplay(pdMS_TO_TICKS(2000))) {
+        camera_preview_active.store(false);
+        gif_changed = true;
+        Serial.println("[FACE] Camera preview timed out waiting for display");
+        return false;
+    }
+
+    const bool drawn = M5.Display.drawJpg(
+        jpegData,
+        static_cast<uint32_t>(jpegLen),
+        0,
+        0,
+        M5.Display.width(),
+        M5.Display.height());
+    releaseDisplay();
+
+    if (!drawn) {
+        camera_preview_active.store(false);
+        gif_changed = true;
+        Serial.println("[FACE] Camera preview JPEG decode failed");
+        return false;
+    }
+
+    Serial.printf("[FACE] Camera preview shown for %u ms\n", (unsigned)durationMs);
+    return true;
 }

@@ -172,7 +172,7 @@ The firmware exposes an HTTP API on port 80.
 | `GET` | `/playback/status` | Runtime diagnostics | Playback, PCM queues, mic state, gesture, heap, and PSRAM |
 | `POST` | `/face` | Set face expression | Body: `{"face":"calm"}` |
 | `GET` | `/face` | Read current face expression | Returns current face name |
-| `GET` | `/snapshot` | Capture camera image | Returns 320x240 JPEG |
+| `GET` | `/snapshot` | Capture camera image | Returns a 320x240 JPEG and previews it on the display for six seconds |
 
 Supported face names are `calm`, `thinking`, `happy`, `sleepy`, `shy`, `smug`,
 and `pouty`.

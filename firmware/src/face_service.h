@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "face_names.h"
@@ -21,3 +22,8 @@ const char* getCurrentFaceName();
 // Advances on every face command, including a same-face reassertion. This lets
 // temporary effects avoid restoring over a newer owner's explicit command.
 uint32_t getFaceCommandRevision();
+
+// Temporarily replace the animated face with the exact JPEG returned by the
+// camera endpoint. The latest requested face is redrawn after the preview.
+bool showCameraPreview(const uint8_t* jpegData, size_t jpegLen,
+                       uint32_t durationMs = 6000);
