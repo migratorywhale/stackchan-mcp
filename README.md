@@ -25,6 +25,7 @@ Connect it once and any Claude window — the web chat at claude.ai, Claude Desk
 - **Independent environmental sensing** — SHT31 temperature/humidity + QMP6988 barometric pressure via the M5Stack ENV III Unit.
 - **Full MCP tool suite** — `see` / `listen` / `say` / `face` / `sense` / `move` / `nod` / `shake` / `status` / `health` — the complete action vocabulary of a physical presence.
 - **Voice wake-word loop** — background bridge polls Stack-chan's mic, forwards wake-word transcripts to the AI frontend, closes the loop without any keyboard interaction.
+- **Optional host-side face tracking** — a Mac or PC detects faces in 320x240 camera frames and sends bounded, slow pan/tilt corrections while Stack-chan listens or speaks.
 - **Open and self-hosted** — firmware source included (PlatformIO + Arduino), no cloud dependency for the core robot, MIT licensed.
 
 ---
@@ -205,6 +206,43 @@ Replace the example wake words with your own names.
 
 ---
 
+## Face Tracking (Optional)
+
+The CoreS3 only captures frames. Face detection and motion control run on the
+host, where OpenCV can process the 320x240 stream at a few frames per second.
+Tracking starts only after a wake-word transcript or short-touch transcript is
+actually delivered to the frontend, or when `stackchan_say` begins.
+
+```bash
+uv sync --extra face-tracking
+```
+
+Enable the trigger bridge in `.env`:
+
+```bash
+STACKCHAN_FACE_TRACKING="1"
+```
+
+Then start one tracker process:
+
+```bash
+.venv/bin/python scripts/stackchan_face_tracker.py
+```
+
+The controller uses smoothing, a center dead zone, small step limits, and slow
+servo speed. It follows one face without biometric identification: initially
+the largest face, then the face nearest the previous position. If no face is
+visible for about two seconds, Stack-chan returns home once and stops looking
+until a new explicit trigger arrives. It never sweeps the room.
+
+The GC0308 camera and top touch strip share GPIO 11/12. During a tracking burst,
+top-touch input is temporarily unavailable. The host closes the camera session
+normally, and the firmware independently restores touch after five idle seconds
+if the tracker crashes or the network disappears. A launchd example is provided
+at `ops/launchd/xyz.stackchan.face-tracker.plist.example`.
+
+---
+
 ## Technical Stack
 
 | Layer | Technology |
@@ -215,6 +253,7 @@ Replace the example wake words with your own names.
 | TTS | [Fish Audio](https://fish.audio) API (primary) / edge-tts (free fallback) |
 | ASR / transcription | Groq Whisper via Fish Audio |
 | AI | Anthropic Claude (or any MCP-compatible client) |
+| Host face detection | OpenCV (optional extra; no face images are persisted) |
 | Remote access | Tailscale (recommended) / Cloudflare tunnel (optional) |
 
 ---

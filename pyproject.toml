@@ -21,6 +21,11 @@ Homepage = "https://github.com/migratorywhale/stackchan-mcp"
 Issues = "https://github.com/migratorywhale/stackchan-mcp/issues"
 Source = "https://github.com/migratorywhale/stackchan-mcp"
 
+[project.optional-dependencies]
+face-tracking = [
+    "opencv-python-headless==4.14.0.94",
+]
+
 [dependency-groups]
 dev = [
     "cyclonedx-bom==7.3.1",

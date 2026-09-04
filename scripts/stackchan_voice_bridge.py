@@ -223,7 +223,7 @@ def forward_event_to_frontend(event: dict[str, Any], args: argparse.Namespace) -
         or source == "stackchan_touch"
     )
     is_touch_pet = str(event.get("interaction") or "") == "petting"
-    return forward_to_frontend(
+    result = forward_to_frontend(
         event,
         wake_url=wake_url,
         session_id=wake_session_id,
@@ -246,6 +246,11 @@ def forward_event_to_frontend(event: dict[str, Any], args: argparse.Namespace) -
         wake_words=() if is_touch_recording or is_touch_pet else parse_wake_words(args.wake_words),
         source=source or "stackchan_mic",
     )
+    if result.get("ok") and not is_touch_pet:
+        from mcp_server.face_tracking import signal_face_tracking
+
+        signal_face_tracking("touch_voice" if is_touch_recording else "wake_word")
+    return result
 
 
 def build_touch_pet_event() -> dict[str, Any]:

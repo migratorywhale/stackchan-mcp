@@ -28,6 +28,7 @@ from mcp_server.mcp_tools import (
     format_speech_confirmation,
     post_preferred_pcm_stream,
     register_tools,
+    speech_tracking_duration,
 )
 from mcp_server.server import BearerAuthMiddleware, ensure_http_auth_configured
 from mcp_server.stackchan_client import (
@@ -310,6 +311,12 @@ def test_speech_confirmation_omits_transport_diagnostics():
     assert "…" in result
 
 
+def test_speech_tracking_duration_is_bounded():
+    assert speech_tracking_duration("") == 6.0
+    assert speech_tracking_duration("x" * 40) == 13.0
+    assert speech_tracking_duration("x" * 1000) == 24.0
+
+
 def test_stackchan_say_audit_log_records_length_without_speech_text(monkeypatch, tmp_path, caplog):
     secret_text = "这段 Stack-chan say 原文应该留在会话备份里，但不要复制进 MCP 服务日志"
     wav_path = tmp_path / "speech.wav"
@@ -327,6 +334,11 @@ def test_stackchan_say_audit_log_records_length_without_speech_text(monkeypatch,
 
     monkeypatch.setattr("mcp_server.mcp_tools.start_audio_server", lambda _port: None)
     monkeypatch.setattr("mcp_server.audio_processing.generate_tts", lambda *_args, **_kwargs: wav_path)
+    tracking_signals = []
+    monkeypatch.setattr(
+        "mcp_server.mcp_tools.signal_face_tracking",
+        lambda reason, *, duration: tracking_signals.append((reason, duration)),
+    )
 
     caplog.set_level(logging.INFO, logger="mcp_server.mcp_tools")
     mcp = FakeFastMCP()
@@ -338,6 +350,7 @@ def test_stackchan_say_audit_log_records_length_without_speech_text(monkeypatch,
     assert "tool=stackchan_say" in caplog.text
     assert f"text_len={len(secret_text)}" in caplog.text
     assert secret_text not in caplog.text
+    assert tracking_signals == [("stackchan_say", speech_tracking_duration(secret_text))]
 
 
 def test_preferred_pcm_auto_uses_tcp_before_experimental_udp(monkeypatch, tmp_path):
@@ -645,6 +658,7 @@ def test_voice_bridge_reads_touch_source_from_audio_status():
 
 def test_voice_bridge_touch_recording_bypasses_wake_word_and_uses_touch_prefix(monkeypatch):
     forwarded = {}
+    tracking_signals = []
 
     def fake_forward(event, **kwargs):
         forwarded["event"] = event
@@ -652,6 +666,10 @@ def test_voice_bridge_touch_recording_bypasses_wake_word_and_uses_touch_prefix(m
         return {"ok": True}
 
     monkeypatch.setattr("scripts.stackchan_voice_bridge.forward_to_frontend", fake_forward)
+    monkeypatch.setattr(
+        "mcp_server.face_tracking.signal_face_tracking",
+        lambda reason: tracking_signals.append(reason),
+    )
     args = argparse.Namespace(
         wake_session_id="117067d6-1111-2222-3333-444444444444",
         wake_session_title="",
@@ -681,6 +699,7 @@ def test_voice_bridge_touch_recording_bypasses_wake_word_and_uses_touch_prefix(m
     assert forwarded["prompt_prefix"] == "[Stack-chan语音输入] （触摸）"
     assert forwarded["wake_words"] == ()
     assert forwarded["source"] == "stackchan_touch"
+    assert tracking_signals == ["touch_voice"]
 
 
 def test_touch_pet_tracker_emits_only_new_counts_and_rebaselines_after_restart():
@@ -714,6 +733,7 @@ def test_touch_pet_tracker_bounds_a_corrupt_or_stale_counter_jump():
 
 def test_voice_bridge_forwards_touch_pet_without_prefix_or_wake_word(monkeypatch):
     forwarded = {}
+    tracking_signals = []
 
     def fake_forward(event, **kwargs):
         forwarded["event"] = event
@@ -721,6 +741,10 @@ def test_voice_bridge_forwards_touch_pet_without_prefix_or_wake_word(monkeypatch
         return {"ok": True}
 
     monkeypatch.setattr("scripts.stackchan_voice_bridge.forward_to_frontend", fake_forward)
+    monkeypatch.setattr(
+        "mcp_server.face_tracking.signal_face_tracking",
+        lambda reason: tracking_signals.append(reason),
+    )
     args = argparse.Namespace(
         wake_session_id="117067d6-1111-2222-3333-444444444444",
         wake_session_title="",
@@ -745,6 +769,7 @@ def test_voice_bridge_forwards_touch_pet_without_prefix_or_wake_word(monkeypatch
     assert forwarded["prompt_prefix"] == ""
     assert forwarded["wake_words"] == ()
     assert forwarded["source"] == "stackchan_touch_strip"
+    assert tracking_signals == []
 
 
 def test_voice_bridge_consumer_lock_waits_then_records_owner(monkeypatch, tmp_path, capsys):
@@ -1409,6 +1434,50 @@ def test_stackchan_client_posts_move_request(monkeypatch):
             {"json": {"x": 1, "y": 2, "speed": 3}, "timeout": 5},
         )
     ]
+
+
+def test_stackchan_client_face_tracking_move_preserves_gesture(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def json(self):
+            return {"success": True}
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr("mcp_server.stackchan_client.requests.post", fake_post)
+
+    result = StackchanClient(make_config()).move(1, 2, 3, interrupt_gesture=False)
+
+    assert result == {"success": True}
+    assert calls[0][1]["json"]["interrupt_gesture"] is False
+
+
+def test_stackchan_client_camera_session_and_hidden_snapshot(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        content = b"jpeg"
+
+        def json(self):
+            return {"success": True}
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return FakeResponse()
+
+    client = StackchanClient(make_config())
+    monkeypatch.setattr(client, "request", fake_request)
+
+    assert client.start_camera_session(4500) == {"success": True}
+    assert client.snapshot_once(preview=False, camera_session=True) == (b"jpeg", 4)
+    assert client.stop_camera_session() == {"success": True}
+    assert calls[0][2]["json_body"] == {"idle_timeout_ms": 4500}
+    assert calls[1][1].endswith("/snapshot?preview=0&session=1")
+    assert calls[2][0] == "delete"
 
 
 def test_stackchan_client_uses_system_curl_for_local_network_transport(monkeypatch):

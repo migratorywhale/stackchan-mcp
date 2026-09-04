@@ -25,6 +25,28 @@
 #define CAM_PIN_PCLK    45
 
 static bool cameraReady = false;
+static bool cameraSessionActive = false;
+static uint32_t cameraSessionDeadlineMs = 0;
+static uint32_t cameraSessionTimeoutMs = 0;
+
+static constexpr uint32_t CAMERA_SESSION_MIN_TIMEOUT_MS = 1000;
+static constexpr uint32_t CAMERA_SESSION_MAX_TIMEOUT_MS = 15000;
+
+static uint32_t clampSessionTimeout(uint32_t timeoutMs) {
+    if (timeoutMs < CAMERA_SESSION_MIN_TIMEOUT_MS) return CAMERA_SESSION_MIN_TIMEOUT_MS;
+    if (timeoutMs > CAMERA_SESSION_MAX_TIMEOUT_MS) return CAMERA_SESSION_MAX_TIMEOUT_MS;
+    return timeoutMs;
+}
+
+static bool deadlineReached(uint32_t now, uint32_t deadline) {
+    return (int32_t)(now - deadline) >= 0;
+}
+
+static void refreshCameraSessionDeadline() {
+    if (cameraSessionActive) {
+        cameraSessionDeadlineMs = millis() + cameraSessionTimeoutMs;
+    }
+}
 
 static bool initCamera() {
     camera_config_t config;
@@ -80,15 +102,7 @@ static void deinitCamera() {
     }
 }
 
-bool captureJpeg(uint8_t** outBuf, size_t* outLen, int quality) {
-    if (!outBuf || !outLen) {
-        return false;
-    }
-    *outBuf = nullptr;
-    *outLen = 0;
-
-    // GC0308 SCCB and M5.In_I2C both use GPIO 11/12. Keep the camera lazy so
-    // touch and environmental sensors own the bus between snapshots.
+static bool acquireCameraBus() {
     suspendTouchService();
     const bool busReleased = M5.In_I2C.release();
     if (!busReleased) {
@@ -99,31 +113,116 @@ bool captureJpeg(uint8_t** outBuf, size_t* outLen, int quality) {
         return false;
     }
 
-    bool captureOk = false;
     if (initCamera()) {
-        // With CAMERA_GRAB_WHEN_EMPTY, the driver captures one frame immediately
-        // after esp_camera_fb_return(). Discard it to force a fresh capture.
-        camera_fb_t* stale = esp_camera_fb_get();
-        if (!stale) {
-            Serial.println("[CAM] Stale flush failed");
-        } else {
-            esp_camera_fb_return(stale);
+        return true;
+    }
 
-            camera_fb_t* fb = esp_camera_fb_get();
-            if (!fb) {
-                Serial.println("[CAM] Capture failed");
-            } else {
-                captureOk = frame2jpg(fb, quality, outBuf, outLen);
-                esp_camera_fb_return(fb);
-                if (!captureOk) {
-                    Serial.println("[CAM] JPEG conversion failed");
-                }
+    if (!resumeTouchService()) {
+        Serial.println("[CAM] Internal I2C/touch recovery failed after camera init failure");
+    }
+    return false;
+}
+
+static bool releaseCameraBus() {
+    deinitCamera();
+    const bool touchRestored = resumeTouchService();
+    if (!touchRestored) {
+        Serial.println("[CAM] Internal I2C/touch recovery failed after camera stop");
+    }
+    return touchRestored;
+}
+
+bool startCameraSession(uint32_t idleTimeoutMs) {
+    cameraSessionTimeoutMs = clampSessionTimeout(idleTimeoutMs);
+    if (cameraSessionActive) {
+        refreshCameraSessionDeadline();
+        return true;
+    }
+
+    if (!acquireCameraBus()) {
+        return false;
+    }
+
+    cameraSessionActive = true;
+    refreshCameraSessionDeadline();
+    Serial.printf("[CAM] Burst session started (idle timeout %u ms)\n",
+                  (unsigned)cameraSessionTimeoutMs);
+    return true;
+}
+
+bool stopCameraSession() {
+    if (!cameraSessionActive) {
+        return true;
+    }
+
+    cameraSessionActive = false;
+    cameraSessionDeadlineMs = 0;
+    cameraSessionTimeoutMs = 0;
+    const bool restored = releaseCameraBus();
+    Serial.println(restored ? "[CAM] Burst session stopped" : "[CAM] Burst session stop failed");
+    return restored;
+}
+
+void updateCameraService() {
+    if (cameraSessionActive && deadlineReached(millis(), cameraSessionDeadlineMs)) {
+        Serial.println("[CAM] Burst session idle timeout; restoring touch");
+        stopCameraSession();
+    }
+}
+
+bool isCameraSessionActive() {
+    return cameraSessionActive;
+}
+
+uint32_t cameraSessionIdleTimeoutMs() {
+    if (!cameraSessionActive) {
+        return 0;
+    }
+    const uint32_t now = millis();
+    if (deadlineReached(now, cameraSessionDeadlineMs)) {
+        return 0;
+    }
+    return cameraSessionDeadlineMs - now;
+}
+
+bool captureJpeg(uint8_t** outBuf, size_t* outLen, int quality) {
+    if (!outBuf || !outLen) {
+        return false;
+    }
+    *outBuf = nullptr;
+    *outLen = 0;
+
+    const bool ownsCamera = !cameraSessionActive;
+    if (ownsCamera && !acquireCameraBus()) {
+        return false;
+    }
+    if (!cameraReady) {
+        return false;
+    }
+    refreshCameraSessionDeadline();
+
+    bool captureOk = false;
+    // With CAMERA_GRAB_WHEN_EMPTY, the driver captures one frame immediately
+    // after esp_camera_fb_return(). Discard it to force a fresh capture.
+    camera_fb_t* stale = esp_camera_fb_get();
+    if (!stale) {
+        Serial.println("[CAM] Stale flush failed");
+    } else {
+        esp_camera_fb_return(stale);
+
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) {
+            Serial.println("[CAM] Capture failed");
+        } else {
+            captureOk = frame2jpg(fb, quality, outBuf, outLen);
+            esp_camera_fb_return(fb);
+            if (!captureOk) {
+                Serial.println("[CAM] JPEG conversion failed");
             }
         }
     }
 
-    deinitCamera();
-    const bool touchRestored = resumeTouchService();
+    const bool touchRestored = ownsCamera ? releaseCameraBus() : true;
 
     if (!captureOk || !touchRestored) {
         if (*outBuf) {

@@ -10,6 +10,7 @@ import requests
 from . import audio_processing
 from .audio_publish import publish_wav
 from .audio_server import AUDIO_DIR, audio_url, start_audio_server
+from .face_tracking import signal_face_tracking
 from .listening import capture_ready_recording, format_listen_result
 from .stackchan_client import (
     PcmPlaybackError,
@@ -49,6 +50,12 @@ def format_speech_confirmation(text: str) -> str:
     preview = text[:60]
     suffix = "…" if len(text) > 60 else ""
     return f"🗣️ Stack-chan is saying: \"{preview}{suffix}\""
+
+
+def speech_tracking_duration(text: str) -> float:
+    # Start looking while TTS is generated, then stay engaged for the estimated
+    # spoken duration. The lease is capped again by signal_face_tracking().
+    return max(6.0, min(24.0, 3.0 + len(text) / 4.0))
 
 
 def audit_tool_call(name: str, **attributes: object) -> None:
@@ -135,6 +142,10 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
             "stackchan_say",
             lang=lang,
             text_len=len(text),
+        )
+        signal_face_tracking(
+            "stackchan_say",
+            duration=speech_tracking_duration(text),
         )
         start_audio_server(config.audio_serve_port)
 

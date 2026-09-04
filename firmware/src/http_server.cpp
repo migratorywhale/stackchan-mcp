@@ -268,9 +268,15 @@ static void handleMove() {
     float x = doc["x"] | 0.0f;
     float y = doc["y"] | 0.0f;
     int speed = doc["speed"] | 50;
+    bool interruptGesture = doc["interrupt_gesture"] | true;
 
     if (!isServoReady()) {
         server.send(503, "application/json", "{\"success\":false,\"error\":\"servo not ready\"}");
+        return;
+    }
+    if (!interruptGesture && getServoStatus().gestureActive) {
+        server.send(409, "application/json",
+                    "{\"success\":false,\"error\":\"gesture active\"}");
         return;
     }
     bool ack = servoMove(x, y, speed);
@@ -574,6 +580,13 @@ static void handleFace() {
 // → Capture JPEG from camera and return it
 // ────────────────────────────────────────────
 static void handleSnapshot() {
+    const bool sessionRequired = server.hasArg("session") && server.arg("session") == "1";
+    if (sessionRequired && !isCameraSessionActive()) {
+        server.send(409, "application/json",
+                    "{\"success\":false,\"error\":\"camera session is not active\"}");
+        return;
+    }
+
     uint8_t* jpgBuf = nullptr;
     size_t jpgLen = 0;
 
@@ -582,13 +595,62 @@ static void handleSnapshot() {
         return;
     }
 
-    if (!showCameraPreview(jpgBuf, jpgLen)) {
+    const bool preview = !server.hasArg("preview") || server.arg("preview") != "0";
+    if (preview && !showCameraPreview(jpgBuf, jpgLen)) {
         Serial.println("[HTTP] Camera preview unavailable; returning JPEG normally");
     }
 
     server.send_P(200, "image/jpeg", (const char*)jpgBuf, jpgLen);
     free(jpgBuf);
     Serial.printf("[HTTP] GET /snapshot -> %u bytes JPEG\n", (unsigned)jpgLen);
+}
+
+// POST /camera/session {"idle_timeout_ms": 5000}
+// DELETE /camera/session
+// Keep the GC0308 initialized for a bounded burst of host-side CV frames.
+static void handleCameraSessionStart() {
+    uint32_t idleTimeoutMs = 5000;
+    if (server.hasArg("plain") && !server.arg("plain").isEmpty()) {
+        JsonDocument doc;
+        if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+            server.send(400, "application/json",
+                        "{\"success\":false,\"error\":\"json parse error\"}");
+            return;
+        }
+        idleTimeoutMs = doc["idle_timeout_ms"] | idleTimeoutMs;
+    }
+
+    if (!startCameraSession(idleTimeoutMs)) {
+        server.send(503, "application/json",
+                    "{\"success\":false,\"error\":\"camera session start failed\"}");
+        return;
+    }
+
+    JsonDocument response;
+    response["success"] = true;
+    response["active"] = true;
+    response["idle_timeout_ms"] = cameraSessionIdleTimeoutMs();
+    String body;
+    serializeJson(response, body);
+    server.send(200, "application/json", body);
+}
+
+static void handleCameraSessionStop() {
+    const bool restored = stopCameraSession();
+    server.send(restored ? 200 : 500, "application/json",
+                restored
+                    ? "{\"success\":true,\"active\":false}"
+                    : "{\"success\":false,\"error\":\"touch restore failed\"}");
+}
+
+static void handleCameraSessionStatus() {
+    JsonDocument response;
+    response["success"] = true;
+    response["active"] = isCameraSessionActive();
+    response["idle_timeout_ms"] = cameraSessionIdleTimeoutMs();
+    String body;
+    serializeJson(response, body);
+    server.send(200, "application/json", body);
 }
 
 // GET /env/debug — QMP6988校准字节+原始ADC快照，电脑端验算补偿公式用
@@ -665,6 +727,9 @@ void initHttpServer() {
     server.on("/touch/status", HTTP_GET,  handleTouchStatus);
     server.on("/playback/status", HTTP_GET, handlePlaybackStatus);
     server.on("/snapshot",     HTTP_GET,  handleSnapshot);
+    server.on("/camera/session", HTTP_POST, handleCameraSessionStart);
+    server.on("/camera/session", HTTP_DELETE, handleCameraSessionStop);
+    server.on("/camera/status", HTTP_GET, handleCameraSessionStatus);
     server.on("/face",         HTTP_POST, handleFace);
     server.on("/face",         HTTP_GET,  handleFace);
     server.on("/env",          HTTP_GET,  handleEnv);
