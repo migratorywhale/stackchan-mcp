@@ -45,6 +45,7 @@ class OpenCvFaceDetector:
         self.detector = self.cv2.CascadeClassifier(str(cascade_path))
         if self.detector.empty():
             raise RuntimeError(f"Could not load OpenCV face cascade: {cascade_path}")
+        self.equalizer = self.cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         self.min_face_pixels = min_face_pixels
 
     def detect(self, jpeg_data: bytes) -> tuple[list[FaceBox], int, int]:
@@ -53,10 +54,10 @@ class OpenCvFaceDetector:
         if image is None:
             raise ValueError("Camera returned an invalid JPEG")
         gray = self.cv2.cvtColor(image, self.cv2.COLOR_BGR2GRAY)
-        gray = self.cv2.equalizeHist(gray)
+        gray = self.equalizer.apply(gray)
         found = self.detector.detectMultiScale(
             gray,
-            scaleFactor=1.1,
+            scaleFactor=1.05,
             minNeighbors=5,
             minSize=(self.min_face_pixels, self.min_face_pixels),
         )
