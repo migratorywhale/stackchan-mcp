@@ -6,7 +6,7 @@ from mcp_server.face_tracking import (
     read_tracking_lease,
     signal_face_tracking,
 )
-from scripts.stackchan_face_tracker import FaceTracker
+from scripts.stackchan_face_tracker import FaceTracker, OpenCvFaceDetector
 
 
 class FakeClient:
@@ -59,6 +59,27 @@ class FakeDetector:
         return self.faces, 320, 240
 
 
+class FakeCascade:
+    def __init__(self, results):
+        self.results = iter(results)
+        self.frames = []
+
+    def detectMultiScale(self, frame, **_options):
+        self.frames.append(frame)
+        return next(self.results)
+
+
+class FakeEqualizer:
+    def apply(self, _gray):
+        return "local"
+
+
+class FakeCv2:
+    @staticmethod
+    def equalizeHist(_gray):
+        return "global"
+
+
 def tracker_settings() -> FaceTrackingSettings:
     return FaceTrackingSettings(
         acquire_frames=1,
@@ -73,6 +94,29 @@ def active_lease(state_path):
         "test", duration=10, path=state_path, enabled=True
     )
     return read_tracking_lease(state_path)
+
+
+def face_detector_with_results(results):
+    detector = OpenCvFaceDetector.__new__(OpenCvFaceDetector)
+    detector.detector = FakeCascade(results)
+    detector.equalizer = FakeEqualizer()
+    detector.cv2 = FakeCv2()
+    detector.min_face_pixels = 36
+    return detector
+
+
+def test_face_detector_uses_global_equalization_after_local_miss():
+    detector = face_detector_with_results([[], [(120, 16, 89, 89)]])
+
+    assert detector._detect_boxes("gray") == [(120, 16, 89, 89)]
+    assert detector.detector.frames == ["local", "global"]
+
+
+def test_face_detector_skips_fallback_after_local_hit():
+    detector = face_detector_with_results([[(100, 20, 80, 80)]])
+
+    assert detector._detect_boxes("gray") == [(100, 20, 80, 80)]
+    assert detector.detector.frames == ["local"]
 
 
 def test_one_frame_mode_releases_camera_and_holds_detected_pose(tmp_path):
