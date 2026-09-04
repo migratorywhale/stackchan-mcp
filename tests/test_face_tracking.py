@@ -47,6 +47,22 @@ def test_signal_face_tracking_extends_lease_and_increments_sequence(tmp_path):
     assert json.loads(state_path.read_text())["version"] == 1
 
 
+def test_face_tracking_settings_expand_frame_budget_to_acquisition(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_FACE_TRACK_ACQUIRE_FRAMES", "3")
+    monkeypatch.setenv("STACKCHAN_FACE_TRACK_MAX_FRAMES", "1")
+
+    configured = FaceTrackingSettings.from_env()
+
+    assert configured.acquire_frames == 3
+    assert configured.max_frames_per_trigger == 3
+
+
+def test_face_tracking_settings_allow_unbounded_frame_budget(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_FACE_TRACK_MAX_FRAMES", "0")
+
+    assert FaceTrackingSettings.from_env().max_frames_per_trigger == 0
+
+
 def test_select_face_prefers_largest_then_stays_near_previous_target():
     left = FaceBox(10, 20, 50, 50)
     right = FaceBox(210, 20, 70, 70)

@@ -7,6 +7,7 @@
 #include <queue>
 
 #include "audio_gate.h"
+#include "camera_service.h"
 #include "config_loader.h"
 #include "face_service.h"
 #include "playback_service.h"
@@ -804,7 +805,10 @@ static void handleStreamClient(WiFiClient client) {
         s_clientConnected = false;
         return;
     }
-    if (s_active || s_udpActive || isPlaybackActive() || M5.Speaker.isPlaying()) {
+    if (
+        s_active || s_udpActive || isPlaybackActive() || isCameraSessionActive()
+        || M5.Speaker.isPlaying()
+    ) {
         client.print("ERR BUSY\n");
         client.stop();
         s_clientConnected = false;
@@ -870,7 +874,10 @@ UdpPcmSessionResult beginUdpPcmSession() {
         }
         memset(s_udpRing, 0, sizeof(UdpFrameSlot) * PCM_UDP_RING_FRAMES);
     }
-    if (s_active || s_playing || s_udpActive || s_udpPlaying || isPlaybackActive() || M5.Speaker.isPlaying()) {
+    if (
+        s_active || s_playing || s_udpActive || s_udpPlaying || isPlaybackActive()
+        || isCameraSessionActive() || M5.Speaker.isPlaying()
+    ) {
         result.error = "busy";
         return result;
     }

@@ -205,6 +205,7 @@ class FaceTrackingSettings:
     min_command_delta: float = 1.0
     min_command_interval: float = 0.3
     acquire_frames: int = 2
+    max_frames_per_trigger: int = 0
     speed: int = 18
 
     @classmethod
@@ -215,6 +216,17 @@ class FaceTrackingSettings:
         pitch_max = max(
             pitch_min,
             min(env_float("STACKCHAN_FACE_TRACK_PITCH_MAX", 55.0), 90.0),
+        )
+        acquire_frames = max(
+            1, min(env_int("STACKCHAN_FACE_TRACK_ACQUIRE_FRAMES", 2), 5)
+        )
+        configured_max_frames = max(
+            0, min(env_int("STACKCHAN_FACE_TRACK_MAX_FRAMES", 0), 300)
+        )
+        max_frames_per_trigger = (
+            0
+            if configured_max_frames == 0
+            else max(acquire_frames, configured_max_frames)
         )
         return cls(
             fps=max(0.5, min(env_float("STACKCHAN_FACE_TRACK_FPS", 2.5), 5.0)),
@@ -267,7 +279,8 @@ class FaceTrackingSettings:
             min_command_interval=max(
                 0.05, min(env_float("STACKCHAN_FACE_TRACK_COMMAND_INTERVAL_SEC", 0.3), 2.0)
             ),
-            acquire_frames=max(1, min(env_int("STACKCHAN_FACE_TRACK_ACQUIRE_FRAMES", 2), 5)),
+            acquire_frames=acquire_frames,
+            max_frames_per_trigger=max_frames_per_trigger,
             speed=max(1, min(env_int("STACKCHAN_FACE_TRACK_SPEED", 18), 100)),
         )
 

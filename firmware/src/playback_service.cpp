@@ -7,6 +7,7 @@
 #include "face_service.h"
 #include "wav_parser.h"
 #include "audio_gate.h"
+#include "camera_service.h"
 #include "pcm_stream_service.h"
 
 struct PlaybackRuntimeState {
@@ -375,7 +376,7 @@ static bool startDownloadedWavPlayback(uint8_t* wavData, size_t wavSize) {
 }
 
 static void checkPendingPlayback() {
-    if (s_isPlaying || !s_downloadCompleteQueue) {
+    if (s_isPlaying || isCameraSessionActive() || !s_downloadCompleteQueue) {
         return;
     }
 
@@ -407,7 +408,10 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
         Serial.printf("[PCM] Invalid size: %u\n", (unsigned)pcmSize);
         return PCM_PLAYBACK_INVALID;
     }
-    if (s_isPlaying || isPcmStreamActive() || M5.Speaker.isPlaying()) {
+    if (
+        s_isPlaying || isPcmStreamActive() || isCameraSessionActive()
+        || M5.Speaker.isPlaying()
+    ) {
         if (s_playbackState.currentIsPcm && sessionId == s_playbackState.pcmSessionId &&
             enqueuePcmBuffer(pcmData, pcmSize, sessionId, finalSegment)) {
             return PCM_PLAYBACK_QUEUED;
