@@ -98,7 +98,7 @@ Stack-chan takes a photo, returns it to the AI, and the AI describes what it fou
 |------|-------------|
 | `stackchan_say` | Speak text through the speaker (Fish Audio TTS or edge-tts fallback) |
 | `stackchan_listen` | Record from mic + transcribe (Groq Whisper via Fish Audio ASR) |
-| `stackchan_see` | Capture a photo from the 320x240 GC0308 camera |
+| `stackchan_see` | Capture a photo and preview the same frame on Stack-chan's display for six seconds |
 | `stackchan_face` | Set expression: `calm` `thinking` `happy` `sleepy` `shy` `smug` `pouty` |
 | `stackchan_sense` | Read temperature, humidity, and barometric pressure (ENV III Unit) |
 | `stackchan_move` | Move head: pan −128 to +128, tilt 0 to 90 |

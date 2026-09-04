@@ -122,4 +122,7 @@ This is the shared contract between the CoreS3 firmware and the MCP server.
   - `download_age_ms` reports the age of the active WAV download, or `0` when
     idle. `download_watchdog_ms` reports the automatic recovery threshold.
 - `GET /snapshot`
-  - Returns a JPEG image.
+  - Returns a 320x240 JPEG image.
+  - Shows that same JPEG on Stack-chan's display for six seconds, then redraws
+    the latest requested face. A display-preview failure does not fail the
+    camera response.
