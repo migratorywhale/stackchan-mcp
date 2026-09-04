@@ -48,19 +48,28 @@ class OpenCvFaceDetector:
         self.equalizer = self.cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         self.min_face_pixels = min_face_pixels
 
+    def _detect_boxes(self, gray: Any) -> Any:
+        options = {
+            "scaleFactor": 1.05,
+            "minNeighbors": 5,
+            "minSize": (self.min_face_pixels, self.min_face_pixels),
+        }
+        found = self.detector.detectMultiScale(self.equalizer.apply(gray), **options)
+        if len(found) == 0:
+            # Global equalization is a useful fallback for strongly backlit faces.
+            found = self.detector.detectMultiScale(
+                self.cv2.equalizeHist(gray),
+                **options,
+            )
+        return found
+
     def detect(self, jpeg_data: bytes) -> tuple[list[FaceBox], int, int]:
         encoded = self.np.frombuffer(jpeg_data, dtype=self.np.uint8)
         image = self.cv2.imdecode(encoded, self.cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError("Camera returned an invalid JPEG")
         gray = self.cv2.cvtColor(image, self.cv2.COLOR_BGR2GRAY)
-        gray = self.equalizer.apply(gray)
-        found = self.detector.detectMultiScale(
-            gray,
-            scaleFactor=1.05,
-            minNeighbors=5,
-            minSize=(self.min_face_pixels, self.min_face_pixels),
-        )
+        found = self._detect_boxes(gray)
         faces = [FaceBox(int(x), int(y), int(width), int(height)) for x, y, width, height in found]
         height, width = gray.shape[:2]
         return faces, width, height
