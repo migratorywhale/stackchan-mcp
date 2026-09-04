@@ -19,7 +19,7 @@ from .stackchan_client import (
     post_pcm_tcp_stream,
     post_pcm_udp_stream,
 )
-from .stackchan_config import VALID_FACES, StackchanConfig, config_summary
+from .stackchan_config import VALID_FACES, StackchanConfig, config_summary, env_float
 from .telemetry import emit_event, new_request_id
 from .voice_inbox import clear_events, format_events, read_events
 
@@ -54,8 +54,13 @@ def format_speech_confirmation(text: str) -> str:
 
 def speech_tracking_duration(text: str) -> float:
     # Start looking while TTS is generated, then stay engaged for the estimated
-    # spoken duration. The lease is capped again by signal_face_tracking().
-    return max(6.0, min(24.0, 3.0 + len(text) / 4.0))
+    # spoken duration. Slow remote camera links can set a larger deployment
+    # minimum through the same lease-duration setting used by voice triggers.
+    configured_minimum = max(
+        1.0,
+        min(env_float("STACKCHAN_FACE_TRACK_DURATION_SEC", 8.0), 30.0),
+    )
+    return max(configured_minimum, min(30.0, 3.0 + len(text) / 4.0))
 
 
 def audit_tool_call(name: str, **attributes: object) -> None:

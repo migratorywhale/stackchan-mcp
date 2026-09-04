@@ -1,4 +1,6 @@
 #include "camera_service.h"
+#include "pcm_stream_service.h"
+#include "playback_service.h"
 #include "touch_service.h"
 #include "esp_camera.h"
 #include "img_converters.h"
@@ -132,7 +134,15 @@ static bool releaseCameraBus() {
     return touchRestored;
 }
 
+static bool audioPlaybackOwnsRuntime() {
+    return isPlaybackActive() || isPcmStreamActive() || M5.Speaker.isPlaying();
+}
+
 bool startCameraSession(uint32_t idleTimeoutMs) {
+    if (audioPlaybackOwnsRuntime()) {
+        Serial.println("[CAM] Burst session rejected while audio playback is active");
+        return false;
+    }
     cameraSessionTimeoutMs = clampSessionTimeout(idleTimeoutMs);
     if (cameraSessionActive) {
         refreshCameraSessionDeadline();
@@ -191,6 +201,11 @@ bool captureJpeg(uint8_t** outBuf, size_t* outLen, int quality) {
     }
     *outBuf = nullptr;
     *outLen = 0;
+
+    if (audioPlaybackOwnsRuntime()) {
+        Serial.println("[CAM] Snapshot rejected while audio playback is active");
+        return false;
+    }
 
     const bool ownsCamera = !cameraSessionActive;
     if (ownsCamera && !acquireCameraBus()) {

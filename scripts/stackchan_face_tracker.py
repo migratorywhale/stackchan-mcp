@@ -45,6 +45,7 @@ class OpenCvFaceDetector:
         self.detector = self.cv2.CascadeClassifier(str(cascade_path))
         if self.detector.empty():
             raise RuntimeError(f"Could not load OpenCV face cascade: {cascade_path}")
+        self.equalizer = self.cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         self.min_face_pixels = min_face_pixels
 
     def detect(self, jpeg_data: bytes) -> tuple[list[FaceBox], int, int]:
@@ -53,10 +54,10 @@ class OpenCvFaceDetector:
         if image is None:
             raise ValueError("Camera returned an invalid JPEG")
         gray = self.cv2.cvtColor(image, self.cv2.COLOR_BGR2GRAY)
-        gray = self.cv2.equalizeHist(gray)
+        gray = self.equalizer.apply(gray)
         found = self.detector.detectMultiScale(
             gray,
-            scaleFactor=1.1,
+            scaleFactor=1.05,
             minNeighbors=5,
             minSize=(self.min_face_pixels, self.min_face_pixels),
         )
@@ -86,6 +87,7 @@ class FaceTracker:
         self.tracking_started_at = 0.0
         self.last_face_at: float | None = None
         self.previous_face_center: tuple[float, float] | None = None
+        self.frames_seen = 0
 
     def request_stop(self, _signum: int | None = None, _frame: FrameType | None = None) -> None:
         self.running = False
@@ -117,6 +119,7 @@ class FaceTracker:
         self.tracking_started_at = time.monotonic()
         self.last_face_at = None
         self.previous_face_center = None
+        self.frames_seen = 0
         logger.info("Tracking started: sequence=%d reason=%s", lease.sequence, lease.reason)
         return True
 
@@ -142,10 +145,14 @@ class FaceTracker:
         self.controller.reset()
         self.previous_face_center = None
         self.last_face_at = None
+        self.frames_seen = 0
         self.dormant_sequence = dormant_sequence
 
+    def _frame_budget_reached(self) -> bool:
+        limit = self.settings.max_frames_per_trigger
+        return limit > 0 and self.frames_seen >= limit
+
     def _frame(self, lease: TrackingLease) -> None:
-        now = time.monotonic()
         try:
             jpeg_data, _size = self.client.snapshot_once(
                 preview=False,
@@ -160,6 +167,9 @@ class FaceTracker:
             self._end(home=True, dormant_sequence=lease.sequence)
             return
 
+        now = time.monotonic()
+        self.frames_seen += 1
+
         if not read_tracking_lease(self.state_path).active():
             logger.info("Tracking lease expired while the frame was in transit")
             self._end(home=True)
@@ -168,7 +178,10 @@ class FaceTracker:
         face = select_face(faces, self.previous_face_center)
         if face is None:
             absent_since = self.last_face_at or self.tracking_started_at
-            if now - absent_since >= self.settings.lost_timeout_seconds:
+            if (
+                self._frame_budget_reached()
+                or now - absent_since >= self.settings.lost_timeout_seconds
+            ):
                 logger.info("No face visible; returning home and sleeping until the next trigger")
                 self._end(home=True, dormant_sequence=lease.sequence)
             return
@@ -182,6 +195,9 @@ class FaceTracker:
             now=now,
         )
         if command is None:
+            if self._frame_budget_reached():
+                logger.info("Tracking frame budget reached; holding the current pose")
+                self._end(home=False, dormant_sequence=lease.sequence)
             return
 
         try:
@@ -204,6 +220,9 @@ class FaceTracker:
             )
         elif result.get("error") != "gesture active":
             logger.warning("Face-tracking move was rejected: %s", result)
+        if self._frame_budget_reached():
+            logger.info("Tracking frame budget reached; holding the current pose")
+            self._end(home=False, dormant_sequence=lease.sequence)
 
     def run(self, *, once: bool = False) -> int:
         frame_interval = 1.0 / self.settings.fps

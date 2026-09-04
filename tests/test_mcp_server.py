@@ -311,10 +311,17 @@ def test_speech_confirmation_omits_transport_diagnostics():
     assert "…" in result
 
 
-def test_speech_tracking_duration_is_bounded():
-    assert speech_tracking_duration("") == 6.0
+def test_speech_tracking_duration_is_bounded(monkeypatch):
+    monkeypatch.delenv("STACKCHAN_FACE_TRACK_DURATION_SEC", raising=False)
+    assert speech_tracking_duration("") == 8.0
     assert speech_tracking_duration("x" * 40) == 13.0
-    assert speech_tracking_duration("x" * 1000) == 24.0
+    assert speech_tracking_duration("x" * 1000) == 30.0
+
+
+def test_speech_tracking_duration_uses_deployment_minimum(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_FACE_TRACK_DURATION_SEC", "20")
+
+    assert speech_tracking_duration("short") == 20.0
 
 
 def test_stackchan_say_audit_log_records_length_without_speech_text(monkeypatch, tmp_path, caplog):
