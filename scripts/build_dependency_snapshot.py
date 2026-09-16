@@ -15,8 +15,11 @@ from typing import Any
 from urllib.parse import quote
 
 DETECTOR_NAME = "stackchan-uv-lock"
-DETECTOR_VERSION = "1"
+DETECTOR_VERSION = "2"
 PYPI_REGISTRY = "https://pypi.org/simple"
+
+PackageKey = tuple[str, str]
+DependencyRequest = tuple[PackageKey, frozenset[str]]
 
 
 def normalize_package_name(name: str) -> str:
@@ -28,30 +31,46 @@ def package_url(name: str, version: str) -> str:
     return f"pkg:pypi/{quote(normalized, safe='-._~')}@{quote(version, safe='')}"
 
 
-def dependency_requests(entries: Iterable[Any]) -> list[tuple[str, frozenset[str]]]:
+def dependency_requests(
+    entries: Iterable[Any], packages: Mapping[PackageKey, dict[str, Any]]
+) -> list[DependencyRequest]:
     # uv.lock is universal. Keep marker-gated entries so the snapshot covers every
     # supported platform, matching GitHub's native dependency-graph inventory.
-    requests: list[tuple[str, frozenset[str]]] = []
+    requests: list[DependencyRequest] = []
     for entry in entries:
         if isinstance(entry, str):
-            requests.append((normalize_package_name(entry), frozenset()))
-        elif isinstance(entry, Mapping) and isinstance(entry.get("name"), str):
-            extras = entry.get("extra", [])
-            if not isinstance(extras, list) or not all(isinstance(extra, str) for extra in extras):
-                raise ValueError(f"unsupported uv.lock dependency extras: {extras!r}")
-            requests.append(
-                (
-                    normalize_package_name(entry["name"]),
-                    frozenset(normalize_package_name(extra) for extra in extras),
-                )
-            )
-        else:
+            entry = {"name": entry}
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("name"), str):
             raise ValueError(f"unsupported uv.lock dependency entry: {entry!r}")
+
+        name = normalize_package_name(entry["name"])
+        extras = entry.get("extra", [])
+        if not isinstance(extras, list) or not all(isinstance(extra, str) for extra in extras):
+            raise ValueError(f"unsupported uv.lock dependency extras: {extras!r}")
+        source = entry.get("source", {})
+        if not isinstance(source, Mapping):
+            raise ValueError(f"unsupported uv.lock dependency source: {source!r}")
+        if source:
+            if "registry" not in source:
+                continue
+            registry = source["registry"]
+            if not isinstance(registry, str) or registry.rstrip("/") != PYPI_REGISTRY:
+                raise ValueError(f"unsupported registry for {name}: {source['registry']}")
+
+        candidates = [key for key in packages if key[0] == name]
+        if "version" in entry:
+            candidates = [key for key in candidates if key[1] == str(entry["version"])]
+        if not candidates:
+            if source or "version" in entry or any(key[0] == name for key in packages):
+                raise ValueError(f"unresolved registry dependency: {entry!r}")
+            # Non-registry packages (including the editable root) are not submitted.
+            continue
+        if len(candidates) != 1:
+            raise ValueError(f"ambiguous dependency {name!r}: a locked version is required")
+        requests.append(
+            (candidates[0], frozenset(normalize_package_name(extra) for extra in extras))
+        )
     return requests
-
-
-def dependency_names(entries: Iterable[Any]) -> list[str]:
-    return [name for name, _extras in dependency_requests(entries)]
 
 
 def _find_root_package(packages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -61,97 +80,97 @@ def _find_root_package(packages: list[dict[str, Any]]) -> dict[str, Any]:
     return roots[0]
 
 
-def _registry_packages(packages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    by_name: dict[str, dict[str, Any]] = {}
+def _registry_packages(packages: list[dict[str, Any]]) -> dict[PackageKey, dict[str, Any]]:
+    by_key: dict[PackageKey, dict[str, Any]] = {}
     for package in packages:
         source = package.get("source", {})
         if "registry" not in source:
             continue
         if source["registry"].rstrip("/") != PYPI_REGISTRY:
-            raise ValueError(f"unsupported registry for {package.get('name')}: {source['registry']}")
+            raise ValueError(
+                f"unsupported registry for {package.get('name')}: {source['registry']}"
+            )
 
-        name = normalize_package_name(package["name"])
-        if name in by_name:
-            raise ValueError(f"multiple locked distributions normalize to {name!r}")
-        by_name[name] = package
-    return by_name
+        key = (normalize_package_name(package["name"]), str(package["version"]))
+        if key in by_key:
+            raise ValueError(f"duplicate locked distribution: {key!r}")
+        by_key[key] = package
+    return by_key
 
 
 def _walk_dependencies(
-    seeds: Iterable[tuple[str, frozenset[str]]],
-    packages: Mapping[str, dict[str, Any]],
-) -> dict[str, set[str]]:
-    activated_extras: dict[str, set[str]] = {}
+    seeds: Iterable[DependencyRequest],
+    packages: Mapping[PackageKey, dict[str, Any]],
+) -> dict[PackageKey, set[str]]:
+    activated_extras: dict[PackageKey, set[str]] = {}
     pending = list(seeds)
     while pending:
-        name, requested_extras = pending.pop()
-        name = normalize_package_name(name)
-        if name not in packages:
-            continue
-
-        first_visit = name not in activated_extras
-        known_extras = activated_extras.setdefault(name, set())
+        key, requested_extras = pending.pop()
+        first_visit = key not in activated_extras
+        known_extras = activated_extras.setdefault(key, set())
         new_extras = set(requested_extras) - known_extras
         if not first_visit and not new_extras:
             continue
 
-        package = packages[name]
+        package = packages[key]
         if first_visit:
-            pending.extend(dependency_requests(package.get("dependencies", [])))
+            pending.extend(dependency_requests(package.get("dependencies", []), packages))
         optional_dependencies = package.get("optional-dependencies", {})
         for extra in new_extras:
-            pending.extend(dependency_requests(optional_dependencies.get(extra, [])))
+            pending.extend(dependency_requests(optional_dependencies.get(extra, []), packages))
         known_extras.update(requested_extras)
     return activated_extras
 
 
-def _activated_dependency_names(package: Mapping[str, Any], extras: Iterable[str]) -> set[str]:
-    names = set(dependency_names(package.get("dependencies", [])))
+def _activated_dependency_keys(
+    package: Mapping[str, Any],
+    extras: Iterable[str],
+    packages: Mapping[PackageKey, dict[str, Any]],
+) -> set[PackageKey]:
+    requests = dependency_requests(package.get("dependencies", []), packages)
     optional_dependencies = package.get("optional-dependencies", {})
     for extra in extras:
-        names.update(dependency_names(optional_dependencies.get(extra, [])))
-    return names
+        requests.extend(dependency_requests(optional_dependencies.get(extra, []), packages))
+    return {key for key, _extras in requests}
 
 
-def build_manifest(lock_data: Mapping[str, Any], source_location: str = "uv.lock") -> dict[str, Any]:
+def build_manifest(
+    lock_data: Mapping[str, Any], source_location: str = "uv.lock"
+) -> dict[str, Any]:
     packages = list(lock_data.get("package", []))
     root = _find_root_package(packages)
     registry_packages = _registry_packages(packages)
 
-    runtime_seeds = dependency_requests(root.get("dependencies", []))
+    runtime_seeds = dependency_requests(root.get("dependencies", []), registry_packages)
     for dependencies in root.get("optional-dependencies", {}).values():
-        runtime_seeds.extend(dependency_requests(dependencies))
-    direct_runtime = {name for name, _extras in runtime_seeds}
+        runtime_seeds.extend(dependency_requests(dependencies, registry_packages))
+    direct_runtime = {key for key, _extras in runtime_seeds}
 
-    development_seeds: list[tuple[str, frozenset[str]]] = []
+    development_seeds: list[DependencyRequest] = []
     for dependencies in root.get("dev-dependencies", {}).values():
-        development_seeds.extend(dependency_requests(dependencies))
-    direct_development = {name for name, _extras in development_seeds}
+        development_seeds.extend(dependency_requests(dependencies, registry_packages))
+    direct_development = {key for key, _extras in development_seeds}
 
     runtime = _walk_dependencies(runtime_seeds, registry_packages)
     development = _walk_dependencies(development_seeds, registry_packages)
     included = set(runtime) | set(development)
     direct = direct_runtime | direct_development
 
-    purls = {
-        name: package_url(package["name"], str(package["version"]))
-        for name, package in registry_packages.items()
-        if name in included
-    }
+    purls = {key: package_url(*key) for key in included}
     resolved: dict[str, Any] = {}
-    for name in sorted(included):
-        package = registry_packages[name]
-        purl = purls[name]
-        extras = runtime.get(name, set()) | development.get(name, set())
+    for key in sorted(included):
+        package = registry_packages[key]
+        purl = purls[key]
+        extras = runtime.get(key, set()) | development.get(key, set())
         child_purls = sorted(
             purls[child]
-            for child in _activated_dependency_names(package, extras)
+            for child in _activated_dependency_keys(package, extras, registry_packages)
             if child in purls
         )
         resolved[purl] = {
             "package_url": purl,
-            "relationship": "direct" if name in direct else "indirect",
-            "scope": "runtime" if name in runtime else "development",
+            "relationship": "direct" if key in direct else "indirect",
+            "scope": "runtime" if key in runtime else "development",
             "dependencies": child_purls,
         }
 
