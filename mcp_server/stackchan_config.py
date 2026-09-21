@@ -125,6 +125,7 @@ class StackchanConfig:
     audio_publish_target: str = ""
     audio_publish_timeout: float = 20.0
     audio_publish_attempts: int = 2
+    http_probe_timeout: float = 8.0
 
 
 VALID_AUDIO_MODES = {"auto", "pcm", "wav"}
@@ -199,6 +200,7 @@ def config_summary(config: StackchanConfig) -> dict[str, Any]:
             "http_play": config.http_play_timeout,
             "http_audio": config.http_audio_timeout,
             "http_status": config.http_status_timeout,
+            "http_probe": config.http_probe_timeout,
             "http_command": config.http_command_timeout,
             "http_snapshot_warmup": config.http_snapshot_warmup_timeout,
             "http_snapshot": config.http_snapshot_timeout,
@@ -210,6 +212,43 @@ def config_summary(config: StackchanConfig) -> dict[str, Any]:
         },
     }
 
+
+
+def _local_ip_toward(host: str, port: int = 80) -> str | None:
+    """Return the local interface IP that routes to host:port (no packets sent)."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.2)
+            s.connect((host, port))
+            ip = s.getsockname()[0]
+            return ip if ip and not ip.startswith("0.") else None
+    except OSError:
+        return None
+
+
+def resolve_mac_ip(value: str | None, stackchan_ip: str, stackchan_port: int = 80) -> str:
+    """Resolve MAC_IP for audio URLs the device fetches from this host.
+
+    - "auto" / empty → detect the interface that routes to the device
+      (2026/9/22: router re-leased the mini 10.83.20.188→.173 overnight and the
+      device kept fetching from a dead address; explicit IPs go stale).
+    - explicit → kept as-is (relocate/travel mode needs it), but warn when it is
+      not the interface that routes to the device.
+    """
+    raw = (value or "").strip()
+    detected = _local_ip_toward(stackchan_ip, stackchan_port)
+    if raw == "" or raw.lower() == "auto":
+        if detected:
+            return detected
+        logger.warning("MAC_IP=auto but could not detect a route to %s; using 127.0.0.1", stackchan_ip)
+        return "127.0.0.1"
+    if detected and detected != raw and raw != "127.0.0.1":
+        logger.warning(
+            "MAC_IP=%s but the interface routing to %s is %s; device audio fetch may fail (set MAC_IP=auto)",
+            raw, stackchan_ip, detected,
+        )
+    return raw
 
 def load_config() -> StackchanConfig:
     load_dotenv()
@@ -251,7 +290,11 @@ def load_config() -> StackchanConfig:
     return StackchanConfig(
         stackchan_ip=os.environ.get("STACKCHAN_IP", "127.0.0.1"),
         stackchan_port=int(os.environ.get("STACKCHAN_PORT", 80)),
-        mac_ip=os.environ.get("MAC_IP", "127.0.0.1"),
+        mac_ip=resolve_mac_ip(
+            os.environ.get("MAC_IP", "auto"),
+            os.environ.get("STACKCHAN_IP", "127.0.0.1"),
+            int(os.environ.get("STACKCHAN_PORT", 80)),
+        ),
         audio_serve_port=int(os.environ.get("AUDIO_SERVE_PORT", 5060)),
         tts_engine=os.environ.get("TTS_ENGINE", "fish-audio"),
         audio_mode=audio_mode,
@@ -285,6 +328,7 @@ def load_config() -> StackchanConfig:
         http_play_timeout=env_float_any(("STACKCHAN_HTTP_PLAY_TIMEOUT", "STACKCHAN_HTTP_PLAY_TIMEOUT_SEC"), 5.0),
         http_audio_timeout=env_float_any(("STACKCHAN_HTTP_AUDIO_TIMEOUT", "STACKCHAN_HTTP_AUDIO_TIMEOUT_SEC"), 10.0),
         http_status_timeout=env_float_any(("STACKCHAN_HTTP_STATUS_TIMEOUT", "STACKCHAN_HTTP_STATUS_TIMEOUT_SEC"), 3.0),
+        http_probe_timeout=max(1.0, min(env_float("STACKCHAN_HTTP_PROBE_TIMEOUT", 8.0), 30.0)),
         http_command_timeout=env_float_any(("STACKCHAN_HTTP_COMMAND_TIMEOUT", "STACKCHAN_HTTP_COMMAND_TIMEOUT_SEC"), 5.0),
         http_snapshot_warmup_timeout=env_float_any(
             ("STACKCHAN_HTTP_SNAPSHOT_WARMUP_TIMEOUT", "STACKCHAN_HTTP_SNAPSHOT_WARMUP_TIMEOUT_SEC"),
