@@ -91,6 +91,11 @@ This is the shared contract between the CoreS3 firmware and the MCP server.
   1500 ms is treated as petting. While audio and recording are idle, petting
   shows the `happy` face for five seconds and starts the non-blocking shake
   gesture. Touch never starts speech or a network request.
+- Build with `TOUCH_AGENT_DECIDES=1` in `firmware/src/config.h` to keep the
+  detection and drop the reaction. Gestures are still reported, but the
+  firmware no longer changes the face or moves the servos on its own, leaving
+  the response to the host agent. `/touch/status` reports the active mode as
+  `agent_decides`.
 - The CoreS3 camera shares GPIO 11/12 with the internal I2C bus. `/snapshot`
   temporarily suspends touch, uses the camera, then restores the I2C bus and
   reinitializes the Si12T on every success and failure path.
@@ -115,6 +120,10 @@ This is the shared contract between the CoreS3 firmware and the MCP server.
     current front/middle/back intensity values, the latest click/hold/swipe or
     petting event, recording request/failure counters, pet counters, and
     `resume_failure_count` for camera handoff failures.
+  - `event_seq` is a monotonic counter that increments once per recorded event.
+    Poll it and compare against the last value you saw to detect new events;
+    `last_event_ms` alone is ambiguous because `millis()` resolution is 1 ms
+    and two gestures can land inside the same tick.
 - `GET /playback/status`
   - Includes playback state, PCM queue depth, audio queue depth, download
     queue depth, UDP/TCP PCM stream state, and whether a WAV download is

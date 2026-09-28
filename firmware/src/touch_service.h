@@ -9,6 +9,10 @@ struct TouchRuntimeStatus {
     uint8_t intensities[3] = {0, 0, 0};
     const char* lastEvent = "none";
     uint32_t lastEventMs = 0;
+    // Monotonic cursor: increments once per recorded event. Polling hosts
+    // compare this against the last value they saw to detect new events,
+    // instead of comparing lastEventMs (millis() resolution can collide).
+    uint32_t eventSeq = 0;
     uint32_t petCount = 0;
     uint32_t suppressedPetCount = 0;
     uint32_t recordRequestCount = 0;

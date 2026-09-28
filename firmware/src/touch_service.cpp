@@ -11,6 +11,7 @@
 #include "playback_service.h"
 #include "servo_service.h"
 #include "touch_gesture.h"
+#include "config_loader.h"
 
 namespace {
 
@@ -40,6 +41,7 @@ void clearIntensities() {
 void recordEvent(const char* event, uint32_t nowMs) {
     status.lastEvent = event;
     status.lastEventMs = nowMs;
+    ++status.eventSeq;
 }
 
 bool audioIsBusy() {
@@ -48,6 +50,14 @@ bool audioIsBusy() {
 
 void startPetting(uint32_t nowMs) {
     ++status.petCount;
+#if TOUCH_AGENT_DECIDES
+    // Agent-decides mode: the gesture is reported and nothing else happens.
+    // No face change, no servo movement, and no suppression accounting,
+    // because the agent decides what a pet means rather than the firmware.
+    Serial.printf("[TOUCH] Petting reported to host; no automatic reaction (audio_busy=%s)\n",
+                  audioIsBusy() ? "yes" : "no");
+    return;
+#else
     if (audioIsBusy()) {
         ++status.suppressedPetCount;
         Serial.println("[TOUCH] Petting detected; animation suppressed while audio is busy");
@@ -74,6 +84,7 @@ void startPetting(uint32_t nowMs) {
         servoShake();
     }
     Serial.println("[TOUCH] Petting gesture detected");
+#endif
 }
 
 void finishPettingIfDue(uint32_t nowMs) {

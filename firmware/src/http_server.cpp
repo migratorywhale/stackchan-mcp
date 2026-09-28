@@ -15,6 +15,7 @@
 #include "pcm_stream_service.h"
 #include "env_service.h"
 #include "touch_service.h"
+#include "config_loader.h"
 
 static WebServer server(80);
 
@@ -381,6 +382,8 @@ static void handleTouchStatus() {
     }
     doc["last_event"] = status.lastEvent;
     doc["last_event_ms"] = status.lastEventMs;
+    doc["event_seq"] = status.eventSeq;
+    doc["agent_decides"] = (bool)TOUCH_AGENT_DECIDES;
     doc["pet_count"] = status.petCount;
     doc["suppressed_pet_count"] = status.suppressedPetCount;
     doc["record_request_count"] = status.recordRequestCount;
