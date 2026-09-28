@@ -120,9 +120,12 @@ in that decision.
   flinching. If you need faster, poll faster or add a push channel.
 - **If nothing polls, nothing happens.** Silence is the cost of the design.
   Choose it deliberately, not by accident.
-- **This branch is a minimal re-implementation against upstream `972266b` and
-  has not been built by us in CI.** Read the diff, build it, and confirm the
-  behaviour on your own unit before depending on it.
+- **Compiles cleanly in both configurations; behaviour not yet verified on
+  hardware.** Default and `TOUCH_AGENT_DECIDES=1` both build with zero errors
+  and zero warnings against upstream `972266b` (`pio run -e m5stack-cores3`,
+  ESP32-S3, RAM 31.3%, flash 21.9%). The autonomous path has not been flashed
+  to a device by us, so its runtime behaviour is untested: read the diff, build
+  it, and check it on your own unit before depending on it.
 
 ## Credits
 
