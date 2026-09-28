@@ -22,6 +22,7 @@ Connect it once and any Claude window — the web chat at claude.ai, Claude Desk
 - **MCP-native architecture** — works in any MCP-compatible client: claude.ai web chat, Claude Desktop, Claude Code CLI, Cursor, Windsurf, ChatGPT. No custom app required.
 - **Voice conversation** — in CLI environments, speak naturally with your microphone. Stack-chan listens, transcribes via Groq Whisper, and replies through Fish Audio TTS. No typing needed.
 - **Customizable pixel-art expressions** — AnimatedGIF animation system replaces static images with looping 192x192 animated faces. 7 expressions included as a starting point — **replace them with your own pixel art** to give your companion its own personality. The default faces are ours; yours should be yours.
+- **Touch as a sense, not a reflex** — by default the firmware performs the petting reaction itself. Build with `TOUCH_AGENT_DECIDES=1` and the gesture is reported instead, leaving the response to your agent. See [docs/agent-decides-touch.md](docs/agent-decides-touch.md).
 - **Independent environmental sensing** — SHT31 temperature/humidity + QMP6988 barometric pressure via the M5Stack ENV III Unit.
 - **Full MCP tool suite** — `see` / `listen` / `say` / `face` / `sense` / `move` / `nod` / `shake` / `status` / `health` — the complete action vocabulary of a physical presence.
 - **Voice wake-word loop** — background bridge polls Stack-chan's mic, forwards wake-word transcripts to the AI frontend, closes the loop without any keyboard interaction.
