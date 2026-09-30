@@ -530,6 +530,8 @@ static void handlePlaybackStatus() {
     doc["mic_frame_count"] = mic.frameCount;
     doc["mic_record_failure_count"] = mic.recordFailureCount;
     doc["mic_trigger_count"] = mic.triggerCount;
+    doc["mic_touch_trigger_count"] = mic.touchTriggerCount;
+    doc["mic_recording_source"] = mic.recordingSource;
     doc["mic_stored_recording_count"] = mic.storedRecordingCount;
     doc["mic_resume_requested"] = playback.micResumeRequested;
     doc["servo_ready"] = servo.ready;

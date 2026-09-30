@@ -12,6 +12,7 @@ struct MicRuntimeStatus {
     uint32_t triggerCount = 0;
     uint32_t touchTriggerCount = 0;
     uint32_t storedRecordingCount = 0;
+    const char* recordingSource = "none";
 };
 
 bool initMicrophone();

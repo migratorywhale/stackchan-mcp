@@ -323,6 +323,11 @@ STACKCHAN_AUDIO_MODE=pcm STACKCHAN_SAVE_PCM=1 MAC_IP="$MAC_IP" STACKCHAN_IP="$ST
 The microphone service records 16-bit mono WAV with a pre-trigger ring buffer.
 It uses RMS thresholds to trigger recording and to end after silence.
 
+- A short touch can replace an in-progress ambient voice capture. It starts a
+  fresh touch recording without pre-trigger audio, so background conversation
+  does not gain touch authorization. Playback/streaming and an existing touch
+  recording still reject a new touch. Runtime diagnostics expose
+  `mic_recording_source` and `mic_touch_trigger_count` in `/playback/status`.
 - The device stores the latest recording.
 - MCP clients can poll `/audio/status` and then fetch `/audio`.
 - `scripts/stackchan_voice_bridge.py` is the host-side bridge for the physical

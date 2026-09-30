@@ -9,13 +9,7 @@
 #include "playback_service.h"
 #include "pcm_stream_service.h"
 #include "audio_gate.h"
-
-enum MicState {
-    MIC_IDLE = 0,
-    MIC_TRIGGERING,
-    MIC_RECORDING,
-    MIC_SENDING
-};
+#include "mic_recording_policy.h"
 
 #pragma pack(push, 1)
 struct WAVHeader {
@@ -95,6 +89,7 @@ MicRuntimeStatus getMicRuntimeStatus() {
     status.triggerCount = trigger_count;
     status.touchTriggerCount = touch_trigger_count;
     status.storedRecordingCount = stored_recording_count;
+    status.recordingSource = mic_state == MIC_RECORDING ? recordingSourceName(recording_source) : "none";
     return status;
 }
 
@@ -165,9 +160,9 @@ static void beginRecording(uint32_t now, RecordingSource source, bool includePre
 }
 
 bool requestTouchRecording() {
-    const bool canReplaceAmbientTrigger = mic_state == MIC_IDLE || mic_state == MIC_TRIGGERING;
     if (!record_buffer || !M5.Mic.isEnabled() || !M5.Mic.isRunning() ||
-        isPlaybackActive() || isPcmStreamActive() || !canReplaceAmbientTrigger) {
+        isPlaybackActive() || isPcmStreamActive() ||
+        !canReplaceWithTouch(mic_state, recording_source)) {
         Serial.printf("[MIC] Touch recording rejected: state=%s running=%s playback=%s stream=%s\n",
                       getMicStateName(), M5.Mic.isRunning() ? "yes" : "no",
                       isPlaybackActive() ? "yes" : "no",
@@ -175,6 +170,11 @@ bool requestTouchRecording() {
         return false;
     }
 
+    // An explicit touch starts fresh, even if ambient sound already triggered
+    // voice capture. Do not include the preceding conversation in touch audio.
+    if (mic_state == MIC_RECORDING) {
+        Serial.println("[MIC] Touch taking over ambient voice recording");
+    }
     ++touch_trigger_count;
     beginRecording(millis(), RecordingSource::TOUCH, false);
     return true;
