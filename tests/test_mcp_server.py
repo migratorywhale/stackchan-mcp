@@ -201,6 +201,7 @@ def test_server_entrypoint_registers_expected_tools(monkeypatch):
         "stackchan_see",
         "stackchan_home",
         "stackchan_status",
+        "stackchan_booth_mode",
         "stackchan_health",
         "stackchan_sense",
         "stackchan_config_summary",

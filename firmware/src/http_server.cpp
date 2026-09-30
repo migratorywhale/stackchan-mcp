@@ -16,6 +16,7 @@
 #include "env_service.h"
 #include "touch_service.h"
 #include "firmware_command.h"
+#include "booth_mode.h"
 
 static WebServer httpServer(80);
 
@@ -286,13 +287,42 @@ static void handleMode() {
 }
 
 // ────────────────────────────────────────────
-// GET /audio/status
-// → Recording state plus the monotonic touch-petting event counter.
+// GET/POST /booth: persistent microphone capture policy.
 // ────────────────────────────────────────────
+static void sendBoothStatus(bool success = true) {
+    if (isBoothMode() && !isMicrophoneCaptureStopped()) success = false;
+    JsonDocument doc;
+    doc["success"] = success;
+    doc["booth_mode"] = isBoothMode();
+    doc["persisted"] = isBoothModePersisted();
+    doc["capture_allowed"] = !isBoothMode();
+    doc["mic_running"] = M5.Mic.isRunning();
+    if (!success) doc["error"] = "Booth mode transition incomplete; inspect status before retrying";
+    String body;
+    serializeJson(doc, body);
+    server.send(success ? 200 : 503, "application/json", body);
+}
+
+static void handleBoothStatus() { sendBoothStatus(); }
+
+static void handleBoothSet() {
+    JsonDocument doc;
+    if (!server.hasArg("plain") ||
+        deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok ||
+        !doc.is<JsonObject>() || doc.size() != 1 || !doc["enabled"].is<bool>()) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"expected only enabled: boolean\"}");
+        return;
+    }
+    sendBoothStatus(setBoothMode(doc["enabled"].as<bool>()));
+}
+
+// GET /audio/status: recording state and monotonic host pet-notification counter.
 static void handleAudioStatus() {
     TouchRuntimeStatus touch = getTouchRuntimeStatus();
     String body = "{\"ready\":";
-    body += hasLastRecording() ? "true" : "false";
+    body += !isBoothMode() && hasLastRecording() ? "true" : "false";
+    body += ",\"booth_mode\":";
+    body += isBoothMode() ? "true" : "false";
     body += ",\"mode\":\"mcp\",\"source\":\"";
     body += recordingSourceName(getLastRecordingSource());
     body += "\",\"touch_pet_count\":";
@@ -306,6 +336,10 @@ static void handleAudioStatus() {
 // → 録音済みWAVをそのまま返す（1回読んだらクリア）
 // ────────────────────────────────────────────
 static void handleAudio() {
+    if (isBoothMode()) {
+        server.send(409, "application/json", "{\"success\":false,\"error\":\"microphone capture blocked by booth mode\"}");
+        return;
+    }
     RecordingSnapshot recording = getLastRecording();
     if (!recording.data || recording.size == 0) {
         server.send(404, "application/json", "{\"success\":false,\"error\":\"no audio\"}");
@@ -445,6 +479,7 @@ static void handleTouchStatus() {
     TouchRuntimeStatus status = getTouchRuntimeStatus();
     JsonDocument doc;
     doc["available"] = status.available;
+    doc["booth_mode"] = isBoothMode();
     doc["suspended"] = status.suspended;
     doc["petting_active"] = status.pettingActive;
     JsonArray intensities = doc["intensities"].to<JsonArray>();
@@ -522,6 +557,8 @@ static void handlePlaybackStatus() {
     doc["started_ms"] = playback.startedMs;
     doc["deadline_ms"] = playback.deadlineMs;
     doc["mic_state"] = getMicStateName();
+    doc["booth_mode"] = isBoothMode();
+    doc["booth_mode_persisted"] = isBoothModePersisted();
     doc["mic_enabled"] = mic.enabled;
     doc["mic_running"] = mic.running;
     doc["mic_last_rms"] = mic.lastRms;
@@ -791,6 +828,8 @@ void initHttpServer() {
     httpServer.on("/audio/session", HTTP_POST, handleAudioSessionStart);
     httpServer.on(UriBraces("/audio/session/{}"), HTTP_DELETE, handleAudioSessionStop);
     httpServer.on("/mode",         HTTP_POST, handleMode);
+    httpServer.on("/booth",        HTTP_GET, handleBoothStatus);
+    httpServer.on("/booth",        HTTP_POST, handleBoothSet);
     httpServer.on("/audio/status", HTTP_GET,  handleAudioStatus);
     httpServer.on("/audio",        HTTP_GET,  handleAudio);
     httpServer.on("/move",         HTTP_POST, handleMove);
@@ -831,6 +870,8 @@ void executeFirmwareCommand(FirmwareCommand& command) {
         {"GET", "/audio/status", handleAudioStatus},
         {"GET", "/audio", handleAudio},
         {"POST", "/mode", handleMode},
+        {"GET", "/booth", handleBoothStatus},
+        {"POST", "/booth", handleBoothSet},
         {"POST", "/face", handleFace},
         {"POST", "/move", handleMove},
         {"POST", "/home", handleHome},

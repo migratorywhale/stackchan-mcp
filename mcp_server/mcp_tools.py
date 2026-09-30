@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 import requests
+from pydantic import StrictBool
 
 from . import audio_processing
 from .audio_publish import publish_wav
@@ -24,6 +25,39 @@ from .telemetry import emit_event, new_request_id
 from .voice_inbox import clear_events, format_events, read_events
 
 logger = logging.getLogger(__name__)
+
+
+def _booth_mode_report(enabled: bool | None, status: Any, error: str | None = None) -> str:
+    fields = ("success", "booth_mode", "persisted", "capture_allowed", "mic_running")
+    problems = []
+    valid = isinstance(status, dict) and all(type(status.get(key)) is bool for key in fields)
+    if error:
+        problems.append(error)
+    if not valid or status.get("success") is not True:
+        problems.append("Device did not return a complete successful boolean booth status")
+    else:
+        if enabled is not None and status["booth_mode"] is not enabled:
+            problems.append("Reported booth mode does not match the requested state")
+        if not status["persisted"]:
+            problems.append("Persistence across reboot is not confirmed")
+        if status["booth_mode"] and (status["capture_allowed"] or status["mic_running"]):
+            problems.append("Device microphone capture is not confirmed blocked")
+        if not status["booth_mode"] and not status["capture_allowed"]:
+            problems.append("Normal microphone capture is not confirmed allowed")
+    report = {
+        "success": not problems,
+        "operation": "query" if enabled is None else "set",
+        "requested": enabled,
+        "outcome": "confirmed" if not problems else ("partial" if valid else "unknown"),
+        "status": status,
+    }
+    if problems:
+        report["error"] = "; ".join(problems)
+        report["note"] = (
+            "State may have changed or only partially applied. Query to verify; no write was retried."
+            if enabled is not None else "Current durable booth state is unconfirmed."
+        )
+    return json.dumps(report, ensure_ascii=False)
 
 
 def can_stream_pcm(config: StackchanConfig) -> bool:
@@ -474,6 +508,37 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
             return format_device_request_error(exc)
         except Exception as exc:
             return f"❌ Error: {exc}"
+
+    @mcp.tool()
+    def stackchan_booth_mode(enabled: StrictBool | None = None) -> str:
+        """Query booth mode when omitted/null; explicitly set it with a JSON boolean.
+
+        Never toggles implicitly or retries writes. Booth mode persists across reboot,
+        blocks ALL device microphone capture, and clears pending local recording.
+        Touch gives visual feedback only. The speaker still works and the camera is
+        unchanged; the phone supplies input. Disabling resumes normal device capture.
+        Already-downloaded audio cannot be recalled. Check success and all reported
+        status fields: a failed/partial/unknown result does not confirm privacy or
+        persistence. After an uncertain write, query before deciding what to do next.
+        """
+        if enabled is not None and type(enabled) is not bool:
+            raise ValueError("enabled must be a JSON boolean or null (query)")
+        audit_tool_call("stackchan_booth_mode", enabled=enabled)
+        try:
+            status = client.get_booth_mode() if enabled is None else client.set_booth_mode(enabled)
+            return _booth_mode_report(enabled, status)
+        except requests.HTTPError as exc:
+            status = None
+            detail = str(exc)
+            if exc.response is not None:
+                detail = f"HTTP {exc.response.status_code}: {detail}"
+                try:
+                    status = exc.response.json()
+                except ValueError:
+                    detail += f"; body={exc.response.text[:500]}"
+            return _booth_mode_report(enabled, status, detail)
+        except Exception as exc:
+            return _booth_mode_report(enabled, None, f"Request failed: {exc}")
 
     @mcp.tool()
     def stackchan_health() -> str:

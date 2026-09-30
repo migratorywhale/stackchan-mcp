@@ -56,6 +56,7 @@ def curl_request(
     json_body: dict | None = None,
     data: bytes | None = None,
     headers: dict[str, str] | None = None,
+    disable_config: bool = False,
 ) -> CurlResponse:
     """Call a local-network device through Apple's system curl.
 
@@ -75,6 +76,9 @@ def curl_request(
         "--write-out",
         "\n%{http_code}",
     ]
+    if disable_config:
+        # Must be curl's first option to prevent config-defined redirects/retries.
+        command.insert(1, "--disable")
     request_headers = dict(headers or {})
     payload = data
     if json_body is not None:
@@ -169,6 +173,7 @@ class StackchanClient:
         json_body: dict | None = None,
         data: bytes | None = None,
         headers: dict[str, str] | None = None,
+        allow_redirects: bool = True,
     ):
         if self.config.transport == "relay":
             if not url.startswith(f"{self.base_url}/"):
@@ -187,9 +192,12 @@ class StackchanClient:
                 json_body=json_body,
                 data=data,
                 headers=headers,
+                disable_config=not allow_redirects,
             )
         request_method = getattr(requests, method.lower())
         kwargs: dict[str, Any] = {"timeout": timeout}
+        if not allow_redirects:
+            kwargs["allow_redirects"] = False
         if json_body is not None:
             kwargs["json"] = json_body
         if data is not None:
@@ -260,6 +268,32 @@ class StackchanClient:
             f"{self.base_url}/audio/status",
             timeout=self.config.http_status_timeout if timeout is None else timeout,
         ).json()
+
+    def get_booth_mode(self) -> dict:
+        """Read booth status without changing capture or consuming recorded audio."""
+        return self._booth_mode_request("get")
+
+    def set_booth_mode(self, enabled: bool) -> dict:
+        """Explicitly set durable booth mode once; never toggle or retry a write."""
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a JSON boolean")
+        return self._booth_mode_request("post", {"enabled": enabled})
+
+    def _booth_mode_request(self, method: str, body: dict | None = None) -> dict:
+        response = self.request(
+            method,
+            f"{self.base_url}/booth",
+            json_body=body,
+            timeout=(self.config.http_status_timeout if method == "get"
+                     else self.config.http_command_timeout),
+            allow_redirects=False,
+        )
+        if not 200 <= response.status_code < 300:
+            raise requests.HTTPError(
+                f"Booth mode HTTP {response.status_code}; status unconfirmed",
+                response=response,
+            )
+        return response.json()
 
     def playback_status(self, *, timeout: float | None = None) -> dict:
         return self.request(

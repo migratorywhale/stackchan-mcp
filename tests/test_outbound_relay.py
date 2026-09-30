@@ -83,6 +83,45 @@ def test_command_and_busy_are_not_queued(client):
         assert not client.get("/relay/status", headers=HEADERS).json()["busy"]
 
 
+@pytest.mark.parametrize("enabled", [None, True, False])
+@pytest.mark.parametrize("status", [200, 503])
+def test_booth_allowlist_preserves_method_body_and_device_status(client, enabled, status):
+    method = "GET" if enabled is None else "POST"
+    body = {} if enabled is None else {"enabled": enabled}
+    result_body = {
+        "success": status == 200,
+        "booth_mode": enabled is not False,
+        "persisted": status == 200,
+        "capture_allowed": enabled is False,
+        "mic_running": False,
+    }
+    if status != 200:
+        result_body["error"] = "transition incomplete"
+    with client.websocket_connect("/stackchan/ws", headers=DEVICE_HEADERS) as ws:
+        ready(client, ws)
+        with ThreadPoolExecutor() as pool:
+            future = pool.submit(client.request, method, "/device/booth", headers=HEADERS,
+                                 **({"json": body} if enabled is not None else {}))
+            command = ws.receive_json()
+            assert command["method"] == method
+            assert command["path"] == "/booth"
+            assert command["body"] == body
+            assert command["query"] == {}
+            ws.send_json({"id": command["id"], "status": status, "body": result_body})
+            result = future.result(timeout=2)
+            assert result.status_code == status
+            assert result.json() == result_body
+        assert not client.get("/relay/status", headers=HEADERS).json()["busy"]
+
+
+def test_booth_allowlist_keeps_auth_and_exact_paths(client):
+    for method in ("GET", "POST"):
+        assert client.request(method, "/device/booth").status_code == 401
+        assert client.request(method, "/device/booth", headers=DEVICE_HEADERS).status_code == 401
+        assert client.request(method, "/device/booth", headers=HEADERS).status_code == 503
+        assert client.request(method, "/device/booth/toggle", headers=HEADERS).status_code == 404
+
+
 def test_pcm_and_jpeg_round_trip(client):
     with client.websocket_connect("/stackchan/ws", headers=DEVICE_HEADERS) as ws:
         ready(client, ws)

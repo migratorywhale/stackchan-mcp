@@ -26,6 +26,7 @@ ALLOWED = {
     ("GET", "/status"), ("GET", "/env"), ("GET", "/face"),
     ("GET", "/snapshot"), ("GET", "/audio/status"),
     ("GET", "/playback/status"), ("GET", "/audio"),
+    ("GET", "/booth"), ("POST", "/booth"),
     ("POST", "/mode"), ("POST", "/face"), ("POST", "/move"),
     ("POST", "/home"), ("POST", "/nod"), ("POST", "/shake"),
     ("POST", "/play/pcm"),

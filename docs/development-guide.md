@@ -323,6 +323,13 @@ STACKCHAN_AUDIO_MODE=pcm STACKCHAN_SAVE_PCM=1 MAC_IP="$MAC_IP" STACKCHAN_IP="$ST
 The microphone service records 16-bit mono WAV with a pre-trigger ring buffer.
 It uses RMS thresholds to trigger recording and to end after silence.
 
+- Optional [booth mode](booth-mode.md) blocks all body microphone capture,
+  including touch, VAD and post-playback restart. The explicit MCP tool
+  `stackchan_booth_mode(enabled=true/false)` uses `GET/POST /booth` through either
+  transport. Its setting survives reboot; touch feedback remains local, speaker
+  output remains usable, and the existing phone frontend can provide voice input.
+  Current/pre-trigger/stored body audio is discarded on enable; audio already
+  downloaded by a host cannot be recalled by this setting.
 - A short touch can replace an in-progress ambient voice capture. It starts a
   fresh touch recording without pre-trigger audio, so background conversation
   does not gain touch authorization. Playback/streaming and an existing touch

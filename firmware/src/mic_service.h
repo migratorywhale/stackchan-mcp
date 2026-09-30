@@ -16,6 +16,9 @@ struct MicRuntimeStatus {
 };
 
 bool initMicrophone();
+bool suspendMicrophoneCapture();
+bool isMicrophoneCaptureStopped();
+void serviceMicrophoneResume();
 void updateMicrophone();
 bool requestTouchRecording();
 const char* getMicStateName();

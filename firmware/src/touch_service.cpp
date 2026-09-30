@@ -11,6 +11,7 @@
 #include "playback_service.h"
 #include "servo_service.h"
 #include "touch_gesture.h"
+#include "booth_mode.h"
 
 namespace {
 
@@ -46,8 +47,8 @@ bool audioIsBusy() {
     return isPlaybackActive() || isPcmStreamActive() || strcmp(getMicStateName(), "idle") != 0;
 }
 
-void startPetting(uint32_t nowMs) {
-    ++status.petCount;
+void startPetting(uint32_t nowMs, bool notifyHost = true) {
+    if (notifyHost) ++status.petCount;
     if (audioIsBusy()) {
         ++status.suppressedPetCount;
         Serial.println("[TOUCH] Petting detected; animation suppressed while audio is busy");
@@ -92,7 +93,7 @@ void handleSwipe(TouchSwipeDirection direction, uint32_t nowMs) {
     lastSwipeMs = nowMs;
     if (pettingDetector.observe(direction, nowMs)) {
         recordEvent("petting", nowMs);
-        startPetting(nowMs);
+        startPetting(nowMs, !isBoothMode());
         return;
     }
 
@@ -145,6 +146,11 @@ void updateTouchService() {
     }
     if (M5StackChan.TouchSensor.wasClicked() && !trajectory.suppressClick &&
         nowMs - lastSwipeMs > CLICK_AFTER_SWIPE_GUARD_MS) {
+        if (isBoothMode()) {
+            recordEvent("booth_feedback", nowMs);
+            startPetting(nowMs, false);
+            return;
+        }
         ++status.recordRequestCount;
         if (requestTouchRecording()) {
             recordEvent("recording_started", nowMs);
