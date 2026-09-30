@@ -26,6 +26,17 @@ class PcmPlaybackError(RuntimeError):
         self.started = started
 
 
+def _relay_rejected_before_dispatch(exc: requests.HTTPError) -> bool:
+    response = exc.response
+    if response is None or response.status_code != 409:
+        return False
+    try:
+        # Exact relay admission error, not a device's own playback conflict.
+        return response.json() == {"error": "Device channel busy; command was not queued"}
+    except ValueError:
+        return False
+
+
 class CurlResponse:
     """Small requests-compatible response for macOS system-curl transport."""
 
@@ -397,6 +408,7 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
     session_id = uuid.uuid4().hex
     segment_index = 0
     started = False
+    busy_retry_used = False
     first_chunk_ms = None
     first_segment_ms = None
     pending_segment = None
@@ -411,6 +423,7 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
 
     def post_segment(segment: bytes, *, final: bool) -> dict:
         nonlocal declicked_samples, first_segment_ms, last_segment_tail_sample, segment_index, started
+        nonlocal busy_retry_used
         if not segment or len(segment) % PCM_SAMPLE_WIDTH != 0:
             raise ValueError(f"invalid PCM payload size: {len(segment)}")
         segment, declicked = audio_processing.declick_pcm_segment(
@@ -425,20 +438,29 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
             f"&final={1 if final else 0}&mode=staged"
         )
         try:
-            resp = client.request(
-                "post",
-                url,
-                data=segment,
-                headers={
-                    "Content-Type": PCM_CONTENT_TYPE,
-                    "X-Stackchan-Pcm-Session": session_id,
-                    "X-Stackchan-Pcm-Seq": str(segment_index),
-                    "X-Stackchan-Pcm-Final": "1" if final else "0",
-                    "X-Stackchan-Pcm-Mode": "staged",
-                },
-                timeout=client.config.pcm_segment_post_timeout,
-            )
-            resp.raise_for_status()
+            while True:
+                try:
+                    resp = client.request(
+                        "post",
+                        url,
+                        data=segment,
+                        headers={
+                            "Content-Type": PCM_CONTENT_TYPE,
+                            "X-Stackchan-Pcm-Session": session_id,
+                            "X-Stackchan-Pcm-Seq": str(segment_index),
+                            "X-Stackchan-Pcm-Final": "1" if final else "0",
+                            "X-Stackchan-Pcm-Mode": "staged",
+                        },
+                        timeout=client.config.pcm_segment_post_timeout,
+                    )
+                    resp.raise_for_status()
+                    break
+                except requests.HTTPError as exc:
+                    if not relay or busy_retry_used or not _relay_rejected_before_dispatch(exc):
+                        raise
+                    # One retry per utterance, reusing only this unadmitted segment.
+                    busy_retry_used = True
+                    time.sleep(1.5)
             result = resp.json()
         except requests.HTTPError as exc:
             body = getattr(exc.response, "text", "") if exc.response is not None else ""

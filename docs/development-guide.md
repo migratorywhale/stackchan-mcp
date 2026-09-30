@@ -237,6 +237,12 @@ live transport:
   and starts playback only after the final segment. This remains the fallback
   PCM path when TCP cannot connect before playback starts.
 
+In outbound relay mode, speech may retry one rejected PCM segment after 1.5s
+only when HTTP 409 contains the relay's exact `Device channel busy; command was
+not queued` admission error. The whole utterance shares one retry; no earlier
+segment or TTS generation is repeated. Device conflicts and ambiguous failures
+still stop without automatic replay. See [the outbound contract](outbound-channel.md).
+
 The legacy immediate HTTP PCM segment path remains available for direct tests:
 
 - Format: 24 kHz, mono, signed 16-bit little-endian.

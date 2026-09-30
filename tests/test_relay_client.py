@@ -2,6 +2,7 @@ import json
 import os
 import wave
 from dataclasses import replace
+from unittest.mock import Mock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -15,6 +16,8 @@ from mcp_server.stackchan_client import (
     post_pcm_tcp_stream,
     post_pcm_udp_stream,
 )
+
+RELAY_BUSY_BODY = {"error": "Device channel busy; command was not queued"}
 
 
 def forbidden(*_args, **_kwargs):
@@ -81,6 +84,27 @@ def relay_http(monkeypatch):
         return calls
 
     return install
+
+
+@pytest.fixture
+def retry_sleep(monkeypatch):
+    sleep = Mock()
+    monkeypatch.setattr("mcp_server.stackchan_client.time.sleep", sleep)
+    return sleep
+
+
+class OnePassPcm:
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.iterations = 0
+        self.consumed = []
+
+    def __iter__(self):
+        self.iterations += 1
+        assert self.iterations == 1, "PCM input must not restart during retry"
+        for chunk in self.chunks:
+            self.consumed.append(chunk)
+            yield chunk
 
 
 class FakeMCP:
@@ -254,6 +278,326 @@ def test_pcm_upload_is_bounded_ordered_and_final_once(config, relay_http, tmp_pa
     assert len({query["session"][0] for query in queries}) == 1
     assert all(query["mode"] == ["staged"] for query in queries)
     assert all(call[2]["headers"]["Content-Type"].startswith("audio/x-raw") for call in calls)
+
+
+@pytest.mark.parametrize("segment_count,busy_seq", [(1, 0), (3, 0), (3, 1), (3, 2)])
+def test_relay_pcm_busy_retries_identical_segment_once(
+    config, relay_http, retry_sleep, monkeypatch, tmp_path, segment_count, busy_seq
+):
+    config = replace(config, pcm_segment_bytes=4, pcm_declick_samples=2, save_pcm=True)
+    chunks = [b"\x01\x00\x02\x00", b"\x20\x00\x30\x00", b"\x04\x00\x05\x00"][:segment_count]
+    stream = OnePassPcm(chunks)
+    condition = Mock(wraps=audio_processing.condition_pcm_chunk)
+    declick = Mock(wraps=audio_processing.declick_pcm_segment)
+    monkeypatch.setattr(audio_processing, "condition_pcm_chunk", condition)
+    monkeypatch.setattr(audio_processing, "declick_pcm_segment", declick)
+    refused_at = None
+    consumed_at_refusal = None
+
+    def accepted_after_busy(_method, url, _kwargs):
+        nonlocal refused_at, consumed_at_refusal
+        query = parse_qs(urlsplit(url).query)
+        if int(query["seq"][0]) == busy_seq:
+            if refused_at is None:
+                retry_sleep.assert_not_called()
+                refused_at = len(calls) - 1
+                consumed_at_refusal = list(stream.consumed)
+                return response(RELAY_BUSY_BODY, status=409)
+            retry_sleep.assert_called_once_with(1.5)
+            assert stream.consumed == consumed_at_refusal
+        return response({"success": True, "staged": query["final"] == ["0"]})
+
+    calls = relay_http(accepted_after_busy)
+    result = post_pcm_stream(StackchanClient(config), stream, tmp_path, audio_processing)
+
+    assert result["success"] is True
+    assert result["segments"] == segment_count
+    assert result["total_bytes"] == sum(map(len, chunks))
+    assert result["declicked_samples"] == 2 * (segment_count - 1)
+    retry_sleep.assert_called_once_with(1.5)
+    assert len(calls) == segment_count + 1
+    assert refused_at == busy_seq
+    assert calls[busy_seq] == calls[busy_seq + 1]
+    queries = [parse_qs(urlsplit(call[1]).query) for call in calls]
+    expected_seqs = list(range(segment_count))
+    expected_seqs.insert(busy_seq, busy_seq)
+    assert [int(query["seq"][0]) for query in queries] == expected_seqs
+    assert [query["final"][0] for query in queries] == [
+        "1" if seq == segment_count - 1 else "0" for seq in expected_seqs
+    ]
+    assert {query["session"][0] for query in queries} == {result["session"]}
+    for (_, _, kwargs), query in zip(calls, queries, strict=True):
+        assert kwargs["headers"]["X-Stackchan-Pcm-Session"] == query["session"][0]
+        assert kwargs["headers"]["X-Stackchan-Pcm-Seq"] == query["seq"][0]
+        assert kwargs["headers"]["X-Stackchan-Pcm-Final"] == query["final"][0]
+        assert kwargs["headers"]["X-Stackchan-Pcm-Mode"] == "staged"
+        assert query["mode"] == ["staged"]
+    assert stream.iterations == 1
+    assert stream.consumed == chunks
+    assert condition.call_count == segment_count
+    assert declick.call_count == segment_count
+    assert (tmp_path / f"diag_{result['session']}.pcm").read_bytes() == b"".join(chunks)
+
+
+@pytest.mark.parametrize("first_busy_seq,second_busy_seq", [(0, 1), (0, 2), (1, 2)])
+def test_relay_pcm_retry_budget_is_shared_across_segments(
+    config, relay_http, retry_sleep, tmp_path, first_busy_seq, second_busy_seq
+):
+    config = replace(config, pcm_segment_bytes=4)
+    refused = set()
+
+    def busy_once_per_segment(_method, url, _kwargs):
+        query = parse_qs(urlsplit(url).query)
+        seq = int(query["seq"][0])
+        if seq in {first_busy_seq, second_busy_seq} and seq not in refused:
+            refused.add(seq)
+            return response(RELAY_BUSY_BODY, status=409)
+        return response({"success": True, "staged": query["final"] == ["0"]})
+
+    calls = relay_http(busy_once_per_segment)
+    with pytest.raises(PcmPlaybackError) as caught:
+        post_pcm_stream(
+            StackchanClient(config), iter([b"\x01\x00" * 6]), tmp_path, audio_processing
+        )
+    retry_sleep.assert_called_once_with(1.5)
+    expected_seqs = list(range(second_busy_seq + 1))
+    expected_seqs.insert(first_busy_seq, first_busy_seq)
+    assert [int(parse_qs(urlsplit(call[1]).query)["seq"][0]) for call in calls] == expected_seqs
+    assert calls[first_busy_seq] == calls[first_busy_seq + 1]
+    assert caught.value.started is False
+    cause = caught.value.__cause__
+    assert isinstance(cause, requests.HTTPError)
+    assert cause.response.status_code == 409
+    assert cause.response.json() == RELAY_BUSY_BODY
+
+
+@pytest.mark.parametrize("second_outcome", ["busy", "timeout", "503", "504"])
+def test_relay_pcm_second_attempt_failure_stops_without_extra_retry(
+    config, relay_http, retry_sleep, tmp_path, second_outcome
+):
+    config = replace(config, pcm_segment_bytes=4)
+    timeout = requests.ReadTimeout("completion unknown")
+
+    def fail_twice(*_args):
+        if len(calls) == 1:
+            return response(RELAY_BUSY_BODY, status=409)
+        if len(calls) == 2:
+            retry_sleep.assert_called_once_with(1.5)
+            if second_outcome == "timeout":
+                raise timeout
+            status = 409 if second_outcome == "busy" else int(second_outcome)
+            return response(RELAY_BUSY_BODY, status=status)
+        return response({"success": True})
+
+    calls = relay_http(fail_twice)
+    stream = OnePassPcm([b"\x01\x00\x02\x00"] * 3)
+    with pytest.raises(PcmPlaybackError) as caught:
+        post_pcm_stream(StackchanClient(config), stream, tmp_path, audio_processing)
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    retry_sleep.assert_called_once_with(1.5)
+    assert stream.iterations == 1
+    assert len(stream.consumed) == 2
+    assert caught.value.started is False
+    if second_outcome == "timeout":
+        assert caught.value.__cause__ is timeout
+    else:
+        assert isinstance(caught.value.__cause__, requests.HTTPError)
+
+
+def test_relay_pcm_retry_budget_resets_for_next_utterance(config, relay_http, retry_sleep, tmp_path):
+    def busy_then_accepted(*_args):
+        if len(calls) % 2:
+            return response(RELAY_BUSY_BODY, status=409)
+        return response({"success": True})
+
+    calls = relay_http(busy_then_accepted)
+    client = StackchanClient(config)
+    for _ in range(2):
+        assert post_pcm_stream(client, iter([b"\x01\x00"]), tmp_path, audio_processing)["success"]
+    assert len(calls) == 4
+    assert [call.args for call in retry_sleep.call_args_list] == [(1.5,), (1.5,)]
+    assert calls[0] == calls[1]
+    assert calls[2] == calls[3]
+    assert calls[0][1] != calls[2][1]
+
+
+@pytest.mark.parametrize("status,body", [
+    pytest.param(409, {"error": "busy"}, id="generic-conflict"),
+    pytest.param(409, {"success": False, "error": "playback busy"}, id="device-busy"),
+    pytest.param(409, {"success": False, "error": "pcm session mismatch"}, id="device-session"),
+    pytest.param(409, {"success": False, "error": "pcm seq invalid"}, id="device-sequence"),
+    pytest.param(409, {**RELAY_BUSY_BODY, "success": False}, id="extra-json-key"),
+    pytest.param(409, {"error": RELAY_BUSY_BODY["error"] + "."}, id="different-message"),
+    pytest.param(409, [RELAY_BUSY_BODY], id="json-list"),
+    pytest.param(409, RELAY_BUSY_BODY["error"], id="json-string"),
+    pytest.param(409, None, id="json-null"),
+    pytest.param(503, RELAY_BUSY_BODY, id="503-exact-body"),
+    pytest.param(504, RELAY_BUSY_BODY, id="504-exact-body"),
+    pytest.param(200, RELAY_BUSY_BODY, id="no-http-error"),
+])
+def test_relay_pcm_non_admission_errors_never_retry(
+    config, relay_http, retry_sleep, tmp_path, status, body
+):
+    calls = relay_http(lambda *_args: response(status=status, content=json.dumps(body).encode()))
+    with pytest.raises(PcmPlaybackError):
+        post_pcm_stream(StackchanClient(config), iter([b"\x01\x00"]), tmp_path, audio_processing)
+    assert len(calls) == 1
+    retry_sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [200, 409])
+@pytest.mark.parametrize("content", [b"", b"{", b"Device channel busy; command was not queued"])
+def test_relay_pcm_malformed_json_never_retries(config, relay_http, retry_sleep, tmp_path, status, content):
+    calls = relay_http(lambda *_args: response(status=status, content=content))
+    with pytest.raises(PcmPlaybackError):
+        post_pcm_stream(StackchanClient(config), iter([b"\x01\x00"]), tmp_path, audio_processing)
+    assert len(calls) == 1
+    retry_sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [
+    requests.Timeout,
+    requests.ReadTimeout,
+    requests.ConnectTimeout,
+    requests.ConnectionError,
+    requests.RequestException,
+])
+def test_relay_pcm_non_http_exceptions_never_retry(config, relay_http, retry_sleep, tmp_path, error):
+    failure = error("completion unknown", response=response(RELAY_BUSY_BODY, status=409))
+
+    def fail(*_args):
+        raise failure
+
+    calls = relay_http(fail)
+    with pytest.raises(PcmPlaybackError) as caught:
+        post_pcm_stream(StackchanClient(config), iter([b"\x01\x00"]), tmp_path, audio_processing)
+    assert caught.value.__cause__ is failure
+    assert len(calls) == 1
+    retry_sleep.assert_not_called()
+
+
+def test_relay_pcm_http_error_without_response_never_retries(config, relay_http, retry_sleep, tmp_path):
+    failure = requests.HTTPError("409 Device channel busy; command was not queued")
+
+    def fail(*_args):
+        raise failure
+
+    calls = relay_http(fail)
+    with pytest.raises(PcmPlaybackError) as caught:
+        post_pcm_stream(StackchanClient(config), iter([b"\x01\x00"]), tmp_path, audio_processing)
+    assert caught.value.__cause__ is failure
+    assert len(calls) == 1
+    retry_sleep.assert_not_called()
+
+
+def test_direct_pcm_does_not_retry_exact_relay_busy_body(config, retry_sleep, monkeypatch, tmp_path):
+    config = replace(config, transport="direct", stackchan_ip="192.0.2.20")
+    post = Mock(return_value=response(RELAY_BUSY_BODY, status=409))
+    monkeypatch.setattr(requests, "post", post)
+    with pytest.raises(PcmPlaybackError):
+        post_pcm_stream(StackchanClient(config), iter([b"\x01\x00"]), tmp_path, audio_processing)
+    assert post.call_count == 1
+    assert post.call_args.args[0].startswith("http://192.0.2.20:80/play/pcm?")
+    retry_sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("method,args", [
+    ("move", (1, 2, 3)),
+    ("gesture", ("nod",)),
+    ("set_face", ("calm",)),
+    ("read_env", ()),
+    ("audio_status", ()),
+    ("playback_status", ()),
+    ("start_camera_session", ()),
+    ("snapshot_once", ()),
+    ("get_audio", ()),
+    ("relay_status", ()),
+])
+def test_non_speech_apis_never_retry_exact_relay_busy_body(
+    config, relay_http, retry_sleep, method, args
+):
+    calls = relay_http(lambda *_args: response(RELAY_BUSY_BODY, status=409))
+    with pytest.raises(requests.HTTPError):
+        getattr(StackchanClient(config), method)(*args)
+    assert len(calls) == 1
+    retry_sleep.assert_not_called()
+
+
+def test_raw_pcm_request_does_not_gain_speech_retry_policy(config, relay_http, retry_sleep):
+    calls = relay_http(lambda *_args: response(RELAY_BUSY_BODY, status=409))
+    client = StackchanClient(config)
+    with pytest.raises(requests.HTTPError):
+        client.request("post", f"{client.base_url}/play/pcm", data=b"\x01\x00", timeout=5)
+    assert len(calls) == 1
+    retry_sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("tts_path", ["fish-stream", "generated-wav"])
+@pytest.mark.parametrize("retry_outcome", ["success", "busy", "timeout"])
+def test_registered_say_retries_only_refused_segment_without_reinvoking_tts(
+    config, relay_http, retry_sleep, monkeypatch, tmp_path, tts_path, retry_outcome
+):
+    config = replace(config, audio_mode="auto", pcm_segment_bytes=4, fish_audio_key="test-key")
+    pcm = b"\x01\x00\x02\x00\x03\x00\x04\x00\x05\x00\x06\x00"
+    stream = OnePassPcm([pcm])
+    other_tts = Mock(side_effect=forbidden)
+    if tts_path == "fish-stream":
+        tts = Mock(return_value=stream)
+        wav_stream = Mock(side_effect=forbidden)
+        monkeypatch.setattr(audio_processing, "iter_fish_pcm_stream", tts)
+        monkeypatch.setattr(audio_processing, "generate_tts", other_tts)
+        monkeypatch.setattr(audio_processing, "iter_wav_pcm", wav_stream)
+    else:
+        config = replace(config, tts_engine="edge-tts")
+        wav_path = tmp_path / "tts.wav"
+        with wave.open(str(wav_path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(24000)
+            wav.writeframes(pcm)
+        tts = Mock(return_value=wav_path)
+        wav_stream = Mock(wraps=audio_processing.iter_wav_pcm)
+        monkeypatch.setattr(audio_processing, "generate_tts", tts)
+        monkeypatch.setattr(audio_processing, "iter_wav_pcm", wav_stream)
+        monkeypatch.setattr(audio_processing, "iter_fish_pcm_stream", other_tts)
+
+    attempts = 0
+
+    def later_segment_busy(_method, url, _kwargs):
+        nonlocal attempts
+        query = parse_qs(urlsplit(url).query)
+        if query["seq"] == ["1"]:
+            attempts += 1
+            assert attempts <= 2, "A refused segment gets at most one retry"
+            if attempts == 1 or retry_outcome == "busy":
+                return response(RELAY_BUSY_BODY, status=409)
+            if retry_outcome == "timeout":
+                raise requests.ReadTimeout("completion unknown")
+        return response({"success": True, "staged": query["final"] == ["0"]})
+
+    calls = relay_http(later_segment_busy)
+    result = registered_tools(config)["stackchan_say"]("hello", lang="en")
+    tts.assert_called_once_with("hello", "en", config)
+    other_tts.assert_not_called()
+    retry_sleep.assert_called_once_with(1.5)
+    assert calls[1] == calls[2]
+    if tts_path == "fish-stream":
+        wav_stream.assert_not_called()
+        assert stream.iterations == 1
+        assert stream.consumed == [pcm]
+    else:
+        wav_stream.assert_called_once_with(wav_path)
+    if retry_outcome == "success":
+        assert "is saying" in result
+        expected_seqs = ["0", "1", "1", "2"]
+        assert b"".join(call[2]["data"] for index, call in enumerate(calls) if index != 1) == pcm
+    else:
+        assert "failed" in result.lower()
+        assert "is saying" not in result
+        expected_seqs = ["0", "1", "1"]
+    assert [parse_qs(urlsplit(call[1]).query)["seq"][0] for call in calls] == expected_seqs
+    assert len({parse_qs(urlsplit(call[1]).query)["session"][0] for call in calls}) == 1
 
 
 @pytest.mark.parametrize("transport", ["auto", "tcp", "udp", "staged"])
