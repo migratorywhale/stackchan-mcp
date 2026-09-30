@@ -9,6 +9,7 @@ from dataclasses import replace
 
 import httpx
 import pytest
+import requests
 import uvicorn
 from websockets.sync.client import connect
 
@@ -133,3 +134,63 @@ def test_mcp_client_through_real_relay(wire_server, monkeypatch, tmp_path):
                                 "body": {"success": True, "staged": seq == 0}}))
         assert future.result(timeout=3)["success"]
         assert bytes(received) == pcm
+
+
+def test_speech_retries_only_unadmitted_segment_after_status_poll(wire_server, monkeypatch, tmp_path):
+    base, url = wire_server
+    monkeypatch.setattr(stackchan_config, "load_dotenv", lambda: None)
+    monkeypatch.delenv("STACKCHAN_RELAY_TOKEN_FILE", raising=False)
+    config = replace(stackchan_config.load_config(), transport="relay", relay_url=base,
+                     relay_token=CONTROL_TOKEN, pcm_first_segment_timeout=0,
+                     pcm_gain=1, pcm_limit=1, save_pcm=False,
+                     pcm_declick_samples=0, pcm_zero_cross_window=0)
+    client = StackchanClient(config)
+    request_once = client.request
+    rejected = threading.Event()
+    speech_attempts = []
+
+    def observe_request(method, request_url, **kwargs):
+        if method == "post":
+            speech_attempts.append((request_url, kwargs["data"]))
+        try:
+            return request_once(method, request_url, **kwargs)
+        except requests.HTTPError as exc:
+            assert exc.response is not None
+            assert exc.response.status_code == 409
+            assert exc.response.json() == {"error": "Device channel busy; command was not queued"}
+            rejected.set()
+            raise
+
+    monkeypatch.setattr(client, "request", observe_request)
+    with (
+        connect(url, additional_headers={"Authorization": f"Bearer {DEVICE_TOKEN}"}) as ws,
+        ThreadPoolExecutor() as pool,
+    ):
+        ws.send(json.dumps({"type": "hello", "v": 1}))
+        deadline = time.monotonic() + 2
+        while not client.relay_status()["online"]:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        poll = pool.submit(client.audio_status)
+        poll_request = json.loads(ws.recv(timeout=2))
+        assert poll_request["path"] == "/audio/status"
+        pcm = b"\x01\x00" * 100
+        speech = pool.submit(post_pcm_stream, client, iter([pcm]), tmp_path, audio_processing)
+        assert rejected.wait(timeout=1)
+        with pytest.raises(TimeoutError):
+            ws.recv(timeout=0.05)
+        ws.send(json.dumps({"id": poll_request["id"], "status": 200,
+                            "body": {"ready": False}}))
+        assert poll.result(timeout=1) == {"ready": False}
+        accepted = json.loads(ws.recv(timeout=3))
+        assert accepted["path"] == "/play/pcm"
+        assert accepted["query"]["seq"] == "0"
+        assert accepted["query"]["final"] == "1"
+        assert ws.recv(timeout=1) == b"SCB1" + accepted["id"].encode() + pcm
+        ws.send(json.dumps({"id": accepted["id"], "status": 200,
+                            "body": {"success": True, "staged": False}}))
+        assert speech.result(timeout=1)["success"]
+        assert len(speech_attempts) == 2
+        assert speech_attempts[0] == speech_attempts[1]
+        with pytest.raises(TimeoutError):
+            ws.recv(timeout=0.05)

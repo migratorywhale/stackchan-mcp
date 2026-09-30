@@ -39,6 +39,13 @@ Speech uses bounded staged PCM segments regardless of the old TCP/UDP/WAV
 setting. WAV TTS is locally decoded before upload; the body never downloads a
 host audio URL. Staged speech starts after its final segment has arrived, so
 long utterances have higher first-audio latency than streaming playback.
+If speech receives the relay's exact HTTP 409 admission rejection (`Device
+channel busy; command was not queued`), it waits 1.5 seconds and resubmits that
+unadmitted PCM segment once. The budget is one retry for the whole utterance,
+not each segment. Session, sequence, final flag and PCM bytes stay identical;
+earlier accepted segments and TTS generation are not restarted. Other 409s,
+timeouts, disconnects and unknown outcomes are not retried. Direct transport
+and non-speech commands retain their original behavior.
 Camera streaming/session controls and servo diagnostics are not implemented in
 this first outbound version; they return errors rather than silently using LAN.
 
@@ -64,8 +71,11 @@ get HTTP 409 and are not queued. An upload taking over five seconds gets 408;
 if the body reconnects during upload, the command is not sent to the new
 connection. Offline requests get 503. A 20-second overall command deadline gives 504
 and closes the channel. A reconnect fails any old pending request. **No command
-is automatically replayed**, because a lost reply does not prove that an action
-did not execute. The process runs as one worker and keeps no durable command log.
+is automatically replayed after an unknown outcome**, because a lost reply does
+not prove that an action did not execute. The bounded speech-only retry above
+applies solely to a confirmed pre-dispatch rejection; the relay itself still
+does not retry or queue anything. The process runs as one worker and keeps no
+durable command log.
 
 ## WebSocket wire format
 
