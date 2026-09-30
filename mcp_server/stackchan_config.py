@@ -2,7 +2,7 @@ import logging
 import os
 import shlex
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -126,6 +126,9 @@ class StackchanConfig:
     audio_publish_timeout: float = 20.0
     audio_publish_attempts: int = 2
     http_probe_timeout: float = 8.0
+    transport: str = "direct"
+    relay_url: str = "http://127.0.0.1:8766"
+    relay_token: str = field(default="", repr=False)
 
 
 VALID_AUDIO_MODES = {"auto", "pcm", "wav"}
@@ -153,9 +156,15 @@ EDGE_VOICES = {
 def config_summary(config: StackchanConfig) -> dict[str, Any]:
     return {
         "stackchan": {
+            "transport": config.transport,
             "ip": config.stackchan_ip,
             "port": config.stackchan_port,
-            "base_url": f"http://{config.stackchan_ip}:{config.stackchan_port}",
+            "base_url": (
+                f"{config.relay_url.rstrip('/')}/device"
+                if config.transport == "relay"
+                else f"http://{config.stackchan_ip}:{config.stackchan_port}"
+            ),
+            "relay_token_configured": bool(config.relay_token),
         },
         "audio": {
             "mac_ip": config.mac_ip,
@@ -231,7 +240,7 @@ def resolve_mac_ip(value: str | None, stackchan_ip: str, stackchan_port: int = 8
     """Resolve MAC_IP for audio URLs the device fetches from this host.
 
     - "auto" / empty → detect the interface that routes to the device
-      (2026/9/22: router re-leased the mini 10.83.20.188→.173 overnight and the
+      (2026/9/22: router re-leased the host a new address overnight and the
       device kept fetching from a dead address; explicit IPs go stale).
     - explicit → kept as-is (relocate/travel mode needs it), but warn when it is
       not the interface that routes to the device.
@@ -252,6 +261,16 @@ def resolve_mac_ip(value: str | None, stackchan_ip: str, stackchan_port: int = 8
 
 def load_config() -> StackchanConfig:
     load_dotenv()
+
+    transport = os.environ.get("STACKCHAN_TRANSPORT", "direct").strip().lower()
+    if transport not in {"direct", "relay"}:
+        raise ValueError("STACKCHAN_TRANSPORT must be direct or relay")
+    relay_token = os.environ.get("STACKCHAN_RELAY_TOKEN", "")
+    if transport == "relay" and (token_file := os.environ.get("STACKCHAN_RELAY_TOKEN_FILE")):
+        try:
+            relay_token = Path(token_file).read_text().strip()
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("Could not read STACKCHAN_RELAY_TOKEN_FILE") from exc
 
     audio_mode = os.environ.get("STACKCHAN_AUDIO_MODE", "wav").lower()
     if audio_mode not in VALID_AUDIO_MODES:
@@ -294,7 +313,7 @@ def load_config() -> StackchanConfig:
             os.environ.get("MAC_IP", "auto"),
             os.environ.get("STACKCHAN_IP", "127.0.0.1"),
             int(os.environ.get("STACKCHAN_PORT", 80)),
-        ),
+        ) if transport == "direct" else "127.0.0.1",
         audio_serve_port=int(os.environ.get("AUDIO_SERVE_PORT", 5060)),
         tts_engine=os.environ.get("TTS_ENGINE", "fish-audio"),
         audio_mode=audio_mode,
@@ -372,4 +391,7 @@ def load_config() -> StackchanConfig:
             1,
             3,
         ),
+        transport=transport,
+        relay_url=os.environ.get("STACKCHAN_RELAY_URL", "http://127.0.0.1:8766").rstrip("/"),
+        relay_token=relay_token,
     )

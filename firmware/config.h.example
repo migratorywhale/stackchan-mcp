@@ -42,4 +42,17 @@
 // ディスプレイ
 #define DISPLAY_BRIGHTNESS  70
 
+// Optional outbound channel. Leave disabled unless all fields are provisioned.
+// HOST is a DNS hostname only, never a URL. The WSS path is /stackchan/ws.
+// Use a device-only Bearer token, not the relay's host HTTP token.
+#define STACKCHAN_OUTBOUND_ENABLED 0
+#define STACKCHAN_OUTBOUND_HOST ""
+#define STACKCHAN_OUTBOUND_PORT 443
+#define STACKCHAN_OUTBOUND_DEVICE_TOKEN ""
+// Complete PEM root CA: use a single-line string literal with escaped \n newlines,
+// or set this macro to the name of a static const char[] containing the PEM.
+// Do not put a multiline raw string literal directly in a #define.
+#define STACKCHAN_OUTBOUND_CA_PEM ""
+#define STACKCHAN_OUTBOUND_NTP_SERVER "pool.ntp.org"
+
 #endif

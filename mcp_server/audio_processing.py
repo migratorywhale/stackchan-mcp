@@ -183,6 +183,14 @@ def generate_tts(text: str, lang: str, config: StackchanConfig) -> Path:
     return tts_edge(text, lang, config)
 
 
+def iter_wav_pcm(wav_path: Path):
+    """Read validated TTS audio without forwarding the WAV container to the device."""
+    validate_playback_wav(wav_path)
+    with wave.open(str(wav_path), "rb") as wav:
+        while chunk := wav.readframes(24 * 1024):
+            yield chunk
+
+
 def validate_pcm_contract(sample_rate: int, channels: int, sample_width: int) -> None:
     if sample_rate != PCM_SAMPLE_RATE or channels != PCM_CHANNELS or sample_width != PCM_SAMPLE_WIDTH:
         raise ValueError(

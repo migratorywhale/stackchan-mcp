@@ -4,7 +4,7 @@ from mcp_server.stackchan_config import resolve_mac_ip
 
 
 def test_explicit_value_is_kept():
-    assert resolve_mac_ip("10.0.0.5", "127.0.0.1") == "10.0.0.5"
+    assert resolve_mac_ip("192.0.2.5", "127.0.0.1") == "192.0.2.5"
 
 
 def test_auto_detects_loopback_route():

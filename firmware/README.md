@@ -83,6 +83,85 @@ CoreS3 のカメラ SCCB と内部 I2C（タッチ・環境センサー）は GP
 
 ---
 
+## Optional Outbound WSS
+
+Direct HTTP, TCP PCM and UDP PCM remain available. The outbound channel is
+disabled by default. Provision the following defines separately for deployment;
+do not commit tokens or create a private configuration for a rehearsal build:
+
+| Define | Default |
+|---|---|
+| `STACKCHAN_OUTBOUND_ENABLED` | `0` |
+| `STACKCHAN_OUTBOUND_HOST` | `""` (DNS hostname, no scheme/path) |
+| `STACKCHAN_OUTBOUND_PORT` | `443` |
+| `STACKCHAN_OUTBOUND_DEVICE_TOKEN` | `""` (device-only Bearer token) |
+| `STACKCHAN_OUTBOUND_CA_PEM` | `""` (complete PEM trust anchor) |
+| `STACKCHAN_OUTBOUND_NTP_SERVER` | `"pool.ntp.org"` |
+
+The path is fixed at `/stackchan/ws`. Missing/invalid configuration or an invalid
+CA disables the service. It waits for a plausible synchronized clock before
+connecting. `beginSslWithCA()` enables CA and hostname verification; authorization
+is set afterwards using `setAuthorization("Bearer ...")`. There is no insecure
+fallback, URL token, payload token, or WebSockets debug logging.
+
+A core-0 FreeRTOS task (priority 1, 12 KiB stack) exclusively owns WebSockets.
+One bounded request/result slot hands commands to the main loop, so outbound
+camera/I2C/servo/recording operations do not run concurrently with HTTP handlers.
+Disconnect invalidates the connection generation: unexecuted requests are skipped,
+late results are discarded, and only outbound-owned queued/staged PCM is cleared.
+Every outbound PCM buffer carries its connection generation. All stale-generation
+queues and staging are swept, not just the most recent session; generation is
+checked again at playback start after any microphone/speaker setup waits.
+An already-running operation or active audio segment may finish. There is no
+command replay after reconnect. Heartbeats run every 10 seconds; commands time
+out after 20 seconds and pending binary/fragment assembly after 5 seconds.
+Every request must carry a positive int64 `expires_at_ms` Unix timestamp in
+milliseconds. UTC expiry is checked before hardware dispatch and replies in
+addition to the generation and monotonic timeout, rejecting TCP-delayed commands.
+Expiry more than 25 seconds ahead of UTC (20 seconds plus 5 seconds of clock-skew
+tolerance) also fails closed, rather than trusting a clock that is far behind.
+
+Outbound routes: GET `/status` (playback diagnostics alias), `/playback/status`,
+`/env`, `/face`, `/snapshot`, `/audio/status`, `/audio`; POST `/mode`, `/face`, `/move`,
+`/home`, `/nod`, `/shake`, `/play/pcm`. Other endpoints remain direct-only.
+PCM is mono 24 kHz s16le. Existing staged playback supports up to 2 MiB per
+utterance. Incoming PCM bodies and JPEG replies are capped at 128 KiB; recorded
+WAV replies alone may reach 512 KiB (the current 8-second recording is at most
+256044 bytes). JSON envelopes remain capped at 8 KiB. Binary messages use `SCB1`
+plus the 32-character request ID plus bytes. Binary replies are copied into
+bounded PSRAM before leaving the main loop.
+
+The voice bridge polls `/audio/status`, then intentionally consumes `/audio`.
+`GET /audio` is not a health check and the firmware does not push voice uploads.
+An oversized WAV or failed response allocation leaves the recording ready; a
+successful response copy marks it consumed. A later timeout/disconnect may lose
+that delivery and must not cause an automatic retry or replay. Direct HTTP keeps
+its existing read-once behavior.
+
+`scripts/websocket_limits.py` checks the pinned WebSockets 2.7.2 package version
+and patches only this worktree's generated `.pio/libdeps` copy: its hard-coded
+15 KiB frame limit becomes overrideable, and receive payloads use PSRAM. The
+build sets `WEBSOCKETS_MAX_DATA_SIZE=131108` (128 KiB + 36-byte envelope); a
+compile-time assertion verifies the override. Fragmented messages are also
+bounded. A dependency upgrade must revalidate this compatibility patch.
+
+Rehearsal checks (no device or private `src/config.h` needed):
+
+```sh
+pio run -e m5stack-cores3-public
+pio check -e m5stack-cores3-public --severity=high --fail-on-defect=high
+pio test -e native
+```
+
+The public environment defines `STACKCHAN_USE_PUBLIC_CONFIG`, causing the loader
+to include only `config.h.example` and defaults, even if private `config.h` exists.
+Native tests cover wire validation, size limits, fragmentation, cancellation
+eligibility, GET body policy, bounded WAV/JPEG response copies, and actual PCM
+queue/staging ownership with hardware stubs. They do not verify live TLS, I2S
+timing, camera behavior, or firmware upload.
+
+---
+
 ## 😀 表情アセット
 
 現在の表情は `firmware/src/gif_assets.h` にコンパイル済みアセットとして含まれます。

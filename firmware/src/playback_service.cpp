@@ -9,6 +9,7 @@
 #include "audio_gate.h"
 #include "camera_service.h"
 #include "pcm_stream_service.h"
+#include "outbound_service.h"
 
 struct PlaybackRuntimeState {
     size_t lipSyncOffset = 0;
@@ -20,6 +21,8 @@ struct PlaybackRuntimeState {
     bool currentIsPcm = false;
     String pcmSessionId = "";
     bool pcmFinalSegment = false;
+    PcmOrigin pcmOrigin = PcmOrigin::DIRECT;
+    uint32_t pcmGeneration = 0;
 };
 
 static PlaybackRuntimeState s_playbackState;
@@ -53,6 +56,8 @@ struct PcmBuffer {
     size_t size;
     String sessionId;
     bool finalSegment;
+    PcmOrigin origin;
+    uint32_t generation;
 };
 
 struct DownloadedAudio {
@@ -73,6 +78,8 @@ static size_t s_stagedPcmSize = 0;
 static size_t s_stagedPcmCapacity = 0;
 static String s_stagedPcmSessionId = "";
 static long s_stagedPcmNextSeq = 0;
+static PcmOrigin s_stagedPcmOrigin = PcmOrigin::DIRECT;
+static uint32_t s_stagedPcmGeneration = 0;
 
 static void processAudioQueue();
 static void clearStagedPcmPlayback();
@@ -110,6 +117,45 @@ static void clearStagedPcmPlayback() {
     s_stagedPcmCapacity = 0;
     s_stagedPcmSessionId = "";
     s_stagedPcmNextSeq = 0;
+    s_stagedPcmGeneration = 0;
+}
+
+void clearQueuedPcmSession(const String& sessionId, PcmOrigin origin, uint32_t generation) {
+    if (sessionId.isEmpty()) return;
+    const size_t count = s_pcmQueue.size();
+    for (size_t i = 0; i < count; ++i) {
+        PcmBuffer buffer = s_pcmQueue.front();
+        s_pcmQueue.pop();
+        if (buffer.sessionId == sessionId && buffer.origin == origin && buffer.generation == generation) {
+            s_pcmQueuedBytes -= buffer.size;
+            free(buffer.data);
+        } else {
+            s_pcmQueue.push(buffer);
+        }
+    }
+    if (s_stagedPcmSessionId == sessionId && s_stagedPcmOrigin == origin &&
+        s_stagedPcmGeneration == generation) clearStagedPcmPlayback();
+}
+
+static bool pcmGenerationCurrent(PcmOrigin origin, uint32_t generation) {
+    return origin == PcmOrigin::DIRECT || isOutboundGenerationCurrent(generation);
+}
+
+void clearStaleOutboundPcm() {
+    const size_t count = s_pcmQueue.size();
+    for (size_t i = 0; i < count; ++i) {
+        PcmBuffer buffer = s_pcmQueue.front();
+        s_pcmQueue.pop();
+        if (!pcmGenerationCurrent(buffer.origin, buffer.generation)) {
+            s_pcmQueuedBytes -= buffer.size;
+            free(buffer.data);
+        } else {
+            s_pcmQueue.push(buffer);
+        }
+    }
+    if (s_stagedPcmData && !pcmGenerationCurrent(s_stagedPcmOrigin, s_stagedPcmGeneration)) {
+        clearStagedPcmPlayback();
+    }
 }
 
 static bool reserveStagedPcm(size_t requiredSize) {
@@ -144,12 +190,13 @@ static bool reserveStagedPcm(size_t requiredSize) {
     return true;
 }
 
-static bool enqueuePcmBuffer(uint8_t* pcmData, size_t pcmSize, const String& sessionId, bool finalSegment) {
+static bool enqueuePcmBuffer(uint8_t* pcmData, size_t pcmSize, const String& sessionId, bool finalSegment,
+                             PcmOrigin origin, uint32_t generation = 0) {
     if (pcmSize > MAX_QUEUED_PCM_BYTES - s_pcmQueuedBytes) {
         Serial.println("[PCM] Queue full");
         return false;
     }
-    s_pcmQueue.push({pcmData, pcmSize, sessionId, finalSegment});
+    s_pcmQueue.push({pcmData, pcmSize, sessionId, finalSegment, origin, generation});
     s_pcmQueuedBytes += pcmSize;
     Serial.printf("[PCM] Queued segment: session=%s bytes=%u queued=%u final=%s\n",
                   sessionId.c_str(), (unsigned)pcmSize,
@@ -395,7 +442,10 @@ static void checkPendingPlayback() {
     }
 }
 
-PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const String& sessionId, bool finalSegment) {
+PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const String& sessionId, bool finalSegment,
+                                 PcmOrigin origin, uint32_t generation) {
+    clearStaleOutboundPcm();
+    if (!pcmGenerationCurrent(origin, generation)) return PCM_PLAYBACK_INVALID;
     if (!pcmData || pcmSize == 0) {
         Serial.println("[PCM] Empty body");
         return PCM_PLAYBACK_INVALID;
@@ -413,7 +463,8 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
         || M5.Speaker.isPlaying()
     ) {
         if (s_playbackState.currentIsPcm && sessionId == s_playbackState.pcmSessionId &&
-            enqueuePcmBuffer(pcmData, pcmSize, sessionId, finalSegment)) {
+            origin == s_playbackState.pcmOrigin && generation == s_playbackState.pcmGeneration &&
+            enqueuePcmBuffer(pcmData, pcmSize, sessionId, finalSegment, origin, generation)) {
             return PCM_PLAYBACK_QUEUED;
         }
         Serial.printf("[PCM] Busy; refusing segment session=%s current=%s\n",
@@ -421,7 +472,8 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
         return PCM_PLAYBACK_BUSY;
     }
 
-    if (!s_pcmQueue.empty()) {
+    if (!s_pcmQueue.empty() && (s_pcmQueue.front().sessionId != sessionId || s_pcmQueue.front().origin != origin ||
+                              s_pcmQueue.front().generation != generation)) {
         clearQueuedPcmPlayback();
     }
 
@@ -460,6 +512,18 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
         audioGateLeave("pcm-play");
         return PCM_PLAYBACK_SPEAKER_FAILED;
     }
+    // Mic shutdown and speaker setup above can wait. Re-check the lease at the
+    // actual start boundary, not only when the segment was accepted/queued.
+    if (!pcmGenerationCurrent(origin, generation)) {
+        releaseCurrentPlaybackBuffer();
+        s_playbackState.pcmSize = 0;
+        M5.Speaker.end();
+        s_lastSpeakerEndMs = millis();
+        s_micResumeRequested = true;
+        setFaceExpression(FACE_IDLE);
+        audioGateLeave("pcm-play");
+        return PCM_PLAYBACK_SPEAKER_FAILED;
+    }
     bool ok = M5.Speaker.playRaw((const int16_t*)s_currentAudioData,
                                  s_currentAudioSize / sizeof(int16_t),
                                  PCM_SAMPLE_RATE,
@@ -486,6 +550,8 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
     s_playbackState.currentIsPcm = true;
     s_playbackState.pcmSessionId = sessionId;
     s_playbackState.pcmFinalSegment = finalSegment;
+    s_playbackState.pcmOrigin = origin;
+    s_playbackState.pcmGeneration = generation;
     s_playbackStartMs = millis();
     Serial.printf("[PCM] Speaker started: session=%s bytes=%u final=%s queue=%u @ 24kHz mono s16le\n",
                   sessionId.c_str(), (unsigned)pcmSize,
@@ -495,7 +561,10 @@ PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
     return PCM_PLAYBACK_OK;
 }
 
-PcmPlaybackResult stagePcmPlayback(uint8_t* pcmData, size_t pcmSize, const String& sessionId, long seq, bool finalSegment) {
+PcmPlaybackResult stagePcmPlayback(uint8_t* pcmData, size_t pcmSize, const String& sessionId, long seq, bool finalSegment,
+                                 PcmOrigin origin, uint32_t generation) {
+    clearStaleOutboundPcm();
+    if (!pcmGenerationCurrent(origin, generation)) return PCM_PLAYBACK_INVALID;
     if (!pcmData || pcmSize == 0) {
         Serial.println("[PCM] Empty staged segment");
         return PCM_PLAYBACK_INVALID;
@@ -508,13 +577,13 @@ PcmPlaybackResult stagePcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
         Serial.printf("[PCM] Invalid staged size: %u\n", (unsigned)pcmSize);
         return PCM_PLAYBACK_INVALID;
     }
-    if (s_isPlaying || isPcmStreamActive() || M5.Speaker.isPlaying() || s_downloadInFlight ||
-        !s_audioQueue.empty() || !s_pcmQueue.empty()) {
+    if (s_isPlaying || isPcmStreamActive() || isCameraSessionActive() || M5.Speaker.isPlaying() || s_downloadInFlight ||
+        !s_audioQueue.empty() || !s_pcmQueue.empty() || (s_stagedPcmSize && s_stagedPcmOrigin != origin)) {
         Serial.printf("[PCM] Busy; refusing staged segment session=%s\n", sessionId.c_str());
         return PCM_PLAYBACK_BUSY;
     }
 
-    const bool newSession = sessionId != s_stagedPcmSessionId;
+    const bool newSession = sessionId != s_stagedPcmSessionId || generation != s_stagedPcmGeneration;
     if (newSession) {
         if (seq != 0) {
             Serial.printf("[PCM] Staged seq mismatch for new session: got=%ld expected=0\n", seq);
@@ -522,6 +591,8 @@ PcmPlaybackResult stagePcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
         }
         clearStagedPcmPlayback();
         s_stagedPcmSessionId = sessionId;
+        s_stagedPcmOrigin = origin;
+        s_stagedPcmGeneration = generation;
     } else if (seq != s_stagedPcmNextSeq) {
         Serial.printf("[PCM] Staged seq mismatch: session=%s got=%ld expected=%ld\n",
                       sessionId.c_str(), seq, s_stagedPcmNextSeq);
@@ -564,7 +635,14 @@ PcmPlaybackResult stagePcmPlayback(uint8_t* pcmData, size_t pcmSize, const Strin
     s_stagedPcmSessionId = "";
     s_stagedPcmNextSeq = 0;
 
-    return startPcmPlayback(stagedData, stagedSize, stagedSession, true);
+    PcmPlaybackResult result = startPcmPlayback(stagedData, stagedSize, stagedSession, true, origin, generation);
+    if (result != PCM_PLAYBACK_OK && result != PCM_PLAYBACK_QUEUED && result != PCM_PLAYBACK_SPEAKER_FAILED) {
+        // The input segment was already consumed above, including if a TCP/UDP
+        // stream acquired the speaker between staging and this final start.
+        free(stagedData);
+        return PCM_PLAYBACK_SPEAKER_FAILED;
+    }
+    return result;
 }
 
 // ════════════════════════════════════════
@@ -626,6 +704,7 @@ PlaybackStatus getPlaybackStatus() {
 static void processAudioQueue() {
     if (s_isPlaying) return;
 
+    clearStaleOutboundPcm();
     setMouthOpen(0.0f);
 
     if (!s_pcmQueue.empty()) {
@@ -637,7 +716,9 @@ static void processAudioQueue() {
             nextPcm.data,
             nextPcm.size,
             nextPcm.sessionId,
-            nextPcm.finalSegment
+            nextPcm.finalSegment,
+            nextPcm.origin,
+            nextPcm.generation
         );
         if (result != PCM_PLAYBACK_OK) {
             if (result != PCM_PLAYBACK_SPEAKER_FAILED) {

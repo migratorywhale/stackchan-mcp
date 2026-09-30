@@ -17,6 +17,7 @@
 #include "audio_gate.h"
 #include "env_service.h"
 #include "camera_service.h"
+#include "outbound_service.h"
 
 void setup() {
     Serial.begin(115200);
@@ -69,6 +70,7 @@ void setup() {
     initPlayback();
     initPcmStreamService();
     initHttpServer();
+    initOutboundService();
 }
 
 void loop() {
@@ -83,6 +85,7 @@ void loop() {
     }
     updateTouchService();
     handleHttpServer();
+    serviceOutboundCommands();
     serviceWiFi();
     updateServoGesture();
 

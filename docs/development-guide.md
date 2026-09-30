@@ -335,6 +335,12 @@ It uses RMS thresholds to trigger recording and to end after silence.
 - `./start-voice-bridge.sh` runs the bridge in the background. Transcript
   events are appended to `STACKCHAN_VOICE_INBOX`, defaulting to
   `/tmp/stackchan_audio/voice_inbox.jsonl`.
+- Device routing is loaded at process startup, not hot-reloaded. After changing
+  the device address or a forwarding port, restart the actual owning launchd
+  job once and verify the running consumer's logs and a frontend receipt.
+  A fresh `--dry-run --once` probe does not prove that the existing bridge has
+  adopted the same configuration. See
+  `voice-bridge-stale-target-troubleshooting-2026-09-08.md`.
 - MCP clients can call `stackchan_voice_inbox` and
   `stackchan_voice_inbox_clear` to read or clear those background transcripts.
 - `scripts/stackchan_voice_upload_server.py` is the push-mode host receiver for
@@ -418,10 +424,21 @@ curl -sS -X POST "http://$STACKCHAN_IP/mode" \
 - `stackchan_status()`
 - `stackchan_playback_status()`
 
+Status timeouts mean availability is unconfirmed, not that the device is
+powered off. The curl transport preserves timeout errors instead of turning
+them into generic connection failures. Health reports expose `reachability`
+and `all_checks_ok`; one successful endpoint proves a response even if the
+other check fails. The synchronous device HTTP server can delay all endpoints
+during a snapshot, so changing probe paths alone cannot avoid that blocking.
+See `mcp-reachability-troubleshooting-2026-09-08.md`.
+
 Important environment variables:
 
 - `STACKCHAN_IP`: device IP address. Set this explicitly in `.env`.
 - `STACKCHAN_PORT`: device HTTP port, usually `80`.
+- `STACKCHAN_HTTP_PROBE_TIMEOUT`: deadline per manual status/health probe,
+  default `8` seconds, clamped to `1..30`. Background audio/playback polling
+  retains `STACKCHAN_HTTP_STATUS_TIMEOUT` (default `3` seconds).
 - `MAC_IP`: host IP used in generated audio URLs.
 - `AUDIO_SERVE_PORT`: local HTTP port used to serve generated WAV files.
 - `STACKCHAN_AUDIO_PUBLISH_TARGET`: optional rsync destination for deployments

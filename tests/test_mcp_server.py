@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import struct
+import subprocess
 import sys
 import threading
 import types
@@ -34,6 +35,7 @@ from mcp_server.server import BearerAuthMiddleware, ensure_http_auth_configured
 from mcp_server.stackchan_client import (
     PcmPlaybackError,
     StackchanClient,
+    curl_request,
     post_pcm_stream,
     post_pcm_tcp_stream,
     post_pcm_udp_stream,
@@ -236,10 +238,10 @@ def test_registered_mcp_tools_return_json_serializable_content(monkeypatch, tmp_
     class FakeClient:
         base_url = "http://192.0.2.20:80"
 
-        def audio_status(self):
+        def audio_status(self, *, timeout=None):
             return {"ready": False, "mode": "mcp"}
 
-        def playback_status(self):
+        def playback_status(self, *, timeout=None):
             return {
                 "kind": "idle",
                 "playing": False,
@@ -663,7 +665,9 @@ def test_voice_bridge_reads_touch_source_from_audio_status():
     assert recording_source_from_result({"status": {}}) == "voice"
 
 
-def test_voice_bridge_touch_recording_bypasses_wake_word_and_uses_touch_prefix(monkeypatch):
+@pytest.mark.parametrize("transport", ["direct", "relay"])
+def test_voice_bridge_touch_recording_bypasses_wake_word_and_uses_touch_prefix(monkeypatch, transport):
+    monkeypatch.setenv("STACKCHAN_TRANSPORT", transport)
     forwarded = {}
     tracking_signals = []
 
@@ -706,7 +710,7 @@ def test_voice_bridge_touch_recording_bypasses_wake_word_and_uses_touch_prefix(m
     assert forwarded["prompt_prefix"] == "[Stack-chan语音输入] （触摸）"
     assert forwarded["wake_words"] == ()
     assert forwarded["source"] == "stackchan_touch"
-    assert tracking_signals == ["touch_voice"]
+    assert tracking_signals == (["touch_voice"] if transport == "direct" else [])
 
 
 def test_touch_pet_tracker_emits_only_new_counts_and_rebaselines_after_restart():
@@ -2085,10 +2089,10 @@ def test_health_check_is_non_destructive():
     class FakeClient:
         base_url = "http://192.0.2.20:80"
 
-        def audio_status(self):
+        def audio_status(self, *, timeout=None):
             return {"ready": True, "mode": "mcp"}
 
-        def playback_status(self):
+        def playback_status(self, *, timeout=None):
             return {"playing": False, "kind": "idle"}
 
         def get_audio(self):
@@ -2213,7 +2217,7 @@ def test_stackchan_sense_omits_nan_and_reports_missing_or_failed_reads():
 
 def test_playback_status_formats_runtime_diagnostics():
     class FakeClient:
-        def playback_status(self):
+        def playback_status(self, *, timeout=None):
             return {
                 "kind": "pcm",
                 "playing": True,
@@ -2234,6 +2238,102 @@ def test_playback_status_formats_runtime_diagnostics():
     assert "kind=pcm" in result
     assert "pcm_queue=2/98304B" in result
     assert "psram=654321" in result
+
+
+@pytest.mark.parametrize("returncode,error_cls", [(28, requests.Timeout), (7, requests.ConnectionError)])
+def test_curl_transport_preserves_timeout_vs_connection_failure(monkeypatch, returncode, error_cls):
+    monkeypatch.setattr(
+        "mcp_server.stackchan_client.subprocess.run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            returncode=returncode, stdout=b"\n000", stderr=b"probe failed"
+        ),
+    )
+    with pytest.raises(error_cls):
+        curl_request("get", "http://192.0.2.20/audio/status", timeout=8)
+
+
+def test_curl_process_deadline_is_a_timeout(monkeypatch):
+    def expired(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("curl", 10)
+
+    monkeypatch.setattr("mcp_server.stackchan_client.subprocess.run", expired)
+    with pytest.raises(requests.Timeout):
+        curl_request("get", "http://192.0.2.20/audio/status", timeout=8)
+
+
+@pytest.mark.parametrize("tool_name", ["stackchan_status", "stackchan_playback_status", "stackchan_see", "stackchan_sense"])
+@pytest.mark.parametrize("error_cls", [requests.Timeout, requests.ConnectionError])
+def test_device_request_failure_does_not_assert_offline(tool_name, error_cls):
+    class FakeClient:
+        def fail(self, **_kwargs):
+            raise error_cls("test failure")
+
+        audio_status = playback_status = snapshot = read_env = fail
+
+    mcp = FakeFastMCP()
+    register_tools(mcp, FakeClient(), make_config(), lambda **_kwargs: None)
+    result = mcp.tools[tool_name]()
+    assert "Availability unconfirmed" in result
+    assert "offline" not in result.lower()
+    assert ("timed out" in result) == (error_cls is requests.Timeout)
+
+
+@pytest.mark.parametrize("audio_fails,playback_fails", [(True, False), (False, True), (True, True)])
+def test_health_reports_partial_responses_without_inventing_offline(audio_fails, playback_fails):
+    calls = []
+
+    class FakeClient:
+        base_url = "http://192.0.2.20:80"
+
+        def audio_status(self, *, timeout):
+            calls.append(timeout)
+            if audio_fails:
+                raise requests.Timeout("audio status timed out")
+            return {"ready": False, "mode": "mcp"}
+
+        def playback_status(self, *, timeout):
+            calls.append(timeout)
+            if playback_fails:
+                raise requests.Timeout("playback status timed out")
+            return {"playing": False}
+
+    mcp = FakeFastMCP()
+    register_tools(mcp, FakeClient(), make_config(), lambda **_kwargs: None)
+    report = json.loads(mcp.tools["stackchan_health"]())
+    responded = not (audio_fails and playback_fails)
+    assert report["ok"] is responded
+    assert report["device"]["reachability"] == ("responding" if responded else "unconfirmed")
+    assert report["device"]["all_checks_ok"] is False
+    assert calls == [8.0, 8.0]
+
+
+@pytest.mark.parametrize("method,endpoint", [("audio_status", "/audio/status"), ("playback_status", "/playback/status")])
+def test_manual_probe_timeout_does_not_change_polling_timeout(monkeypatch, method, endpoint):
+    calls = []
+
+    def fake_request(verb, url, *, timeout):
+        calls.append((verb, url, timeout))
+        return types.SimpleNamespace(json=lambda: {"ready": False})
+
+    client = StackchanClient(make_config())
+    monkeypatch.setattr(client, "request", fake_request)
+    getattr(client, method)()
+    getattr(client, method)(timeout=client.config.http_probe_timeout)
+    assert calls == [
+        ("get", "http://192.0.2.20:80" + endpoint, 3.0),
+        ("get", "http://192.0.2.20:80" + endpoint, 8.0),
+    ]
+
+
+@pytest.mark.parametrize("configured,expected", [(None, 8.0), ("12", 12.0), ("0", 1.0), ("60", 30.0)])
+def test_manual_probe_timeout_config_is_separate_and_bounded(monkeypatch, configured, expected):
+    monkeypatch.setattr("mcp_server.stackchan_config.load_dotenv", lambda: None)
+    monkeypatch.delenv("STACKCHAN_HTTP_PROBE_TIMEOUT", raising=False)
+    if configured is not None:
+        monkeypatch.setenv("STACKCHAN_HTTP_PROBE_TIMEOUT", configured)
+    config = load_config()
+    assert config.http_probe_timeout == expected
+    assert config_summary(config)["timeouts"]["http_probe"] == expected
 
 
 def test_can_stream_pcm_requires_fish_credentials():
