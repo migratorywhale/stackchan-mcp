@@ -63,8 +63,12 @@ def _booth_mode_report(enabled: bool | None, status: Any, error: str | None = No
 def can_stream_pcm(config: StackchanConfig) -> bool:
     return (
         config.audio_mode != "wav"
-        and config.tts_engine == "fish-audio"
-        and bool(config.fish_audio_key)
+        and (
+            (config.tts_engine == "fish-audio" and bool(config.fish_audio_key))
+            or (config.tts_engine == "elevenlabs" and bool(
+                (config.elevenlabs_api_key and config.elevenlabs_voice_id) or config.fish_audio_key
+            ))
+        )
     )
 
 
@@ -177,28 +181,43 @@ def _probe_direct_device(client: Any, config: StackchanConfig, device: dict[str,
 def post_preferred_pcm_stream(
     client: StackchanClient, text: str, lang: str, config: StackchanConfig
 ) -> dict:
+    prepared_pcm = None
+    engine = config.tts_engine
+    synthesis_started = time.perf_counter()
+    if engine == "elevenlabs":
+        prepared_pcm, engine = audio_processing.prepare_elevenlabs_pcm(text, lang, config)
+    synthesis_ms = timing_ms(synthesis_started)
+
     def pcm_chunks():
+        if prepared_pcm is not None:
+            return (prepared_pcm[offset:offset + 4096] for offset in range(0, len(prepared_pcm), 4096))
         return audio_processing.iter_fish_pcm_stream(text, lang, config)
+
+    def report(result: dict) -> dict:
+        result["tts_engine"] = engine
+        if prepared_pcm is not None:
+            result.setdefault("timing_ms", {})["tts_prepare"] = synthesis_ms
+        return result
 
     if config.transport == "relay" or config.pcm_transport == "staged":
         result = post_pcm_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing)
         result.setdefault("transport", "relay" if config.transport == "relay" else "staged")
-        return result
+        return report(result)
 
     if config.pcm_transport in {"auto", "tcp"}:
         try:
-            return post_pcm_tcp_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing)
+            return report(post_pcm_tcp_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing))
         except PcmPlaybackError as exc:
             if exc.started or config.pcm_transport == "tcp":
                 raise
             logger.warning("Falling back from TCP PCM to staged PCM: %s", exc)
 
     if config.pcm_transport == "udp":
-        return post_pcm_udp_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing)
+        return report(post_pcm_udp_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing))
 
     result = post_pcm_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing)
     result.setdefault("transport", "staged")
-    return result
+    return report(result)
 
 
 def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
@@ -227,6 +246,7 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                     if result.get("success"):
                         diag = (
                             f" transport={result.get('transport', 'staged')}"
+                            f" tts={result.get('tts_engine', config.tts_engine)}"
                             f" session={result.get('session', '?')}"
                             f" segments={result.get('segments', '?')}"
                             f" bytes={result.get('total_bytes', '?')}"
@@ -244,7 +264,8 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                                 "stackchan.audio.path": "pcm",
                                 "stackchan.audio.mode": config.audio_mode,
                                 "stackchan.pcm.transport": result.get("transport", "staged"),
-                                "stackchan.tts.engine": config.tts_engine,
+                                "stackchan.tts.engine": result.get("tts_engine", config.tts_engine),
+                                "stackchan.tts.requested_engine": config.tts_engine,
                                 "stackchan.lang": lang,
                                 "stackchan.text.length": len(text),
                                 "stackchan.pcm.segments": result.get("segments"),
@@ -255,9 +276,12 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                         if result.get("saved_pcm"):
                             diag += f" saved={result['saved_pcm']}"
                         logger.info("PCM speech accepted: lang=%s%s%s", lang, diag, format_timing_ms(timings))
-                        return format_speech_confirmation(text)
+                        confirmation = format_speech_confirmation(text)
+                        if config.tts_engine == "elevenlabs" and result.get("tts_engine") == "fish-audio":
+                            confirmation += " (Fish fallback)"
+                        return confirmation
                     pcm_fallback_reason = f"PCM play returned {result}"
-                    if config.audio_mode == "pcm" or config.transport == "relay":
+                    if config.audio_mode == "pcm" or config.transport == "relay" or config.tts_engine == "elevenlabs":
                         return f"❌ PCM play failed: {result}"
                     logger.warning("Falling back to WAV TTS: %s", pcm_fallback_reason)
                 except PcmPlaybackError as exc:
@@ -265,13 +289,13 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                         logger.error("PCM playback failed after audio started: %s", exc)
                         return f"❌ PCM playback failed after audio started: {exc}"
                     pcm_fallback_reason = str(exc)
-                    if config.audio_mode == "pcm" or config.transport == "relay":
+                    if config.audio_mode == "pcm" or config.transport == "relay" or config.tts_engine == "elevenlabs":
                         logger.error("PCM playback failed in forced PCM mode: %s", exc)
                         return f"❌ PCM playback failed: {exc}"
                     logger.warning("Falling back to WAV TTS after PCM failure: %s", exc)
                 except Exception as exc:
                     pcm_fallback_reason = str(exc)
-                    if config.audio_mode == "pcm" or config.transport == "relay":
+                    if config.audio_mode == "pcm" or config.transport == "relay" or config.tts_engine == "elevenlabs":
                         logger.error("PCM playback failed in forced PCM mode: %s", exc)
                         return f"❌ PCM playback failed: {exc}"
                     logger.warning("Falling back to WAV TTS after PCM failure: %s", exc)
@@ -289,7 +313,7 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                     },
                 )
             elif config.audio_mode == "pcm" and config.transport != "relay":
-                return "❌ PCM playback unavailable: TTS_ENGINE must be fish-audio and FISH_AUDIO_KEY must be set"
+                return "❌ PCM playback unavailable: configure fish-audio or elevenlabs TTS credentials"
 
             wav_timing = {}
             t0 = time.perf_counter()
@@ -349,7 +373,7 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                             f"started_ms={status.get('started_ms', '?')} "
                             f"deadline_ms={status.get('deadline_ms', '?')}"
                         )
-                engine = "Fish Audio" if (config.tts_engine == "fish-audio" and config.fish_audio_key) else "edge-tts"
+                engine = config.tts_engine
                 fallback_note = " (PCM fallback)" if pcm_fallback_reason else ""
                 wav_timing["say_total"] = timing_ms(say_started)
                 emit_event(

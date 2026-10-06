@@ -1399,6 +1399,9 @@ def test_iter_fish_pcm_stream_requests_pcm_chunks(monkeypatch):
     request_kwargs = {}
 
     class FakeResponse:
+        def close(self):
+            return None
+
         def raise_for_status(self):
             return None
 

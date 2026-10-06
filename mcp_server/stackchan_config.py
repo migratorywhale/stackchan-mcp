@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import shlex
 import tempfile
@@ -52,6 +53,22 @@ def env_float_any(names: tuple[str, ...], default: float) -> float:
         if name in os.environ:
             return env_float(name, default)
     return default
+
+
+def env_unit_float(name: str, default: float) -> float:
+    value = env_float(name, default)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        logger.warning("Invalid %s; expected a finite value in [0, 1]; using %.2f", name, default)
+        return default
+    return value
+
+
+def env_positive_float(name: str, default: float) -> float:
+    value = env_float(name, default)
+    if not math.isfinite(value) or value <= 0.0:
+        logger.warning("Invalid %s; expected a finite positive value; using %.2f", name, default)
+        return default
+    return value
 
 
 def env_int(name: str, default: int) -> int:
@@ -129,6 +146,12 @@ class StackchanConfig:
     transport: str = "direct"
     relay_url: str = "http://127.0.0.1:8766"
     relay_token: str = field(default="", repr=False)
+    elevenlabs_api_key: str = field(default="", repr=False)
+    elevenlabs_voice_id: str = field(default="", repr=False)
+    elevenlabs_model_id: str = "eleven_v4"
+    elevenlabs_stability: float = 0.70
+    elevenlabs_similarity: float = 0.75
+    elevenlabs_tts_timeout: float = 30.0
 
 
 VALID_AUDIO_MODES = {"auto", "pcm", "wav"}
@@ -203,6 +226,11 @@ def config_summary(config: StackchanConfig) -> dict[str, Any]:
             "fish_audio_model_zh_configured": bool(config.fish_audio_model_zh),
             "fish_audio_model_en_configured": bool(config.fish_audio_model_en),
             "fish_stream_chunk_bytes": config.fish_stream_chunk_bytes,
+            "elevenlabs_api_key_configured": bool(config.elevenlabs_api_key),
+            "elevenlabs_voice_id_configured": bool(config.elevenlabs_voice_id),
+            "elevenlabs_model_id": config.elevenlabs_model_id,
+            "elevenlabs_stability": config.elevenlabs_stability,
+            "elevenlabs_similarity": config.elevenlabs_similarity,
         },
         "mcp_auth_token_configured": bool(config.mcp_auth_token),
         "timeouts": {
@@ -218,6 +246,7 @@ def config_summary(config: StackchanConfig) -> dict[str, Any]:
             "pcm_segment_post": config.pcm_segment_post_timeout,
             "fish_tts": config.fish_tts_timeout,
             "fish_asr": config.fish_asr_timeout,
+            "elevenlabs_tts": config.elevenlabs_tts_timeout,
         },
     }
 
@@ -380,6 +409,12 @@ def load_config() -> StackchanConfig:
         fish_audio_key=os.environ.get("FISH_AUDIO_KEY", ""),
         fish_audio_model_zh=os.environ.get("FISH_AUDIO_MODEL_ZH", ""),
         fish_audio_model_en=os.environ.get("FISH_AUDIO_MODEL_EN", ""),
+        elevenlabs_api_key=os.environ.get("ELEVENLABS_API_KEY", ""),
+        elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID", ""),
+        elevenlabs_model_id=os.environ.get("ELEVENLABS_MODEL_ID", "eleven_v4"),
+        elevenlabs_stability=env_unit_float("ELEVENLABS_STABILITY", 0.70),
+        elevenlabs_similarity=env_unit_float("ELEVENLABS_SIMILARITY", 0.75),
+        elevenlabs_tts_timeout=env_positive_float("STACKCHAN_ELEVENLABS_TTS_TIMEOUT", 30.0),
         mcp_auth_token=os.environ.get("STACKCHAN_MCP_AUTH_TOKEN", ""),
         audio_publish_target=os.environ.get("STACKCHAN_AUDIO_PUBLISH_TARGET", ""),
         audio_publish_timeout=env_float_any(

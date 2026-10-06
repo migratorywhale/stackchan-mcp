@@ -57,6 +57,42 @@ export FISH_AUDIO_KEY="your_key_here"  # Fish Audio API key (TTS + ASR)
 
 Or copy `.env.example` to `.env` and edit there — `.env` is gitignored.
 
+#### TTS configuration
+
+`TTS_ENGINE` defaults to `fish-audio`; `edge-tts` is also supported. To opt in to
+ElevenLabs TTS, set `TTS_ENGINE=elevenlabs`, `ELEVENLABS_API_KEY`, and
+`ELEVENLABS_VOICE_ID`. Keep the existing Fish credentials and voice models
+configured for fallback; ASR configuration is unchanged.
+
+| Variable | Default | Validation |
+|----------|---------|------------|
+| `ELEVENLABS_MODEL_ID` | `eleven_v4` | Model identifier |
+| `ELEVENLABS_STABILITY` | `0.70` | Finite number in `[0, 1]` |
+| `ELEVENLABS_SIMILARITY` | `0.75` | Finite number in `[0, 1]` |
+| `STACKCHAN_ELEVENLABS_TTS_TIMEOUT` | `30.0` | Finite positive seconds |
+
+Invalid numeric settings log a warning and use the defaults above. Configuration
+diagnostics expose only configured booleans for the ElevenLabs API key and voice
+ID, never their values.
+
+The ElevenLabs path requests `pcm_24000` from the official
+[stream endpoint](https://elevenlabs.io/docs/api-reference/text-to-speech/stream).
+It buffers and validates the complete utterance before handing audio to the
+existing PCM transport. On synthesis failure (including a partial stream), it
+discards that audio and synthesizes once with Fish, also before playback. A
+missing Fish key or a failed fallback returns an error; it does not silently
+select Edge. TCP-to-staged transport fallback reuses the completed PCM without
+another paid synthesis. Device playback failures never trigger a new TTS call
+in ElevenLabs mode.
+
+This adds whole-utterance synthesis latency in exchange for avoiding mixed or
+repeated half-sentences. The existing `STACKCHAN_MAX_PCM_PAYLOAD_BYTES` cap also
+bounds the buffer (default 2 MiB, about 43 seconds of audio). Timeout settings
+bound connect/read inactivity, with an elapsed-time deadline checked between
+chunks; they are not a strict wall-clock cancellation timer. Fish ASR remains
+unchanged. Switching `TTS_ENGINE` back to `fish-audio` and reloading the MCP
+service rolls back voice selection without touching firmware or chat sessions.
+
 ### 4. Connect your MCP client
 
 Add this block to your MCP client config (Claude Desktop, Cursor, etc.):
