@@ -209,11 +209,36 @@ def test_wav_mode_wraps_the_same_pcm(monkeypatch, tmp_path):
     monkeypatch.setattr(audio_processing, "AUDIO_DIR", tmp_path)
     pcm = b"\x01\x00" * 100
     monkeypatch.setattr(audio_processing, "prepare_elevenlabs_pcm", Mock(return_value=(pcm, "elevenlabs")))
-    path = audio_processing.generate_tts("hello", "zh", config(audio_mode="wav"))
+    details = {}
+    path = audio_processing.generate_tts("hello", "zh", config(audio_mode="wav"), details=details)
+    assert details == {"engine": "elevenlabs"}
     audio_processing.validate_playback_wav(path)
     with wave.open(str(path), "rb") as wav:
         assert wav.readframes(100) == pcm
         assert (wav.getframerate(), wav.getnchannels(), wav.getsampwidth()) == (24000, 1, 2)
+
+
+@pytest.mark.parametrize("engine", ["elevenlabs", "fish-audio"])
+def test_wav_relay_reports_actual_provider(monkeypatch, tmp_path, engine):
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    monkeypatch.setattr(audio_processing, "TEMP_AUDIO_DIR", temp)
+    monkeypatch.setattr(audio_processing, "AUDIO_DIR", tmp_path)
+    pcm = b"\x01\x00" * 100
+    prepare = Mock(return_value=(pcm, engine))
+    monkeypatch.setattr(audio_processing, "prepare_elevenlabs_pcm", prepare)
+
+    def accept(_client, chunks, *_args):
+        assert b"".join(chunks) == pcm
+        return {"success": True}
+
+    monkeypatch.setattr(mcp_tools, "post_pcm_stream", accept)
+    mcp = FakeFastMCP()
+    mcp_tools.register_tools(mcp, SimpleNamespace(), config(transport="relay", audio_mode="wav"), Mock())
+    confirmation = mcp.tools["stackchan_say"]("hello")
+    assert "Stack-chan is saying" in confirmation
+    assert ("Fish fallback" in confirmation) is (engine == "fish-audio")
+    prepare.assert_called_once()
 
 
 @pytest.mark.parametrize("settings,expected", [

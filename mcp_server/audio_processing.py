@@ -181,9 +181,13 @@ def tts_fish(text: str, lang: str, config: StackchanConfig) -> Path:
         temp_wav_path.unlink(missing_ok=True)
 
 
-def generate_tts(text: str, lang: str, config: StackchanConfig) -> Path:
+def generate_tts(
+    text: str, lang: str, config: StackchanConfig, *, details: dict[str, str] | None = None
+) -> Path:
     if config.tts_engine == "elevenlabs":
-        pcm, _engine = prepare_elevenlabs_pcm(text, lang, config)
+        pcm, engine = prepare_elevenlabs_pcm(text, lang, config)
+        if details is not None:
+            details["engine"] = engine
         stem = new_tts_stem()
         temp_wav_path = TEMP_AUDIO_DIR / f"{stem}.wav"
         try:

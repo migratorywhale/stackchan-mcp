@@ -316,8 +316,15 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                 return "❌ PCM playback unavailable: configure fish-audio or elevenlabs TTS credentials"
 
             wav_timing = {}
+            tts_details: dict[str, str] = {}
             t0 = time.perf_counter()
-            wav_path = audio_processing.generate_tts(text, lang, config)
+            if config.tts_engine == "elevenlabs":
+                wav_path = audio_processing.generate_tts(text, lang, config, details=tts_details)
+            else:
+                wav_path = audio_processing.generate_tts(text, lang, config)
+            engine = tts_details.get("engine", config.tts_engine)
+            provider_fallback = config.tts_engine == "elevenlabs" and engine == "fish-audio"
+            confirmation = format_speech_confirmation(text) + (" (Fish fallback)" if provider_fallback else "")
             wav_timing["tts"] = timing_ms(t0)
             t0 = time.perf_counter()
             audio_processing.validate_playback_wav(wav_path)
@@ -327,7 +334,8 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                     client, audio_processing.iter_wav_pcm(wav_path), AUDIO_DIR, audio_processing
                 )
                 if result.get("success"):
-                    return format_speech_confirmation(text)
+                    logger.info("Relay WAV speech accepted: tts=%s lang=%s", engine, lang)
+                    return confirmation
                 return f"PCM play failed: {result}"
             if config.audio_publish_target:
                 t0 = time.perf_counter()
@@ -373,7 +381,6 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                             f"started_ms={status.get('started_ms', '?')} "
                             f"deadline_ms={status.get('deadline_ms', '?')}"
                         )
-                engine = config.tts_engine
                 fallback_note = " (PCM fallback)" if pcm_fallback_reason else ""
                 wav_timing["say_total"] = timing_ms(say_started)
                 emit_event(
@@ -383,7 +390,8 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                     attributes={
                         "stackchan.audio.path": "wav",
                         "stackchan.audio.mode": config.audio_mode,
-                        "stackchan.tts.engine": config.tts_engine,
+                        "stackchan.tts.engine": engine,
+                        "stackchan.tts.requested_engine": config.tts_engine,
                         "stackchan.lang": lang,
                         "stackchan.text.length": len(text),
                         "stackchan.fallback.used": bool(pcm_fallback_reason),
@@ -398,7 +406,7 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                     fallback_note,
                     format_timing_ms(wav_timing),
                 )
-                return format_speech_confirmation(text)
+                return confirmation
             emit_event(
                 "stackchan.say.failed",
                 body="Playback request failed",
