@@ -99,6 +99,7 @@ class Relay:
         self.settings = settings
         self.peer: Peer | None = None
         self.admitted: Peer | None = None
+        self.booth_reservation: object | None = None
 
     def online(self) -> bool:
         return bool(self.peer and self.peer.ready
@@ -197,7 +198,9 @@ class Relay:
         peer = self.peer
         return JSONResponse({
             "online": self.online(),
-            "busy": bool(self.admitted or (peer and peer.pending)),
+            "busy": bool(self.admitted or (peer and peer.pending) or self.booth_reservation),
+            "pending_path": peer.pending.path if peer and peer.pending else None,
+            "booth_priority_reserved": self.booth_reservation is not None,
             "last_seen_age": round(time.monotonic() - peer.last_seen, 3) if peer else None,
         })
 
@@ -210,9 +213,16 @@ class Relay:
         peer = self.peer
         if not peer or not self.online():
             return JSONResponse({"error": "Device outbound channel is offline"}, status_code=503)
-        if self.admitted or peer.pending:
+        booth_write = request.method == "POST" and path == "/booth"
+        busy_at_arrival = bool(self.admitted or peer.pending)
+        if self.booth_reservation or (not booth_write and busy_at_arrival):
             return JSONResponse({"error": "Device channel busy; command was not queued"}, status_code=409)
-        self.admitted = peer
+        reservation = object() if booth_write else None
+        owns_admission = not booth_write
+        if booth_write:
+            self.booth_reservation = reservation
+        else:
+            self.admitted = peer
         deadline = time.monotonic() + self.settings.command_timeout
         try:
             raw = bytearray()
@@ -239,6 +249,15 @@ class Relay:
             query = dict(request.query_params)
             if len(str(query)) > 1024:
                 raise ChannelError(400, "Query too large")
+            if booth_write:
+                # One explicit capture-stop may wait ahead of polling, but never
+                # interrupt or replay the request already on the device channel.
+                if set(body) == {"enabled"} and body["enabled"] is True:
+                    await self.wait_for_booth_slot(request, peer, deadline)
+                elif busy_at_arrival or self.admitted or peer.pending:
+                    raise ChannelError(409, "Device channel busy; command was not queued")
+                self.admitted = peer
+                owns_admission = True
             return await self.dispatch(peer, deadline, request.method, path, query, body,
                                        bytes(raw) if binary else b"")
         except (ValueError, UnicodeError):
@@ -246,7 +265,22 @@ class Relay:
         except ChannelError as exc:
             return JSONResponse({"error": exc.message}, status_code=exc.status)
         finally:
-            self.admitted = None
+            if owns_admission:
+                self.admitted = None
+            if reservation is not None and self.booth_reservation is reservation:
+                self.booth_reservation = None
+
+    async def wait_for_booth_slot(self, request: Request, peer: Peer, deadline: float) -> None:
+        while True:
+            if self.peer is not peer or not self.online():
+                raise ChannelError(503, "Device changed while waiting; booth command was not sent")
+            if time.monotonic() >= deadline:
+                raise ChannelError(408, "Booth admission deadline elapsed; command was not sent")
+            if await request.is_disconnected():
+                raise ChannelError(499, "Booth caller disconnected; command was not sent")
+            if not self.admitted and not peer.pending:
+                return
+            await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
 
     async def dispatch(self, peer: Peer, deadline: float, method: str, path: str, query: dict[str, str],
                        body: dict[str, Any], binary: bytes) -> Response:

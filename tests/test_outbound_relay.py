@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -291,4 +292,179 @@ def test_connection_change_while_uploading_does_not_dispatch_on_new_peer():
         assert response.status_code == 503
         assert relay.peer.pending is None
         assert relay.admitted is None
+    asyncio.run(run())
+
+
+def wait_for_booth_reservation(client):
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        status = client.get("/relay/status", headers=HEADERS).json()
+        if status["booth_priority_reserved"]:
+            return status
+        time.sleep(0.001)
+    pytest.fail("Booth priority was not reserved")
+
+
+@pytest.mark.parametrize("path", ["/audio/status", "/audio"])
+def test_booth_enable_waits_for_complete_reply_then_precedes_new_polling(client, path):
+    with client.websocket_connect("/stackchan/ws", headers=DEVICE_HEADERS) as ws:
+        ready(client, ws)
+        with ThreadPoolExecutor() as pool:
+            first = pool.submit(client.get, "/device" + path, headers=HEADERS)
+            active = ws.receive_json()
+            booth = pool.submit(client.post, "/device/booth", headers=HEADERS, json={"enabled": True})
+            status = wait_for_booth_reservation(client)
+            assert status["pending_path"] == path
+            assert status["busy"]
+            for _ in range(3):
+                assert client.get("/device/audio/status", headers=HEADERS).status_code == 409
+            assert client.post("/device/booth", headers=HEADERS, json={"enabled": True}).status_code == 409
+            assert client.post("/device/nod", headers=HEADERS).status_code == 409
+            assert not booth.done()
+            if path == "/audio":
+                wav = b"RIFF" + b"\x00" * 256040
+                ws.send_json({"id": active["id"], "status": 200,
+                              "binary_size": len(wav), "content_type": "audio/wav"})
+                assert not booth.done()
+                assert client.get("/relay/status", headers=HEADERS).json()["pending_path"] == "/audio"
+                ws.send_bytes(b"SCB1" + active["id"].encode() + wav)
+                assert first.result(timeout=1).content == wav
+            else:
+                ws.send_json({"id": active["id"], "status": 200, "body": {"ready": False}})
+                assert first.result(timeout=1).status_code == 200
+            command = ws.receive_json()
+            assert command["path"] == "/booth"
+            assert command["body"] == {"enabled": True}
+            assert command["id"] != active["id"]
+            ws.send_json({"id": command["id"], "status": 200, "body": {"success": True}})
+            assert booth.result(timeout=1).status_code == 200
+        status = client.get("/relay/status", headers=HEADERS).json()
+        assert not status["busy"]
+        assert not status["booth_priority_reserved"]
+
+
+@pytest.mark.parametrize("body", [{"enabled": False}, {"enabled": 1}, {"enabled": "true"},
+                                  {"enabled": True, "extra": 1}, {}])
+def test_only_exact_enable_receives_priority(client, body):
+    with client.websocket_connect("/stackchan/ws", headers=DEVICE_HEADERS) as ws:
+        ready(client, ws)
+        with ThreadPoolExecutor() as pool:
+            first = pool.submit(client.get, "/device/audio/status", headers=HEADERS)
+            active = ws.receive_json()
+            assert client.post("/device/booth", headers=HEADERS, json=body).status_code == 409
+            status = client.get("/relay/status", headers=HEADERS).json()
+            assert not status["booth_priority_reserved"]
+            assert status["busy"] and status["pending_path"] == "/audio/status"
+            ws.send_json({"id": active["id"], "status": 200, "body": {"ready": False}})
+            assert first.result(timeout=1).status_code == 200
+
+
+@pytest.mark.parametrize("body", [{"enabled": False}, {"enabled": 1}, {"enabled": "true"},
+                                  {"enabled": True, "extra": 1}, {}])
+def test_nonpriority_booth_arriving_busy_cannot_dispatch_after_slow_upload(body):
+    async def run():
+        relay = Relay(RelaySettings(DEVICE, CONTROL))
+        peer = Peer(None, ready=True)
+        relay.peer = peer
+        relay.admitted = peer
+
+        async def receive():
+            await asyncio.sleep(0)
+            relay.admitted = None
+            return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+        scope = {"type": "http", "method": "POST", "path_params": {"path": "booth"},
+                 "query_string": b"",
+                 "headers": [(b"authorization", f"Bearer {CONTROL}".encode())]}
+        response = await relay.command(Request(scope, receive=receive))
+        assert response.status_code == 409
+        assert peer.pending is None
+        assert relay.admitted is None
+        assert relay.booth_reservation is None
+    asyncio.run(run())
+
+
+def test_booth_priority_finishes_active_pcm_frame_but_rejects_later_segments(client):
+    with client.websocket_connect("/stackchan/ws", headers=DEVICE_HEADERS) as ws:
+        ready(client, ws)
+        with ThreadPoolExecutor() as pool:
+            pcm = b"\x00\x01" * 2400
+            first = pool.submit(client.post, "/device/play/pcm?session=test&seq=0&final=0",
+                                headers={**HEADERS, "Content-Type": "audio/x-raw"}, content=pcm)
+            active = ws.receive_json()
+            assert ws.receive_bytes() == b"SCB1" + active["id"].encode() + pcm
+            booth = pool.submit(client.post, "/device/booth", headers=HEADERS, json={"enabled": True})
+            assert wait_for_booth_reservation(client)["pending_path"] == "/play/pcm"
+            ws.send_json({"id": active["id"], "status": 200, "body": {"queued": True}})
+            assert first.result(timeout=1).status_code == 200
+            command = ws.receive_json()
+            assert command["path"] == "/booth"
+            next_segment = client.post("/device/play/pcm?session=test&seq=1&final=1",
+                                       headers={**HEADERS, "Content-Type": "audio/x-raw"}, content=pcm)
+            assert next_segment.status_code == 409
+            assert "not queued" in next_segment.json()["error"]
+            ws.send_json({"id": command["id"], "status": 200, "body": {"success": True}})
+            assert booth.result(timeout=1).status_code == 200
+        assert not client.get("/relay/status", headers=HEADERS).json()["busy"]
+
+
+def test_booth_reservation_is_not_carried_to_reconnected_device(client):
+    with client.websocket_connect("/stackchan/ws", headers=DEVICE_HEADERS) as old:
+        ready(client, old)
+        with ThreadPoolExecutor() as pool:
+            first = pool.submit(client.get, "/device/audio/status", headers=HEADERS)
+            old.receive_json()
+            booth = pool.submit(client.post, "/device/booth", headers=HEADERS, json={"enabled": True})
+            wait_for_booth_reservation(client)
+            with client.websocket_connect("/stackchan/ws", headers=DEVICE_HEADERS) as new:
+                ready(client, new)
+                assert first.result(timeout=1).status_code == 503
+                result = booth.result(timeout=1)
+                assert result.status_code == 503
+                assert "not sent" in result.json()["error"]
+                assert not client.get("/relay/status", headers=HEADERS).json()["booth_priority_reserved"]
+                next_call = pool.submit(client.get, "/device/booth", headers=HEADERS)
+                command = new.receive_json()
+                assert command["method"] == "GET"
+                new.send_json({"id": command["id"], "status": 200, "body": {"booth_mode": False}})
+                assert next_call.result(timeout=1).status_code == 200
+
+
+@pytest.mark.parametrize("end", ["timeout", "cancel", "disconnect", "bad_body"])
+def test_abandoned_booth_reservation_never_releases_active_owner(end):
+    async def run():
+        relay = Relay(RelaySettings(DEVICE, CONTROL, command_timeout=0.05))
+        peer = Peer(None, ready=True)
+        relay.peer = peer
+        relay.admitted = peer
+        read = False
+
+        async def receive():
+            nonlocal read
+            if not read:
+                read = True
+                return {"type": "http.request", "body": b"[" if end == "bad_body" else b'{"enabled":true}',
+                        "more_body": False}
+            if end == "disconnect":
+                return {"type": "http.disconnect"}
+            await asyncio.Event().wait()
+
+        scope = {"type": "http", "method": "POST", "path_params": {"path": "booth"},
+                 "query_string": b"",
+                 "headers": [(b"authorization", f"Bearer {CONTROL}".encode())]}
+        task = asyncio.create_task(relay.command(Request(scope, receive=receive)))
+        if end == "cancel":
+            await asyncio.sleep(0)
+            assert relay.booth_reservation is not None
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            response = await task
+            assert response.status_code == {"timeout": 408, "disconnect": 499, "bad_body": 400}[end]
+            if end != "bad_body":
+                assert "not sent" in json.loads(response.body)["error"]
+        assert relay.admitted is peer
+        assert relay.booth_reservation is None
+        assert peer.pending is None
     asyncio.run(run())

@@ -133,3 +133,43 @@ def test_mcp_client_through_real_relay(wire_server, monkeypatch, tmp_path):
                                 "body": {"success": True, "staged": seq == 0}}))
         assert future.result(timeout=3)["success"]
         assert bytes(received) == pcm
+
+
+def test_real_channel_booth_priority_and_disconnected_waiter(wire_server):
+    base, url = wire_server
+    with (
+        connect(url, additional_headers={"Authorization": f"Bearer {DEVICE_TOKEN}"}) as ws,
+        httpx.Client(base_url=base, headers=CONTROL_HEADERS, timeout=4) as http,
+        ThreadPoolExecutor() as pool,
+    ):
+        ws.send(json.dumps({"type": "hello", "v": 1}))
+        deadline = time.monotonic() + 2
+        while not http.get("/relay/status").json()["online"]:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        first = pool.submit(http.get, "/device/audio/status")
+        active = json.loads(ws.recv(timeout=1))
+        abandoned = pool.submit(http.post, "/device/booth", json={"enabled": True}, timeout=0.1)
+        with pytest.raises(httpx.ReadTimeout):
+            abandoned.result(timeout=1)
+        deadline = time.monotonic() + 1
+        while http.get("/relay/status").json()["booth_priority_reserved"]:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        assert http.get("/relay/status").json()["pending_path"] == "/audio/status"
+        booth = pool.submit(http.post, "/device/booth", json={"enabled": True})
+        deadline = time.monotonic() + 1
+        while not http.get("/relay/status").json()["booth_priority_reserved"]:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        assert http.get("/device/audio/status").status_code == 409
+        ws.send(json.dumps({"id": active["id"], "status": 200, "body": {"ready": False}}))
+        assert first.result(timeout=1).status_code == 200
+        command = json.loads(ws.recv(timeout=1))
+        assert command["path"] == "/booth"
+        assert command["body"] == {"enabled": True}
+        ws.send(json.dumps({"id": command["id"], "status": 200, "body": {"success": True}}))
+        assert booth.result(timeout=1).status_code == 200
+        assert not http.get("/relay/status").json()["busy"]
+        with pytest.raises(TimeoutError):
+            ws.recv(timeout=0.05)

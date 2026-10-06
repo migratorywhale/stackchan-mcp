@@ -25,6 +25,38 @@ write. A lost response does not prove the setting was unchanged. Query it before
 deciding what to do next. Unsupported old firmware returns an error, not a fake
 successful mute.
 
+### Outbound Priority Admission
+
+The mini relay reserves at most one pending explicit `POST /booth` enable
+(`{"enabled":true}`). While the current request finishes, new polling and other
+commands receive the usual not-queued 409, so polling cannot win the next slot
+repeatedly. The complete current response, including any audio binary payload,
+must arrive before booth enable is sent. This is priority admission, not
+preemption of an in-flight transfer or a firmware command queue.
+
+Priority is per request, not per multi-request utterance. With legacy segmented
+PCM playback, the current segment finishes but later segments can receive 409
+and the speech client may abort the rest of that utterance. No segment is
+automatically retried. The current deployment uses whole-utterance WAV playback.
+
+Upload, waiting and execution share the existing 20-second command deadline.
+A waiting enable expires or fails when its caller disconnects or its device
+connection changes. It is never persisted or replayed after reconnect. There
+is no new retry of a dispatched write. Queries and disabling booth mode do
+not wait for priority, and an offline device still cannot receive the command.
+Non-enable bodies that arrived busy remain rejected even if the active request
+finishes while that body uploads.
+
+Authenticated relay status now includes `pending_path` and
+`booth_priority_reserved` to distinguish transport contention from microphone
+state. Only the fixed route path is exposed, not request bodies or audio.
+
+The current booth firmware already accepts an enable while recording and
+cancels local capture when it executes. A transport reservation cannot resolve
+an offline link or force a blocked firmware handler to finish; the existing
+partial-transition and persistence checks still apply. This priority change
+requires only an idle reload of the mini outbound relay, not a firmware flash.
+
 ## Persistence And Failure Behavior
 
 The setting is stored in device NVS (`sc_booth/enabled`); it survives reboot and
