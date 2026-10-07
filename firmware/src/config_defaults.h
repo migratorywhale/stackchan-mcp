@@ -77,4 +77,13 @@
 #define DISPLAY_BRIGHTNESS 70
 #endif
 
+// Touch: when set to 1, the firmware still detects taps, holds and swipes and
+// still publishes them on /touch/status, but it no longer changes the face or
+// moves the servos on its own. The host agent becomes the only thing that
+// decides what a gesture means. Default 0 keeps the built-in petting reaction.
+// Override from firmware/src/config.h for a given build.
+#ifndef TOUCH_AGENT_DECIDES
+#define TOUCH_AGENT_DECIDES 0
+#endif
+
 #endif
