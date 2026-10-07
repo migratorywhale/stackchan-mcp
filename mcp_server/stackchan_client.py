@@ -6,6 +6,7 @@ import subprocess
 import time
 from contextlib import suppress
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 
@@ -55,6 +56,7 @@ def curl_request(
     json_body: dict | None = None,
     data: bytes | None = None,
     headers: dict[str, str] | None = None,
+    disable_config: bool = False,
 ) -> CurlResponse:
     """Call a local-network device through Apple's system curl.
 
@@ -74,6 +76,9 @@ def curl_request(
         "--write-out",
         "\n%{http_code}",
     ]
+    if disable_config:
+        # Must be curl's first option to prevent config-defined redirects/retries.
+        command.insert(1, "--disable")
     request_headers = dict(headers or {})
     payload = data
     if json_body is not None:
@@ -93,10 +98,14 @@ def curl_request(
             check=False,
             timeout=max(1.0, timeout + 2.0),
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        raise requests.Timeout("system curl exceeded its request deadline") from exc
+    except OSError as exc:
         raise requests.ConnectionError(f"system curl failed: {exc}") from exc
     if completed.returncode != 0:
         error = completed.stderr.decode("utf-8", errors="replace").strip()
+        if completed.returncode == 28:
+            raise requests.Timeout(error or "system curl request timed out")
         raise requests.ConnectionError(error or f"system curl exited {completed.returncode}")
 
     body, separator, status = completed.stdout.rpartition(b"\n")
@@ -108,10 +117,52 @@ def curl_request(
 class StackchanClient:
     def __init__(self, config: StackchanConfig):
         self.config = config
+        if config.transport not in {"direct", "relay"}:
+            raise ValueError("STACKCHAN_TRANSPORT must be direct or relay")
+        if config.transport == "relay":
+            relay = urlsplit(config.relay_url)
+            if (
+                relay.scheme != "http"
+                or relay.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or relay.username is not None
+                or relay.password is not None
+                or relay.path not in {"", "/"}
+                or relay.query
+                or relay.fragment
+            ):
+                raise ValueError("STACKCHAN_RELAY_URL must be a loopback HTTP origin without credentials")
+            if not config.relay_token.strip():
+                raise ValueError("STACKCHAN_RELAY_TOKEN is required in relay mode")
 
     @property
     def base_url(self) -> str:
+        if self.config.transport == "relay":
+            return f"{self.config.relay_url.rstrip('/')}/device"
         return f"http://{self.config.stackchan_ip}:{self.config.stackchan_port}"
+
+    def relay_status(self, *, timeout: float | None = None) -> dict:
+        result = self._relay_request(
+            "get",
+            f"{self.config.relay_url.rstrip('/')}/relay/status",
+            timeout=self.config.http_probe_timeout if timeout is None else timeout,
+        ).json()
+        if not isinstance(result, dict) or not isinstance(result.get("online"), bool):
+            raise ValueError("Relay returned invalid online status; availability unconfirmed")
+        return result
+
+    def _relay_request(self, method: str, url: str, *, timeout: float, **kwargs):
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers["Authorization"] = f"Bearer {self.config.relay_token}"
+        # A redirect, proxy, or retry could leak credentials or replay a device action.
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.request(
+                method, url, timeout=timeout, headers=headers, allow_redirects=False, **kwargs
+            )
+        if 300 <= response.status_code < 400:
+            raise requests.HTTPError("Relay redirects are not allowed", response=response)
+        response.raise_for_status()
+        return response
 
     def request(
         self,
@@ -122,7 +173,17 @@ class StackchanClient:
         json_body: dict | None = None,
         data: bytes | None = None,
         headers: dict[str, str] | None = None,
+        allow_redirects: bool = True,
     ):
+        if self.config.transport == "relay":
+            if not url.startswith(f"{self.base_url}/"):
+                raise ValueError("Relay requests must target the configured /device/ path")
+            if method.lower() not in {"get", "post"}:
+                raise ValueError("Relay protocol currently supports only GET and POST")
+            return self._relay_request(
+                # Let the relay's 20s command deadline resolve before giving up locally.
+                method, url, timeout=max(timeout, 22.0), json=json_body, data=data, headers=headers
+            )
         if os.environ.get("STACKCHAN_HTTP_TRANSPORT", "requests").lower() == "curl":
             return curl_request(
                 method,
@@ -131,9 +192,12 @@ class StackchanClient:
                 json_body=json_body,
                 data=data,
                 headers=headers,
+                disable_config=not allow_redirects,
             )
         request_method = getattr(requests, method.lower())
         kwargs: dict[str, Any] = {"timeout": timeout}
+        if not allow_redirects:
+            kwargs["allow_redirects"] = False
         if json_body is not None:
             kwargs["json"] = json_body
         if data is not None:
@@ -143,6 +207,8 @@ class StackchanClient:
         return request_method(url, **kwargs)
 
     def play(self, wav_url: str) -> dict:
+        if self.config.transport == "relay":
+            raise ValueError("Relay playback requires PCM upload, not a device-fetched WAV URL")
         return self.request(
             "post",
             f"{self.base_url}/play",
@@ -186,23 +252,54 @@ class StackchanClient:
         return result
 
     def get_audio(self) -> bytes | None:
-        resp = self.request("get", f"{self.base_url}/audio", timeout=self.config.http_audio_timeout)
+        try:
+            resp = self.request("get", f"{self.base_url}/audio", timeout=self.config.http_audio_timeout)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
         if resp.status_code == 200:
             return resp.content
         return None
 
-    def audio_status(self) -> dict:
+    def audio_status(self, *, timeout: float | None = None) -> dict:
         return self.request(
             "get",
             f"{self.base_url}/audio/status",
-            timeout=self.config.http_status_timeout,
+            timeout=self.config.http_status_timeout if timeout is None else timeout,
         ).json()
 
-    def playback_status(self) -> dict:
+    def get_booth_mode(self) -> dict:
+        """Read booth status without changing capture or consuming recorded audio."""
+        return self._booth_mode_request("get")
+
+    def set_booth_mode(self, enabled: bool) -> dict:
+        """Explicitly set durable outing mode once; never toggle or retry a write."""
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a JSON boolean")
+        return self._booth_mode_request("post", {"enabled": enabled})
+
+    def _booth_mode_request(self, method: str, body: dict | None = None) -> dict:
+        response = self.request(
+            method,
+            f"{self.base_url}/booth",
+            json_body=body,
+            timeout=(self.config.http_status_timeout if method == "get"
+                     else self.config.http_command_timeout),
+            allow_redirects=False,
+        )
+        if not 200 <= response.status_code < 300:
+            raise requests.HTTPError(
+                f"Outing mode HTTP {response.status_code}; status unconfirmed",
+                response=response,
+            )
+        return response.json()
+
+    def playback_status(self, *, timeout: float | None = None) -> dict:
         return self.request(
             "get",
             f"{self.base_url}/playback/status",
-            timeout=self.config.http_status_timeout,
+            timeout=self.config.http_status_timeout if timeout is None else timeout,
         ).json()
 
     def start_audio_session(self) -> dict:
@@ -343,6 +440,8 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
     last_segment_tail_sample = None
     saved_pcm_path = audio_dir / f"diag_{session_id}.pcm" if client.config.save_pcm else None
     saved_pcm_file = saved_pcm_path.open("wb") if saved_pcm_path is not None else None
+    relay = client.config.transport == "relay"
+    segment_bytes = min(client.config.pcm_segment_bytes, 48 * 1024) if relay else client.config.pcm_segment_bytes
 
     def post_segment(segment: bytes, *, final: bool) -> dict:
         nonlocal declicked_samples, first_segment_ms, last_segment_tail_sample, segment_index, started
@@ -422,7 +521,7 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
                 continue
             elapsed = time.perf_counter() - started_at
             if (
-                not started
+                (segment_index == 0 if relay else not started)
                 and client.config.pcm_first_segment_timeout > 0
                 and elapsed > client.config.pcm_first_segment_timeout
             ):
@@ -437,10 +536,8 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
             )
             limited_samples += limited
             buffer.extend(conditioned_chunk)
-            while len(buffer) >= client.config.pcm_segment_bytes:
-                segment_size = client.config.pcm_segment_bytes - (
-                    client.config.pcm_segment_bytes % PCM_SAMPLE_WIDTH
-                )
+            while len(buffer) >= segment_bytes:
+                segment_size = segment_bytes - (segment_bytes % PCM_SAMPLE_WIDTH)
                 segment_size = audio_processing.choose_pcm_segment_cut(
                     buffer,
                     segment_size,
@@ -497,6 +594,9 @@ def post_pcm_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_proces
 
 def post_pcm_tcp_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_processing) -> dict:
     import uuid
+
+    if client.config.transport == "relay":
+        raise PcmPlaybackError("Direct TCP PCM is disabled in relay mode", started=False)
 
     started_at = time.perf_counter()
     session_id = uuid.uuid4().hex
@@ -685,6 +785,9 @@ def _fade_pcm_tail_to_silence(buffer: bytearray, real_len: int, samples: int) ->
 
 def post_pcm_udp_stream(client: StackchanClient, pcm_chunks, audio_dir, audio_processing) -> dict:
     import uuid
+
+    if client.config.transport == "relay":
+        raise PcmPlaybackError("Direct UDP PCM is disabled in relay mode", started=False)
 
     started_at = time.perf_counter()
     diagnostic_id = uuid.uuid4().hex

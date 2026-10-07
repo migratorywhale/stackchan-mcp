@@ -1,8 +1,9 @@
 import logging
+import math
 import os
 import shlex
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,22 @@ def env_float_any(names: tuple[str, ...], default: float) -> float:
         if name in os.environ:
             return env_float(name, default)
     return default
+
+
+def env_unit_float(name: str, default: float) -> float:
+    value = env_float(name, default)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        logger.warning("Invalid %s; expected a finite value in [0, 1]; using %.2f", name, default)
+        return default
+    return value
+
+
+def env_positive_float(name: str, default: float) -> float:
+    value = env_float(name, default)
+    if not math.isfinite(value) or value <= 0.0:
+        logger.warning("Invalid %s; expected a finite positive value; using %.2f", name, default)
+        return default
+    return value
 
 
 def env_int(name: str, default: int) -> int:
@@ -125,6 +142,16 @@ class StackchanConfig:
     audio_publish_target: str = ""
     audio_publish_timeout: float = 20.0
     audio_publish_attempts: int = 2
+    http_probe_timeout: float = 8.0
+    transport: str = "direct"
+    relay_url: str = "http://127.0.0.1:8766"
+    relay_token: str = field(default="", repr=False)
+    elevenlabs_api_key: str = field(default="", repr=False)
+    elevenlabs_voice_id: str = field(default="", repr=False)
+    elevenlabs_model_id: str = "eleven_v4"
+    elevenlabs_stability: float = 0.70
+    elevenlabs_similarity: float = 0.75
+    elevenlabs_tts_timeout: float = 30.0
 
 
 VALID_AUDIO_MODES = {"auto", "pcm", "wav"}
@@ -152,9 +179,15 @@ EDGE_VOICES = {
 def config_summary(config: StackchanConfig) -> dict[str, Any]:
     return {
         "stackchan": {
+            "transport": config.transport,
             "ip": config.stackchan_ip,
             "port": config.stackchan_port,
-            "base_url": f"http://{config.stackchan_ip}:{config.stackchan_port}",
+            "base_url": (
+                f"{config.relay_url.rstrip('/')}/device"
+                if config.transport == "relay"
+                else f"http://{config.stackchan_ip}:{config.stackchan_port}"
+            ),
+            "relay_token_configured": bool(config.relay_token),
         },
         "audio": {
             "mac_ip": config.mac_ip,
@@ -193,12 +226,18 @@ def config_summary(config: StackchanConfig) -> dict[str, Any]:
             "fish_audio_model_zh_configured": bool(config.fish_audio_model_zh),
             "fish_audio_model_en_configured": bool(config.fish_audio_model_en),
             "fish_stream_chunk_bytes": config.fish_stream_chunk_bytes,
+            "elevenlabs_api_key_configured": bool(config.elevenlabs_api_key),
+            "elevenlabs_voice_id_configured": bool(config.elevenlabs_voice_id),
+            "elevenlabs_model_id": config.elevenlabs_model_id,
+            "elevenlabs_stability": config.elevenlabs_stability,
+            "elevenlabs_similarity": config.elevenlabs_similarity,
         },
         "mcp_auth_token_configured": bool(config.mcp_auth_token),
         "timeouts": {
             "http_play": config.http_play_timeout,
             "http_audio": config.http_audio_timeout,
             "http_status": config.http_status_timeout,
+            "http_probe": config.http_probe_timeout,
             "http_command": config.http_command_timeout,
             "http_snapshot_warmup": config.http_snapshot_warmup_timeout,
             "http_snapshot": config.http_snapshot_timeout,
@@ -207,12 +246,60 @@ def config_summary(config: StackchanConfig) -> dict[str, Any]:
             "pcm_segment_post": config.pcm_segment_post_timeout,
             "fish_tts": config.fish_tts_timeout,
             "fish_asr": config.fish_asr_timeout,
+            "elevenlabs_tts": config.elevenlabs_tts_timeout,
         },
     }
 
 
+
+def _local_ip_toward(host: str, port: int = 80) -> str | None:
+    """Return the local interface IP that routes to host:port (no packets sent)."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.2)
+            s.connect((host, port))
+            ip = s.getsockname()[0]
+            return ip if ip and not ip.startswith("0.") else None
+    except OSError:
+        return None
+
+
+def resolve_mac_ip(value: str | None, stackchan_ip: str, stackchan_port: int = 80) -> str:
+    """Resolve MAC_IP for audio URLs the device fetches from this host.
+
+    - "auto" / empty → detect the interface that routes to the device
+      (2026/9/22: router re-leased the host a new address overnight and the
+      device kept fetching from a dead address; explicit IPs go stale).
+    - explicit → kept as-is (relocate/travel mode needs it), but warn when it is
+      not the interface that routes to the device.
+    """
+    raw = (value or "").strip()
+    detected = _local_ip_toward(stackchan_ip, stackchan_port)
+    if raw == "" or raw.lower() == "auto":
+        if detected:
+            return detected
+        logger.warning("MAC_IP=auto but could not detect a route to %s; using 127.0.0.1", stackchan_ip)
+        return "127.0.0.1"
+    if detected and detected != raw and raw != "127.0.0.1":
+        logger.warning(
+            "MAC_IP=%s but the interface routing to %s is %s; device audio fetch may fail (set MAC_IP=auto)",
+            raw, stackchan_ip, detected,
+        )
+    return raw
+
 def load_config() -> StackchanConfig:
     load_dotenv()
+
+    transport = os.environ.get("STACKCHAN_TRANSPORT", "direct").strip().lower()
+    if transport not in {"direct", "relay"}:
+        raise ValueError("STACKCHAN_TRANSPORT must be direct or relay")
+    relay_token = os.environ.get("STACKCHAN_RELAY_TOKEN", "")
+    if transport == "relay" and (token_file := os.environ.get("STACKCHAN_RELAY_TOKEN_FILE")):
+        try:
+            relay_token = Path(token_file).read_text().strip()
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("Could not read STACKCHAN_RELAY_TOKEN_FILE") from exc
 
     audio_mode = os.environ.get("STACKCHAN_AUDIO_MODE", "wav").lower()
     if audio_mode not in VALID_AUDIO_MODES:
@@ -251,7 +338,11 @@ def load_config() -> StackchanConfig:
     return StackchanConfig(
         stackchan_ip=os.environ.get("STACKCHAN_IP", "127.0.0.1"),
         stackchan_port=int(os.environ.get("STACKCHAN_PORT", 80)),
-        mac_ip=os.environ.get("MAC_IP", "127.0.0.1"),
+        mac_ip=resolve_mac_ip(
+            os.environ.get("MAC_IP", "auto"),
+            os.environ.get("STACKCHAN_IP", "127.0.0.1"),
+            int(os.environ.get("STACKCHAN_PORT", 80)),
+        ) if transport == "direct" else "127.0.0.1",
         audio_serve_port=int(os.environ.get("AUDIO_SERVE_PORT", 5060)),
         tts_engine=os.environ.get("TTS_ENGINE", "fish-audio"),
         audio_mode=audio_mode,
@@ -285,6 +376,7 @@ def load_config() -> StackchanConfig:
         http_play_timeout=env_float_any(("STACKCHAN_HTTP_PLAY_TIMEOUT", "STACKCHAN_HTTP_PLAY_TIMEOUT_SEC"), 5.0),
         http_audio_timeout=env_float_any(("STACKCHAN_HTTP_AUDIO_TIMEOUT", "STACKCHAN_HTTP_AUDIO_TIMEOUT_SEC"), 10.0),
         http_status_timeout=env_float_any(("STACKCHAN_HTTP_STATUS_TIMEOUT", "STACKCHAN_HTTP_STATUS_TIMEOUT_SEC"), 3.0),
+        http_probe_timeout=max(1.0, min(env_float("STACKCHAN_HTTP_PROBE_TIMEOUT", 8.0), 30.0)),
         http_command_timeout=env_float_any(("STACKCHAN_HTTP_COMMAND_TIMEOUT", "STACKCHAN_HTTP_COMMAND_TIMEOUT_SEC"), 5.0),
         http_snapshot_warmup_timeout=env_float_any(
             ("STACKCHAN_HTTP_SNAPSHOT_WARMUP_TIMEOUT", "STACKCHAN_HTTP_SNAPSHOT_WARMUP_TIMEOUT_SEC"),
@@ -317,6 +409,12 @@ def load_config() -> StackchanConfig:
         fish_audio_key=os.environ.get("FISH_AUDIO_KEY", ""),
         fish_audio_model_zh=os.environ.get("FISH_AUDIO_MODEL_ZH", ""),
         fish_audio_model_en=os.environ.get("FISH_AUDIO_MODEL_EN", ""),
+        elevenlabs_api_key=os.environ.get("ELEVENLABS_API_KEY", ""),
+        elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID", ""),
+        elevenlabs_model_id=os.environ.get("ELEVENLABS_MODEL_ID", "eleven_v4"),
+        elevenlabs_stability=env_unit_float("ELEVENLABS_STABILITY", 0.70),
+        elevenlabs_similarity=env_unit_float("ELEVENLABS_SIMILARITY", 0.75),
+        elevenlabs_tts_timeout=env_positive_float("STACKCHAN_ELEVENLABS_TTS_TIMEOUT", 30.0),
         mcp_auth_token=os.environ.get("STACKCHAN_MCP_AUTH_TOKEN", ""),
         audio_publish_target=os.environ.get("STACKCHAN_AUDIO_PUBLISH_TARGET", ""),
         audio_publish_timeout=env_float_any(
@@ -328,4 +426,7 @@ def load_config() -> StackchanConfig:
             1,
             3,
         ),
+        transport=transport,
+        relay_url=os.environ.get("STACKCHAN_RELAY_URL", "http://127.0.0.1:8766").rstrip("/"),
+        relay_token=relay_token,
     )

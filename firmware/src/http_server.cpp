@@ -15,8 +15,71 @@
 #include "pcm_stream_service.h"
 #include "env_service.h"
 #include "touch_service.h"
+#include "firmware_command.h"
+#include "booth_mode.h"
 
-static WebServer server(80);
+static WebServer httpServer(80);
+
+// Both transports execute these handlers on the main loop. Network callbacks
+// never enter this adapter or the hardware services it calls.
+class CommandContext {
+public:
+    FirmwareCommand* outbound = nullptr;
+
+    bool hasArg(const String& name) {
+        if (!outbound) return httpServer.hasArg(name);
+        return name == "plain" ? ::outbound::hasRequestBody(outbound->request)
+                               : !outbound->request["query"][name].isUnbound();
+    }
+    String arg(const String& name) {
+        if (!outbound) return httpServer.arg(name);
+        if (name == "plain") {
+            String body;
+            if (hasArg(name)) serializeJson(outbound->request["body"], body);
+            return body;
+        }
+        return String(outbound->request["query"][name] | "");
+    }
+    String header(const char* name) {
+        return outbound ? String("") : httpServer.header(name);
+    }
+    String uri() {
+        return outbound ? String(outbound->request["path"] | "") : httpServer.uri();
+    }
+    void send(int status, const char* contentType, const String& body) {
+        if (!outbound) {
+            httpServer.send(status, contentType, body);
+            return;
+        }
+        outbound->status = status;
+        outbound->body = body;
+        outbound->contentType = contentType;
+    }
+    bool send_P(int status, const char* contentType, const char* data, size_t size) {
+        if (!outbound) {
+            httpServer.send_P(status, contentType, data, size);
+            return true;
+        }
+        uint8_t* frame = nullptr;
+        const auto result = ::outbound::copyBinaryResponse(outbound->info.id, contentType,
+            reinterpret_cast<const uint8_t*>(data), size, &frame, ps_malloc);
+        if (result == ::outbound::BinaryCopyResult::TOO_LARGE) {
+            send(413, "application/json", "{\"success\":false,\"error\":\"binary response too large\"}");
+            return false;
+        }
+        if (result != ::outbound::BinaryCopyResult::OK) {
+            send(503, "application/json", "{\"success\":false,\"error\":\"response allocation failed\"}");
+            return false;
+        }
+        outbound->binaryFrame = frame;
+        outbound->binarySize = size;
+        outbound->status = status;
+        outbound->contentType = contentType;
+        return true;
+    }
+};
+
+static CommandContext server;
 
 static String   s_pcm_diag_session = "";
 static long     s_pcm_diag_next_seq = 0;
@@ -76,7 +139,7 @@ static String headerOrArg(const char* headerName, const char* argName) {
 // body: raw 24kHz mono s16le PCM
 // ────────────────────────────────────────────
 static void handlePlayPcm() {
-    const char* uploadError = consumePcmUploadError();
+    const char* uploadError = server.outbound ? nullptr : consumePcmUploadError();
     if (uploadError) {
         String body = "{\"success\":false,\"error\":\"";
         body += uploadError;
@@ -85,12 +148,18 @@ static void handlePlayPcm() {
         server.send(400, "application/json", body);
         return;
     }
-    if (!hasPcmUploadBody()) {
+    if (server.outbound ? !server.outbound->pcmData : !hasPcmUploadBody()) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"no pcm body\"}");
         return;
     }
 
-    PcmUploadBuffer upload = takePcmUploadBody();
+    PcmUploadBuffer upload;
+    if (server.outbound) {
+        upload = {server.outbound->pcmData, server.outbound->info.binarySize};
+        server.outbound->pcmData = nullptr;
+    } else {
+        upload = takePcmUploadBody();
+    }
     const size_t pcmSize = upload.size;
     String sessionId = headerOrArg(PCM_HEADER_SESSION, "session");
     String seqArg = headerOrArg(PCM_HEADER_SEQ, "seq");
@@ -116,13 +185,16 @@ static void handlePlayPcm() {
 
     if (!seqValid) {
         free(pcmData);
-        clearQueuedPcmPlayback();
+        if (server.outbound) clearQueuedPcmSession(sessionId, PcmOrigin::OUTBOUND, server.outbound->generation);
+        else clearQueuedPcmPlayback();
         server.send(409, "application/json", "{\"success\":false,\"error\":\"pcm seq invalid\"}");
         return;
     }
+    const PcmOrigin origin = server.outbound ? PcmOrigin::OUTBOUND : PcmOrigin::DIRECT;
+    const uint32_t generation = server.outbound ? server.outbound->generation : 0;
     PcmPlaybackResult result = stagedMode
-        ? stagePcmPlayback(pcmData, pcmSize, sessionId, seq, finalSegment)
-        : startPcmPlayback(pcmData, pcmSize, sessionId, finalSegment);
+        ? stagePcmPlayback(pcmData, pcmSize, sessionId, seq, finalSegment, origin, generation)
+        : startPcmPlayback(pcmData, pcmSize, sessionId, finalSegment, origin, generation);
     if (result != PCM_PLAYBACK_OK && result != PCM_PLAYBACK_QUEUED) {
         if (result != PCM_PLAYBACK_SPEAKER_FAILED) {
             free(pcmData);
@@ -165,7 +237,7 @@ static void handlePlayPcm() {
 }
 
 static void handlePlayPcmRaw() {
-    HTTPRaw& raw = server.raw();
+    HTTPRaw& raw = httpServer.raw();
 
     if (raw.status == RAW_START) {
         handlePcmUploadRaw(PCM_UPLOAD_RAW_START, nullptr, 0);
@@ -215,13 +287,42 @@ static void handleMode() {
 }
 
 // ────────────────────────────────────────────
-// GET /audio/status
-// → Recording state plus the monotonic touch-petting event counter.
+// GET/POST /booth: persistent microphone capture policy.
 // ────────────────────────────────────────────
+static void sendBoothStatus(bool success = true) {
+    if (isBoothMode() && !isMicrophoneCaptureStopped()) success = false;
+    JsonDocument doc;
+    doc["success"] = success;
+    doc["booth_mode"] = isBoothMode();
+    doc["persisted"] = isBoothModePersisted();
+    doc["capture_allowed"] = !isBoothMode();
+    doc["mic_running"] = M5.Mic.isRunning();
+    if (!success) doc["error"] = "Booth mode transition incomplete; inspect status before retrying";
+    String body;
+    serializeJson(doc, body);
+    server.send(success ? 200 : 503, "application/json", body);
+}
+
+static void handleBoothStatus() { sendBoothStatus(); }
+
+static void handleBoothSet() {
+    JsonDocument doc;
+    if (!server.hasArg("plain") ||
+        deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok ||
+        !doc.is<JsonObject>() || doc.size() != 1 || !doc["enabled"].is<bool>()) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"expected only enabled: boolean\"}");
+        return;
+    }
+    sendBoothStatus(setBoothMode(doc["enabled"].as<bool>()));
+}
+
+// GET /audio/status: recording state and monotonic host pet-notification counter.
 static void handleAudioStatus() {
     TouchRuntimeStatus touch = getTouchRuntimeStatus();
     String body = "{\"ready\":";
-    body += hasLastRecording() ? "true" : "false";
+    body += !isBoothMode() && hasLastRecording() ? "true" : "false";
+    body += ",\"booth_mode\":";
+    body += isBoothMode() ? "true" : "false";
     body += ",\"mode\":\"mcp\",\"source\":\"";
     body += recordingSourceName(getLastRecordingSource());
     body += "\",\"touch_pet_count\":";
@@ -235,6 +336,10 @@ static void handleAudioStatus() {
 // → 録音済みWAVをそのまま返す（1回読んだらクリア）
 // ────────────────────────────────────────────
 static void handleAudio() {
+    if (isBoothMode()) {
+        server.send(409, "application/json", "{\"success\":false,\"error\":\"microphone capture blocked by booth mode\"}");
+        return;
+    }
     RecordingSnapshot recording = getLastRecording();
     if (!recording.data || recording.size == 0) {
         server.send(404, "application/json", "{\"success\":false,\"error\":\"no audio\"}");
@@ -242,10 +347,11 @@ static void handleAudio() {
     }
 
     Serial.printf("[HTTP] GET /audio -> %u bytes\n", (unsigned)recording.size);
-    server.send_P(200, "audio/wav", (const char*)recording.data, recording.size);
-
-    // 読んだらクリア（1回限り）
-    markLastRecordingConsumed();
+    // Failed outbound copies must leave the recording available. Once copied,
+    // the response owns its bytes independently; delivery is never replayed.
+    if (server.send_P(200, "audio/wav", (const char*)recording.data, recording.size)) {
+        markLastRecordingConsumed();
+    }
 }
 
 // ────────────────────────────────────────────
@@ -373,6 +479,7 @@ static void handleTouchStatus() {
     TouchRuntimeStatus status = getTouchRuntimeStatus();
     JsonDocument doc;
     doc["available"] = status.available;
+    doc["booth_mode"] = isBoothMode();
     doc["suspended"] = status.suspended;
     doc["petting_active"] = status.pettingActive;
     JsonArray intensities = doc["intensities"].to<JsonArray>();
@@ -450,6 +557,8 @@ static void handlePlaybackStatus() {
     doc["started_ms"] = playback.startedMs;
     doc["deadline_ms"] = playback.deadlineMs;
     doc["mic_state"] = getMicStateName();
+    doc["booth_mode"] = isBoothMode();
+    doc["booth_mode_persisted"] = isBoothModePersisted();
     doc["mic_enabled"] = mic.enabled;
     doc["mic_running"] = mic.running;
     doc["mic_last_rms"] = mic.lastRms;
@@ -458,6 +567,8 @@ static void handlePlaybackStatus() {
     doc["mic_frame_count"] = mic.frameCount;
     doc["mic_record_failure_count"] = mic.recordFailureCount;
     doc["mic_trigger_count"] = mic.triggerCount;
+    doc["mic_touch_trigger_count"] = mic.touchTriggerCount;
+    doc["mic_recording_source"] = mic.recordingSource;
     doc["mic_stored_recording_count"] = mic.storedRecordingCount;
     doc["mic_resume_requested"] = playback.micResumeRequested;
     doc["servo_ready"] = servo.ready;
@@ -711,33 +822,76 @@ void initHttpServer() {
         PCM_HEADER_FINAL,
         PCM_HEADER_MODE,
     };
-    server.collectHeaders(headerKeys, sizeof(headerKeys) / sizeof(headerKeys[0]));
-    server.on("/play",         HTTP_POST, handlePlay);
-    server.on("/play/pcm",     HTTP_POST, handlePlayPcm, handlePlayPcmRaw);
-    server.on("/audio/session", HTTP_POST, handleAudioSessionStart);
-    server.on(UriBraces("/audio/session/{}"), HTTP_DELETE, handleAudioSessionStop);
-    server.on("/mode",         HTTP_POST, handleMode);
-    server.on("/audio/status", HTTP_GET,  handleAudioStatus);
-    server.on("/audio",        HTTP_GET,  handleAudio);
-    server.on("/move",         HTTP_POST, handleMove);
-    server.on("/home",         HTTP_POST, handleHome);
-    server.on("/nod",          HTTP_POST, handleNod);
-    server.on("/shake",        HTTP_POST, handleShake);
-    server.on("/servo/status", HTTP_GET,  handleServoStatus);
-    server.on("/touch/status", HTTP_GET,  handleTouchStatus);
-    server.on("/playback/status", HTTP_GET, handlePlaybackStatus);
-    server.on("/snapshot",     HTTP_GET,  handleSnapshot);
-    server.on("/camera/session", HTTP_POST, handleCameraSessionStart);
-    server.on("/camera/session", HTTP_DELETE, handleCameraSessionStop);
-    server.on("/camera/status", HTTP_GET, handleCameraSessionStatus);
-    server.on("/face",         HTTP_POST, handleFace);
-    server.on("/face",         HTTP_GET,  handleFace);
-    server.on("/env",          HTTP_GET,  handleEnv);
-    server.on("/env/debug",    HTTP_GET,  handleEnvDebug);
-    server.begin();
+    httpServer.collectHeaders(headerKeys, sizeof(headerKeys) / sizeof(headerKeys[0]));
+    httpServer.on("/play",         HTTP_POST, handlePlay);
+    httpServer.on("/play/pcm",     HTTP_POST, handlePlayPcm, handlePlayPcmRaw);
+    httpServer.on("/audio/session", HTTP_POST, handleAudioSessionStart);
+    httpServer.on(UriBraces("/audio/session/{}"), HTTP_DELETE, handleAudioSessionStop);
+    httpServer.on("/mode",         HTTP_POST, handleMode);
+    httpServer.on("/booth",        HTTP_GET, handleBoothStatus);
+    httpServer.on("/booth",        HTTP_POST, handleBoothSet);
+    httpServer.on("/audio/status", HTTP_GET,  handleAudioStatus);
+    httpServer.on("/audio",        HTTP_GET,  handleAudio);
+    httpServer.on("/move",         HTTP_POST, handleMove);
+    httpServer.on("/home",         HTTP_POST, handleHome);
+    httpServer.on("/nod",          HTTP_POST, handleNod);
+    httpServer.on("/shake",        HTTP_POST, handleShake);
+    httpServer.on("/servo/status", HTTP_GET,  handleServoStatus);
+    httpServer.on("/touch/status", HTTP_GET,  handleTouchStatus);
+    httpServer.on("/playback/status", HTTP_GET, handlePlaybackStatus);
+    httpServer.on("/snapshot",     HTTP_GET,  handleSnapshot);
+    httpServer.on("/camera/session", HTTP_POST, handleCameraSessionStart);
+    httpServer.on("/camera/session", HTTP_DELETE, handleCameraSessionStop);
+    httpServer.on("/camera/status", HTTP_GET, handleCameraSessionStatus);
+    httpServer.on("/face",         HTTP_POST, handleFace);
+    httpServer.on("/face",         HTTP_GET,  handleFace);
+    httpServer.on("/env",          HTTP_GET,  handleEnv);
+    httpServer.on("/env/debug",    HTTP_GET,  handleEnvDebug);
+    httpServer.begin();
     Serial.println("[HTTP] Server started on port 80");
 }
 
 void handleHttpServer() {
-    server.handleClient();
+    httpServer.handleClient();
+}
+
+void executeFirmwareCommand(FirmwareCommand& command) {
+    struct Route {
+        const char* method;
+        const char* path;
+        void (*handler)();
+    };
+    static const Route routes[] = {
+        {"GET", "/status", handlePlaybackStatus},
+        {"GET", "/playback/status", handlePlaybackStatus},
+        {"GET", "/env", handleEnv},
+        {"GET", "/face", handleFace},
+        {"GET", "/snapshot", handleSnapshot},
+        {"GET", "/audio/status", handleAudioStatus},
+        {"GET", "/audio", handleAudio},
+        {"POST", "/mode", handleMode},
+        {"GET", "/booth", handleBoothStatus},
+        {"POST", "/booth", handleBoothSet},
+        {"POST", "/face", handleFace},
+        {"POST", "/move", handleMove},
+        {"POST", "/home", handleHome},
+        {"POST", "/nod", handleNod},
+        {"POST", "/shake", handleShake},
+        {"POST", "/play/pcm", handlePlayPcm},
+    };
+    server.outbound = &command;
+    const char* method = command.request["method"] | "";
+    const char* path = command.request["path"] | "";
+    bool found = false;
+    for (const Route& route : routes) {
+        if (strcmp(method, route.method) == 0 && strcmp(path, route.path) == 0) {
+            route.handler();
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        server.send(404, "application/json", "{\"success\":false,\"error\":\"unsupported outbound route\"}");
+    }
+    server.outbound = nullptr;
 }

@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import struct
@@ -10,6 +11,7 @@ from pathlib import Path
 import requests
 
 from .audio_server import AUDIO_DIR, TEMP_AUDIO_DIR
+from .elevenlabs_tts import TtsSynthesisError, collect_pcm, synthesize_pcm
 from .stackchan_config import (
     EDGE_VOICES,
     PCM_CHANNELS,
@@ -18,6 +20,8 @@ from .stackchan_config import (
     PCM_SAMPLE_WIDTH,
     StackchanConfig,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def new_tts_stem() -> str:
@@ -177,10 +181,58 @@ def tts_fish(text: str, lang: str, config: StackchanConfig) -> Path:
         temp_wav_path.unlink(missing_ok=True)
 
 
-def generate_tts(text: str, lang: str, config: StackchanConfig) -> Path:
+def generate_tts(
+    text: str, lang: str, config: StackchanConfig, *, details: dict[str, str] | None = None
+) -> Path:
+    if config.tts_engine == "elevenlabs":
+        pcm, engine = prepare_elevenlabs_pcm(text, lang, config)
+        if details is not None:
+            details["engine"] = engine
+        stem = new_tts_stem()
+        temp_wav_path = TEMP_AUDIO_DIR / f"{stem}.wav"
+        try:
+            with wave.open(str(temp_wav_path), "wb") as wav:
+                wav.setnchannels(PCM_CHANNELS)
+                wav.setsampwidth(PCM_SAMPLE_WIDTH)
+                wav.setframerate(PCM_SAMPLE_RATE)
+                wav.writeframes(pcm)
+            return publish_validated_wav(temp_wav_path, stem)
+        finally:
+            temp_wav_path.unlink(missing_ok=True)
     if config.tts_engine == "fish-audio" and config.fish_audio_key:
         return tts_fish(text, lang, config)
     return tts_edge(text, lang, config)
+
+
+def prepare_elevenlabs_pcm(text: str, lang: str, config: StackchanConfig) -> tuple[bytes, str]:
+    try:
+        return synthesize_pcm(text, config), "elevenlabs"
+    except TtsSynthesisError as exc:
+        if not config.fish_audio_key:
+            raise TtsSynthesisError(f"{exc}; Fish fallback is not configured") from None
+        logger.warning("ElevenLabs unavailable; synthesizing once with Fish: %s", exc)
+
+    # Never expose a partial provider response to the body before switching voices.
+    chunks = iter_fish_pcm_stream(text, lang, config)
+    try:
+        pcm = collect_pcm(
+            chunks,
+            max_bytes=config.max_pcm_payload_bytes,
+            deadline=time.monotonic() + config.fish_tts_timeout,
+        )
+    except (requests.RequestException, ValueError) as exc:
+        raise TtsSynthesisError(f"Fish fallback failed ({type(exc).__name__})") from None
+    finally:
+        chunks.close()
+    return pcm, "fish-audio"
+
+
+def iter_wav_pcm(wav_path: Path):
+    """Read validated TTS audio without forwarding the WAV container to the device."""
+    validate_playback_wav(wav_path)
+    with wave.open(str(wav_path), "rb") as wav:
+        while chunk := wav.readframes(24 * 1024):
+            yield chunk
 
 
 def validate_pcm_contract(sample_rate: int, channels: int, sample_width: int) -> None:
@@ -273,10 +325,13 @@ def iter_fish_pcm_stream(text: str, lang: str, config: StackchanConfig):
         stream=True,
         timeout=config.fish_tts_timeout,
     )
-    raise_for_fish_status(resp)
-    for chunk in resp.iter_content(chunk_size=config.fish_stream_chunk_bytes):
-        if chunk:
-            yield chunk
+    try:
+        raise_for_fish_status(resp)
+        for chunk in resp.iter_content(chunk_size=config.fish_stream_chunk_bytes):
+            if chunk:
+                yield chunk
+    finally:
+        resp.close()
 
 
 def transcribe_audio(wav_path: Path, lang: str, config: StackchanConfig) -> dict:

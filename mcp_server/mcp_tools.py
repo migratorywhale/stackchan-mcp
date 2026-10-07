@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 import requests
+from pydantic import StrictBool
 
 from . import audio_processing
 from .audio_publish import publish_wav
@@ -26,11 +27,48 @@ from .voice_inbox import clear_events, format_events, read_events
 logger = logging.getLogger(__name__)
 
 
+def _booth_mode_report(enabled: bool | None, status: Any, error: str | None = None) -> str:
+    fields = ("success", "booth_mode", "persisted", "capture_allowed", "mic_running")
+    problems = []
+    valid = isinstance(status, dict) and all(type(status.get(key)) is bool for key in fields)
+    if error:
+        problems.append(error)
+    if not valid or status.get("success") is not True:
+        problems.append("Device did not return a complete successful boolean outing status")
+    else:
+        if enabled is not None and status["booth_mode"] is not enabled:
+            problems.append("Reported outing mode does not match the requested state")
+        if not status["persisted"]:
+            problems.append("Persistence across reboot is not confirmed")
+        if status["booth_mode"] and (status["capture_allowed"] or status["mic_running"]):
+            problems.append("Device microphone capture is not confirmed blocked")
+        if not status["booth_mode"] and not status["capture_allowed"]:
+            problems.append("Normal microphone capture is not confirmed allowed")
+    report = {
+        "success": not problems,
+        "operation": "query" if enabled is None else "set",
+        "requested": enabled,
+        "outcome": "confirmed" if not problems else ("partial" if valid else "unknown"),
+        "status": status,
+    }
+    if problems:
+        report["error"] = "; ".join(problems)
+        report["note"] = (
+            "State may have changed or only partially applied. Query to verify; no write was retried."
+            if enabled is not None else "Current durable outing state is unconfirmed."
+        )
+    return json.dumps(report, ensure_ascii=False)
+
+
 def can_stream_pcm(config: StackchanConfig) -> bool:
     return (
         config.audio_mode != "wav"
-        and config.tts_engine == "fish-audio"
-        and bool(config.fish_audio_key)
+        and (
+            (config.tts_engine == "fish-audio" and bool(config.fish_audio_key))
+            or (config.tts_engine == "elevenlabs" and bool(
+                (config.elevenlabs_api_key and config.elevenlabs_voice_id) or config.fish_audio_key
+            ))
+        )
     )
 
 
@@ -81,23 +119,34 @@ def check_audio_dir() -> dict[str, object]:
     }
 
 
+def format_device_request_error(exc: requests.RequestException) -> str:
+    if isinstance(exc, requests.Timeout):
+        return "Stack-chan request timed out; it may be busy or the link may be slow. Availability unconfirmed."
+    if isinstance(exc, requests.ConnectionError):
+        return "Stack-chan is unreachable from MCP right now (connection failed). Availability unconfirmed."
+    return f"Device request failed: {exc}"
+
+
 def build_health_report(client: Any, config: StackchanConfig) -> dict[str, object]:
     device: dict[str, object] = {
         "base_url": client.base_url,
         "ok": False,
     }
-    try:
-        device["audio_status"] = client.audio_status()
-        device["ok"] = True
-    except Exception as exc:
-        device["audio_status_error"] = str(exc)
-    try:
-        device["playback_status"] = client.playback_status()
-        device["ok"] = bool(device.get("ok"))
-    except Exception as exc:
-        device["playback_status_error"] = str(exc)
+    if config.transport == "relay":
+        try:
+            relay = client.relay_status(timeout=config.http_probe_timeout)
+            device["relay"] = relay
+            device["ok"] = relay.get("online") is True
+        except requests.RequestException as exc:
+            device["relay_error"] = format_device_request_error(exc)
+        except Exception as exc:
+            device["relay_error"] = str(exc)
+        device["reachability"] = "responding" if device["ok"] else "unconfirmed"
+        device["all_checks_ok"] = device["ok"]
+    else:
+        _probe_direct_device(client, config, device)
 
-    report: dict[str, object] = {
+    return {
         "ok": bool(device.get("ok")),
         "config": config_summary(config),
         "dependencies": {
@@ -108,34 +157,67 @@ def build_health_report(client: Any, config: StackchanConfig) -> dict[str, objec
         "audio_dir": check_audio_dir(),
         "device": device,
     }
-    return report
+
+
+def _probe_direct_device(client: Any, config: StackchanConfig, device: dict[str, object]) -> None:
+    try:
+        device["audio_status"] = client.audio_status(timeout=config.http_probe_timeout)
+        device["ok"] = True
+    except requests.RequestException as exc:
+        device["audio_status_error"] = format_device_request_error(exc)
+    except Exception as exc:
+        device["audio_status_error"] = str(exc)
+    try:
+        device["playback_status"] = client.playback_status(timeout=config.http_probe_timeout)
+        device["ok"] = True
+    except requests.RequestException as exc:
+        device["playback_status_error"] = format_device_request_error(exc)
+    except Exception as exc:
+        device["playback_status_error"] = str(exc)
+    device["reachability"] = "responding" if device["ok"] else "unconfirmed"
+    device["all_checks_ok"] = "audio_status" in device and "playback_status" in device
 
 
 def post_preferred_pcm_stream(
     client: StackchanClient, text: str, lang: str, config: StackchanConfig
 ) -> dict:
+    prepared_pcm = None
+    engine = config.tts_engine
+    synthesis_started = time.perf_counter()
+    if engine == "elevenlabs":
+        prepared_pcm, engine = audio_processing.prepare_elevenlabs_pcm(text, lang, config)
+    synthesis_ms = timing_ms(synthesis_started)
+
     def pcm_chunks():
+        if prepared_pcm is not None:
+            return (prepared_pcm[offset:offset + 4096] for offset in range(0, len(prepared_pcm), 4096))
         return audio_processing.iter_fish_pcm_stream(text, lang, config)
 
-    if config.pcm_transport == "staged":
-        result = post_pcm_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing)
-        result.setdefault("transport", "staged")
+    def report(result: dict) -> dict:
+        result["tts_engine"] = engine
+        if prepared_pcm is not None:
+            result.setdefault("timing_ms", {})["tts_prepare"] = synthesis_ms
         return result
+
+    if config.transport == "relay" or config.pcm_transport == "staged":
+        result = post_pcm_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing)
+        result.setdefault("transport", "relay" if config.transport == "relay" else "staged")
+        return report(result)
 
     if config.pcm_transport in {"auto", "tcp"}:
         try:
-            return post_pcm_tcp_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing)
+            return report(post_pcm_tcp_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing))
         except PcmPlaybackError as exc:
             if exc.started or config.pcm_transport == "tcp":
                 raise
             logger.warning("Falling back from TCP PCM to staged PCM: %s", exc)
 
     if config.pcm_transport == "udp":
-        return post_pcm_udp_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing)
+        return report(post_pcm_udp_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing))
 
     result = post_pcm_stream(client, pcm_chunks(), AUDIO_DIR, audio_processing)
     result.setdefault("transport", "staged")
-    return result
+    return report(result)
 
 
 def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
@@ -148,11 +230,12 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
             lang=lang,
             text_len=len(text),
         )
-        signal_face_tracking(
-            "stackchan_say",
-            duration=speech_tracking_duration(text),
-        )
-        start_audio_server(config.audio_serve_port)
+        if config.transport == "direct":
+            signal_face_tracking(
+                "stackchan_say",
+                duration=speech_tracking_duration(text),
+            )
+            start_audio_server(config.audio_serve_port)
 
         try:
             pcm_fallback_reason = None
@@ -163,6 +246,7 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                     if result.get("success"):
                         diag = (
                             f" transport={result.get('transport', 'staged')}"
+                            f" tts={result.get('tts_engine', config.tts_engine)}"
                             f" session={result.get('session', '?')}"
                             f" segments={result.get('segments', '?')}"
                             f" bytes={result.get('total_bytes', '?')}"
@@ -180,7 +264,8 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                                 "stackchan.audio.path": "pcm",
                                 "stackchan.audio.mode": config.audio_mode,
                                 "stackchan.pcm.transport": result.get("transport", "staged"),
-                                "stackchan.tts.engine": config.tts_engine,
+                                "stackchan.tts.engine": result.get("tts_engine", config.tts_engine),
+                                "stackchan.tts.requested_engine": config.tts_engine,
                                 "stackchan.lang": lang,
                                 "stackchan.text.length": len(text),
                                 "stackchan.pcm.segments": result.get("segments"),
@@ -191,9 +276,12 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                         if result.get("saved_pcm"):
                             diag += f" saved={result['saved_pcm']}"
                         logger.info("PCM speech accepted: lang=%s%s%s", lang, diag, format_timing_ms(timings))
-                        return format_speech_confirmation(text)
+                        confirmation = format_speech_confirmation(text)
+                        if config.tts_engine == "elevenlabs" and result.get("tts_engine") == "fish-audio":
+                            confirmation += " (Fish fallback)"
+                        return confirmation
                     pcm_fallback_reason = f"PCM play returned {result}"
-                    if config.audio_mode == "pcm":
+                    if config.audio_mode == "pcm" or config.transport == "relay" or config.tts_engine == "elevenlabs":
                         return f"❌ PCM play failed: {result}"
                     logger.warning("Falling back to WAV TTS: %s", pcm_fallback_reason)
                 except PcmPlaybackError as exc:
@@ -201,13 +289,13 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                         logger.error("PCM playback failed after audio started: %s", exc)
                         return f"❌ PCM playback failed after audio started: {exc}"
                     pcm_fallback_reason = str(exc)
-                    if config.audio_mode == "pcm":
+                    if config.audio_mode == "pcm" or config.transport == "relay" or config.tts_engine == "elevenlabs":
                         logger.error("PCM playback failed in forced PCM mode: %s", exc)
                         return f"❌ PCM playback failed: {exc}"
                     logger.warning("Falling back to WAV TTS after PCM failure: %s", exc)
                 except Exception as exc:
                     pcm_fallback_reason = str(exc)
-                    if config.audio_mode == "pcm":
+                    if config.audio_mode == "pcm" or config.transport == "relay" or config.tts_engine == "elevenlabs":
                         logger.error("PCM playback failed in forced PCM mode: %s", exc)
                         return f"❌ PCM playback failed: {exc}"
                     logger.warning("Falling back to WAV TTS after PCM failure: %s", exc)
@@ -224,16 +312,31 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                         "stackchan.latency.pcm_attempt_ms": timing_ms(pcm_started),
                     },
                 )
-            elif config.audio_mode == "pcm":
-                return "❌ PCM playback unavailable: TTS_ENGINE must be fish-audio and FISH_AUDIO_KEY must be set"
+            elif config.audio_mode == "pcm" and config.transport != "relay":
+                return "❌ PCM playback unavailable: configure fish-audio or elevenlabs TTS credentials"
 
             wav_timing = {}
+            tts_details: dict[str, str] = {}
             t0 = time.perf_counter()
-            wav_path = audio_processing.generate_tts(text, lang, config)
+            if config.tts_engine == "elevenlabs":
+                wav_path = audio_processing.generate_tts(text, lang, config, details=tts_details)
+            else:
+                wav_path = audio_processing.generate_tts(text, lang, config)
+            engine = tts_details.get("engine", config.tts_engine)
+            provider_fallback = config.tts_engine == "elevenlabs" and engine == "fish-audio"
+            confirmation = format_speech_confirmation(text) + (" (Fish fallback)" if provider_fallback else "")
             wav_timing["tts"] = timing_ms(t0)
             t0 = time.perf_counter()
             audio_processing.validate_playback_wav(wav_path)
             wav_timing["validate"] = timing_ms(t0)
+            if config.transport == "relay":
+                result = post_pcm_stream(
+                    client, audio_processing.iter_wav_pcm(wav_path), AUDIO_DIR, audio_processing
+                )
+                if result.get("success"):
+                    logger.info("Relay WAV speech accepted: tts=%s lang=%s", engine, lang)
+                    return confirmation
+                return f"PCM play failed: {result}"
             if config.audio_publish_target:
                 t0 = time.perf_counter()
                 publish_wav(
@@ -278,7 +381,6 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                             f"started_ms={status.get('started_ms', '?')} "
                             f"deadline_ms={status.get('deadline_ms', '?')}"
                         )
-                engine = "Fish Audio" if (config.tts_engine == "fish-audio" and config.fish_audio_key) else "edge-tts"
                 fallback_note = " (PCM fallback)" if pcm_fallback_reason else ""
                 wav_timing["say_total"] = timing_ms(say_started)
                 emit_event(
@@ -288,7 +390,8 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                     attributes={
                         "stackchan.audio.path": "wav",
                         "stackchan.audio.mode": config.audio_mode,
-                        "stackchan.tts.engine": config.tts_engine,
+                        "stackchan.tts.engine": engine,
+                        "stackchan.tts.requested_engine": config.tts_engine,
                         "stackchan.lang": lang,
                         "stackchan.text.length": len(text),
                         "stackchan.fallback.used": bool(pcm_fallback_reason),
@@ -303,7 +406,7 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                     fallback_note,
                     format_timing_ms(wav_timing),
                 )
-                return format_speech_confirmation(text)
+                return confirmation
             emit_event(
                 "stackchan.say.failed",
                 body="Playback request failed",
@@ -407,8 +510,8 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                 image_cls(data=jpeg_data, format="jpeg"),
                 f"📷 Photo captured ({size} bytes). Saved to: {img_path}",
             ]
-        except requests.exceptions.ConnectionError:
-            return f"❌ Stack-chan offline (cannot reach {config.stackchan_ip})"
+        except requests.RequestException as exc:
+            return format_device_request_error(exc)
         except Exception as exc:
             return f"❌ Error: {exc}"
 
@@ -425,12 +528,50 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
     def stackchan_status() -> str:
         audit_tool_call("stackchan_status")
         try:
-            status = client.audio_status()
+            if config.transport == "relay":
+                status = client.relay_status(timeout=config.http_probe_timeout)
+                return (
+                    f"Stack-chan relay online={status.get('online', False)} "
+                    f"busy={status.get('busy', False)} last_seen_age={status.get('last_seen_age')}"
+                )
+            status = client.audio_status(timeout=config.http_probe_timeout)
             return f"✅ Stack-chan online at {config.stackchan_ip} | Mode: {status.get('mode', '?')} | Recording ready: {status.get('ready', '?')}"
-        except requests.exceptions.ConnectionError:
-            return f"❌ Stack-chan offline (cannot reach {config.stackchan_ip})"
+        except requests.RequestException as exc:
+            return format_device_request_error(exc)
         except Exception as exc:
             return f"❌ Error: {exc}"
+
+    @mcp.tool(title="出门模式")
+    def stackchan_booth_mode(enabled: StrictBool | None = None) -> str:
+        """Query outing mode (出门模式) when omitted/null; set it with a JSON boolean.
+
+        The legacy tool name stays stackchan_booth_mode for existing callers.
+        Never toggles implicitly or retries writes. Outing mode persists across reboot,
+        blocks ALL device microphone capture, and clears pending local recording.
+        Touch gives visual feedback only. The speaker still works and the camera is
+        unchanged; the phone supplies input. Disabling resumes normal device capture.
+        Already-downloaded audio cannot be recalled. Check success and all reported
+        status fields: a failed/partial/unknown result does not confirm privacy or
+        persistence. After an uncertain write, query before deciding what to do next.
+        """
+        if enabled is not None and type(enabled) is not bool:
+            raise ValueError("enabled must be a JSON boolean or null (query)")
+        audit_tool_call("stackchan_booth_mode", enabled=enabled)
+        try:
+            status = client.get_booth_mode() if enabled is None else client.set_booth_mode(enabled)
+            return _booth_mode_report(enabled, status)
+        except requests.HTTPError as exc:
+            status = None
+            detail = str(exc)
+            if exc.response is not None:
+                detail = f"HTTP {exc.response.status_code}: {detail}"
+                try:
+                    status = exc.response.json()
+                except ValueError:
+                    detail += f"; body={exc.response.text[:500]}"
+            return _booth_mode_report(enabled, status, detail)
+        except Exception as exc:
+            return _booth_mode_report(enabled, None, f"Request failed: {exc}")
 
     @mcp.tool()
     def stackchan_health() -> str:
@@ -448,7 +589,7 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
     def stackchan_playback_status() -> str:
         audit_tool_call("stackchan_playback_status")
         try:
-            status = client.playback_status()
+            status = client.playback_status(timeout=config.http_probe_timeout)
             return (
                 "Playback "
                 f"kind={status.get('kind', '?')} "
@@ -463,8 +604,8 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
                 f"heap={status.get('free_heap', '?')} "
                 f"psram={status.get('free_psram', '?')}"
             )
-        except requests.exceptions.ConnectionError:
-            return f"❌ Stack-chan offline (cannot reach {config.stackchan_ip})"
+        except requests.RequestException as exc:
+            return format_device_request_error(exc)
         except Exception as exc:
             return f"❌ Error: {exc}"
 
@@ -503,8 +644,8 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
             if not parts:
                 return "⚠️ No sensor data available"
             return "  ".join(parts)
-        except requests.exceptions.ConnectionError:
-            return f"❌ Stack-chan offline (cannot reach {config.stackchan_ip})"
+        except requests.RequestException as exc:
+            return format_device_request_error(exc)
         except Exception as exc:
             return f"❌ Error: {exc}"
 

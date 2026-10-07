@@ -103,7 +103,14 @@ Important environment variables:
 - `STACKCHAN_PORT`: device HTTP port, usually `80`.
 - `MAC_IP`: host IP used in generated audio URLs.
 - `AUDIO_SERVE_PORT`: local HTTP port for generated WAV files.
-- `TTS_ENGINE`: `fish-audio` or `edge-tts`.
+- `TTS_ENGINE`: `fish-audio` (default), `elevenlabs`, or `edge-tts`.
+- ElevenLabs TTS requires `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID`.
+  Keep Fish credentials configured for fallback and ASR. Optional settings:
+  `ELEVENLABS_MODEL_ID` (default `eleven_v4`), `ELEVENLABS_STABILITY` (`0.70`),
+  `ELEVENLABS_SIMILARITY` (`0.75`), and `STACKCHAN_ELEVENLABS_TTS_TIMEOUT`
+  (`30.0` seconds). Stability/similarity must be finite numbers in `[0, 1]`;
+  timeout must be finite and positive. Invalid numeric settings warn and use
+  defaults. Diagnostics must expose only configured booleans for key/voice ID.
 
 For local HTTP MCP mode:
 

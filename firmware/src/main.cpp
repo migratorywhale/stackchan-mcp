@@ -17,6 +17,8 @@
 #include "audio_gate.h"
 #include "env_service.h"
 #include "camera_service.h"
+#include "outbound_service.h"
+#include "booth_mode.h"
 
 void setup() {
     Serial.begin(115200);
@@ -36,6 +38,9 @@ void setup() {
 
     initAudioGate();
     initFace();
+    if (!initBoothMode()) {
+        Serial.println("[WARN] Booth setting unreadable; microphone stays blocked");
+    }
 
     Serial.println("\n=== Stack-chan firmware ===");
 
@@ -43,7 +48,7 @@ void setup() {
     M5.Speaker.config(spk_cfg);
     M5.Speaker.setVolume(SPEAKER_VOLUME);
 
-    if (!initMicrophone()) {
+    if (!isBoothMode() && !initMicrophone()) {
         Serial.println("[ERROR] Microphone initialization failed!");
     }
 
@@ -69,11 +74,10 @@ void setup() {
     initPlayback();
     initPcmStreamService();
     initHttpServer();
+    initOutboundService();
 }
 
 void loop() {
-    static uint32_t lastMicResumeAttemptMs = 0;
-
     updateCameraService();
     // The GC0308 owns the internal I2C pins during a burst session. The BSP
     // update polls the top touch sensor on that bus, so leave it paused until
@@ -83,33 +87,14 @@ void loop() {
     }
     updateTouchService();
     handleHttpServer();
+    serviceOutboundCommands();
     serviceWiFi();
     updateServoGesture();
 
     updatePlayback();
     updateMicrophone();
 
-    // Playback can stop the microphone before the normal completion path has
-    // a chance to request a resume. Keep the request latched until begin()
-    // succeeds so one transient failure cannot leave the device deaf.
-    if (!M5.Mic.isRunning()) {
-        requestMicResume();
-    }
-
-    // マイク再開（完了検知より前に置く）
-    if (shouldResumeMic()) {
-        if (M5.Mic.isRunning()) {
-            clearMicResumeRequest();
-        } else if (millis() - lastMicResumeAttemptMs >= 1000) {
-            lastMicResumeAttemptMs = millis();
-            if (initMicrophone()) {
-                clearMicResumeRequest();
-                Serial.println("[MIC] Mic resumed after playback");
-            } else {
-                Serial.println("[MIC] Mic resume failed; retrying");
-            }
-        }
-    }
+    serviceMicrophoneResume();
 
     delay(50);
 }

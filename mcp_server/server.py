@@ -78,7 +78,8 @@ if __name__ == "__main__":
     config = load_config()
     http_mode, mcp_host, mcp_port = parse_args(sys.argv)
     mcp = create_mcp(config, http_mode=http_mode, host=mcp_host, port=mcp_port)
-    start_audio_server(config.audio_serve_port)
+    if config.transport == "direct":
+        start_audio_server(config.audio_serve_port)
     if http_mode:
         try:
             ensure_http_auth_configured(config)

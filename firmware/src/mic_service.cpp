@@ -1,4 +1,5 @@
 #include <M5Unified.h>
+#include <math.h>
 
 #include "mic_service.h"
 #include "config_loader.h"
@@ -9,13 +10,8 @@
 #include "playback_service.h"
 #include "pcm_stream_service.h"
 #include "audio_gate.h"
-
-enum MicState {
-    MIC_IDLE = 0,
-    MIC_TRIGGERING,
-    MIC_RECORDING,
-    MIC_SENDING
-};
+#include "mic_recording_policy.h"
+#include "booth_mode.h"
 
 #pragma pack(push, 1)
 struct WAVHeader {
@@ -59,6 +55,8 @@ static constexpr uint32_t TOUCH_VOICE_START_TIMEOUT_MS = 4000;
 
 // プリトリガーリングバッファ
 static int16_t pre_trigger_buf[PRE_TRIGGER_BUFFER_SAMPLES];
+static int16_t capture_frame[MIC_FRAME_SAMPLES];
+static bool capture_stop_pending = false;
 static size_t  pre_buf_write = 0;
 static bool    pre_buf_full  = false;
 static inline float calcRmsNorm(const int16_t* data, size_t n) {
@@ -95,6 +93,7 @@ MicRuntimeStatus getMicRuntimeStatus() {
     status.triggerCount = trigger_count;
     status.touchTriggerCount = touch_trigger_count;
     status.storedRecordingCount = stored_recording_count;
+    status.recordingSource = mic_state == MIC_RECORDING ? recordingSourceName(recording_source) : "none";
     return status;
 }
 
@@ -165,9 +164,10 @@ static void beginRecording(uint32_t now, RecordingSource source, bool includePre
 }
 
 bool requestTouchRecording() {
-    const bool canReplaceAmbientTrigger = mic_state == MIC_IDLE || mic_state == MIC_TRIGGERING;
+    if (isBoothMode() || capture_stop_pending) return false;
     if (!record_buffer || !M5.Mic.isEnabled() || !M5.Mic.isRunning() ||
-        isPlaybackActive() || isPcmStreamActive() || !canReplaceAmbientTrigger) {
+        isPlaybackActive() || isPcmStreamActive() ||
+        !canReplaceWithTouch(mic_state, recording_source)) {
         Serial.printf("[MIC] Touch recording rejected: state=%s running=%s playback=%s stream=%s\n",
                       getMicStateName(), M5.Mic.isRunning() ? "yes" : "no",
                       isPlaybackActive() ? "yes" : "no",
@@ -175,6 +175,11 @@ bool requestTouchRecording() {
         return false;
     }
 
+    // An explicit touch starts fresh, even if ambient sound already triggered
+    // voice capture. Do not include the preceding conversation in touch audio.
+    if (mic_state == MIC_RECORDING) {
+        Serial.println("[MIC] Touch taking over ambient voice recording");
+    }
     ++touch_trigger_count;
     beginRecording(millis(), RecordingSource::TOUCH, false);
     return true;
@@ -207,6 +212,7 @@ static void applyMicConfig() {
 }
 
 bool initMicrophone() {
+    if (isBoothMode() || capture_stop_pending) return false;
     Serial.println("[MIC] Initializing microphone...");
 
     // プリトリガーバッファをリセット（初回 & 再開時共通）
@@ -254,14 +260,72 @@ bool initMicrophone() {
     return true;
 }
 
+bool suspendMicrophoneCapture() {
+    capture_stop_pending = true;
+    const bool wasRecording = mic_state != MIC_IDLE;
+    mic_state = MIC_IDLE;
+    recording_source = RecordingSource::NONE;
+    recorded_samples = 0;
+    recording_has_voice = false;
+    recording_started_ms = 0;
+    trigger_start_ms = 0;
+    silence_start_ms = 0;
+    pre_buf_write = 0;
+    pre_buf_full = false;
+    memset(pre_trigger_buf, 0, sizeof(pre_trigger_buf));
+    if (record_buffer) memset(record_buffer, 0, max_samples * sizeof(int16_t));
+    clearLastRecording();
+    clearMicResumeRequest();
+    if (wasRecording && !isPlaybackActive() && !isPcmStreamActive()) {
+        setFaceExpression(FACE_IDLE);
+    }
+    // Another audio task may be inside end() after running already became false.
+    if (!audioGateEnter("mic-suspend", 20)) return false;
+    if (M5.Mic.isRunning()) M5.Mic.end();
+    const bool stopped = !M5.Mic.isRunning();
+    if (stopped) {
+        memset(capture_frame, 0, sizeof(capture_frame));
+        capture_stop_pending = false;
+    }
+    audioGateLeave("mic-suspend");
+    return stopped;
+}
+
+bool isMicrophoneCaptureStopped() {
+    return !capture_stop_pending && !M5.Mic.isRunning();
+}
+
+void serviceMicrophoneResume() {
+    static uint32_t lastResumeAttemptMs = 0;
+    if (isBoothMode()) {
+        clearMicResumeRequest();
+        if (!isMicrophoneCaptureStopped()) suspendMicrophoneCapture();
+        return;
+    }
+    if (capture_stop_pending && !suspendMicrophoneCapture()) return;
+    if (!M5.Mic.isRunning()) requestMicResume();
+    if (!shouldResumeMic()) return;
+    if (M5.Mic.isRunning()) {
+        clearMicResumeRequest();
+    } else if (millis() - lastResumeAttemptMs >= 1000) {
+        lastResumeAttemptMs = millis();
+        if (initMicrophone()) {
+            clearMicResumeRequest();
+            Serial.println("[MIC] Mic resumed after playback");
+        } else {
+            Serial.println("[MIC] Mic resume failed; retrying");
+        }
+    }
+}
+
 void updateMicrophone() {
+    if (isBoothMode() || capture_stop_pending) return;
     if (!M5.Mic.isEnabled() || !M5.Mic.isRunning()) return;
     if (!record_buffer) return;
     if (isPlaybackActive()) return;
 
-    static int16_t frame[MIC_FRAME_SAMPLES];
     if (!audioGateEnter("mic-record", 0)) return;
-    bool recorded = M5.Mic.record(frame, MIC_FRAME_SAMPLES, MIC_SAMPLE_RATE);
+    bool recorded = M5.Mic.record(capture_frame, MIC_FRAME_SAMPLES, MIC_SAMPLE_RATE);
     audioGateLeave("mic-record");
     if (!recorded) {
         record_failure_count++;
@@ -269,7 +333,7 @@ void updateMicrophone() {
     }
     size_t got = MIC_FRAME_SAMPLES;
 
-    float rms = calcRmsNorm(frame, got);
+    float rms = calcRmsNorm(capture_frame, got);
     uint32_t now = millis();
     last_rms = rms;
     last_frame_ms = now;
@@ -283,7 +347,7 @@ void updateMicrophone() {
 
     if (mic_state == MIC_IDLE || mic_state == MIC_TRIGGERING) {
         for (size_t i = 0; i < got; i++) {
-            pre_trigger_buf[pre_buf_write] = frame[i];
+            pre_trigger_buf[pre_buf_write] = capture_frame[i];
             pre_buf_write = (pre_buf_write + 1) % PRE_TRIGGER_BUFFER_SAMPLES;
             if (pre_buf_write == 0) pre_buf_full = true;
         }
@@ -314,7 +378,7 @@ void updateMicrophone() {
             if (!touch_settling) {
                 size_t remain = max_samples - recorded_samples;
                 size_t to_copy = (got < remain) ? got : remain;
-                memcpy(record_buffer + recorded_samples, frame, to_copy * sizeof(int16_t));
+                memcpy(record_buffer + recorded_samples, capture_frame, to_copy * sizeof(int16_t));
                 recorded_samples += to_copy;
             }
 
