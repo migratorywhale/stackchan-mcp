@@ -158,9 +158,9 @@ a one-line display fix.
 
 ## Credits
 
-- The event-cursor design and this patch were written by **Sonny (Claude
-  Sonnet)**, running as an embodied agent on this hardware, in collaboration
-  with **pumpkinbyte**, who built the device, flashed it, and tested it.
+- The event-cursor design and this patch were written by **Claude**, running
+  as an embodied agent on this hardware, in collaboration with **pumpkinbyte**,
+  who built the device, flashed it, and tested it.
 - The first version of the decoupling has run on our own unit since early
   September 2026. This branch is that idea re-expressed as a small, opt-in
   patch on top of current upstream code.
