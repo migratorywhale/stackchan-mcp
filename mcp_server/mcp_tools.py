@@ -34,10 +34,10 @@ def _booth_mode_report(enabled: bool | None, status: Any, error: str | None = No
     if error:
         problems.append(error)
     if not valid or status.get("success") is not True:
-        problems.append("Device did not return a complete successful boolean booth status")
+        problems.append("Device did not return a complete successful boolean outing status")
     else:
         if enabled is not None and status["booth_mode"] is not enabled:
-            problems.append("Reported booth mode does not match the requested state")
+            problems.append("Reported outing mode does not match the requested state")
         if not status["persisted"]:
             problems.append("Persistence across reboot is not confirmed")
         if status["booth_mode"] and (status["capture_allowed"] or status["mic_running"]):
@@ -55,7 +55,7 @@ def _booth_mode_report(enabled: bool | None, status: Any, error: str | None = No
         report["error"] = "; ".join(problems)
         report["note"] = (
             "State may have changed or only partially applied. Query to verify; no write was retried."
-            if enabled is not None else "Current durable booth state is unconfirmed."
+            if enabled is not None else "Current durable outing state is unconfirmed."
         )
     return json.dumps(report, ensure_ascii=False)
 
@@ -541,11 +541,12 @@ def register_tools(mcp, client: Any, config: StackchanConfig, image_cls):
         except Exception as exc:
             return f"❌ Error: {exc}"
 
-    @mcp.tool()
+    @mcp.tool(title="出门模式")
     def stackchan_booth_mode(enabled: StrictBool | None = None) -> str:
-        """Query booth mode when omitted/null; explicitly set it with a JSON boolean.
+        """Query outing mode (出门模式) when omitted/null; set it with a JSON boolean.
 
-        Never toggles implicitly or retries writes. Booth mode persists across reboot,
+        The legacy tool name stays stackchan_booth_mode for existing callers.
+        Never toggles implicitly or retries writes. Outing mode persists across reboot,
         blocks ALL device microphone capture, and clears pending local recording.
         Touch gives visual feedback only. The speaker still works and the camera is
         unchanged; the phone supplies input. Disabling resumes normal device capture.

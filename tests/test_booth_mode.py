@@ -216,6 +216,15 @@ def test_direct_python_call_still_rejects_null_string(tool, device):
     assert device.mock_calls == []
 
 
+def test_outing_display_name_preserves_the_existing_tool_contract(mcp):
+    advertised = next(
+        item for item in asyncio.run(mcp.list_tools()) if item.name == "stackchan_booth_mode"
+    )
+    assert advertised.title == "出门模式"
+    assert "出门模式" in advertised.description
+    assert "outing mode" in advertised.description
+
+
 def test_tool_schema_and_operating_caveats(tool):
     assert "enabled" not in tool.parameters.get("required", [])
     assert tool.parameters["properties"]["enabled"]["anyOf"] == [{"type": "boolean"}, {"type": "null"}]

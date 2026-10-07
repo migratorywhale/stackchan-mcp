@@ -274,7 +274,7 @@ class StackchanClient:
         return self._booth_mode_request("get")
 
     def set_booth_mode(self, enabled: bool) -> dict:
-        """Explicitly set durable booth mode once; never toggle or retry a write."""
+        """Explicitly set durable outing mode once; never toggle or retry a write."""
         if type(enabled) is not bool:
             raise ValueError("enabled must be a JSON boolean")
         return self._booth_mode_request("post", {"enabled": enabled})
@@ -290,7 +290,7 @@ class StackchanClient:
         )
         if not 200 <= response.status_code < 300:
             raise requests.HTTPError(
-                f"Booth mode HTTP {response.status_code}; status unconfirmed",
+                f"Outing mode HTTP {response.status_code}; status unconfirmed",
                 response=response,
             )
         return response.json()
