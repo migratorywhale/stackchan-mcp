@@ -61,7 +61,7 @@ talking to.
 | Field | Meaning |
 |---|---|
 | `event_seq` | **Monotonic counter.** Increments once per recorded event. |
-| `last_event` | `touch_start`, `hold`, `swipe_forward`, `swipe_backward`, `petting`, `recording_started`, `recording_rejected`, or `none` |
+| `last_event` | `hold`, `swipe_forward`, `swipe_backward`, `petting`, `recording_started`, `recording_rejected`, or `none` |
 | `last_event_ms` | `millis()` at the last event |
 | `intensities` | `[front, middle, back]`, 0–3 |
 | `pet_count` | Pets detected since boot |
@@ -120,12 +120,41 @@ in that decision.
   flinching. If you need faster, poll faster or add a push channel.
 - **If nothing polls, nothing happens.** Silence is the cost of the design.
   Choose it deliberately, not by accident.
-- **Compiles cleanly in both configurations; behaviour not yet verified on
-  hardware.** Default and `TOUCH_AGENT_DECIDES=1` both build with zero errors
-  and zero warnings against upstream `972266b` (`pio run -e m5stack-cores3`,
-  ESP32-S3, RAM 31.3%, flash 21.9%). The autonomous path has not been flashed
-  to a device by us, so its runtime behaviour is untested: read the diff, build
-  it, and check it on your own unit before depending on it.
+- **Verified on hardware (Oct 7, 2026).** Default and `TOUCH_AGENT_DECIDES=1`
+  both build with zero errors and zero warnings against upstream `972266b`
+  (`pio run -e m5stack-cores3`, ESP32-S3, RAM 31.3%, flash 21.9%). The
+  autonomous path was then flashed to a real unit (M5Stack CoreS3, via its
+  USB-Serial/JTAG port) and confirmed end to end: `/touch/status` reports
+  `agent_decides: true`, a physical hold arrives as `last_event: "hold"`
+  with `event_seq` advancing, and the body performs **no** face change and
+  **no** head movement of its own. The response was driven entirely from the
+  host.
+
+## Using your own faces
+
+`TOUCH_AGENT_DECIDES` is independent of the face assets, so a personal build
+usually wants its own art. Two things matter:
+
+- **Faces must be 192x192.** The renderer upscales by 1.25x
+  (`SCALE_NUM 5 / SCALE_DEN 4`) and centres the result on the 320x240 panel,
+  so a 320x240 source is drawn at 400x300 and clipped. Keep the canvas square
+  at 192x192.
+- **The filenames are fixed.** `scripts/generate_gif_assets.py` reads
+  `firmware/data/*.gif` named `A_calm.gif`, `B_thinking.gif`, `C_happy.gif`,
+  `D_sleepy.gif`, `E_shy.gif`, `F_smug.gif`, `G_pouty.gif` and regenerates
+  `firmware/src/gif_assets.h`. It refuses to write a partial header, so all
+  seven must be present. Animated GIFs (GIF89a, multiple frames) work.
+
+Faces are deliberately not part of this patch: the branch ships upstream's
+assets so the diff stays reviewable. Swap in your own locally.
+
+## Also in this branch
+
+`wifi_manager.cpp` draws a "WiFi OK!" toast (SSID + IP) across the full
+screen after connecting. Because a face only covers the centre 240 px, that
+text lingered around it until something forced a full redraw. The toast now
+clears itself after its 3 s delay. Unrelated to touch; included because it is
+a one-line display fix.
 
 ## Credits
 
