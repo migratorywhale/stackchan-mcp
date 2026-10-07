@@ -44,6 +44,7 @@ static bool tryConnect(const char* ssid, const char* password) {
     M5.Display.setCursor(10, 90);
     M5.Display.printf("WiFi OK!\n\n  %s\n\n  %s", ssid, WiFi.localIP().toString().c_str());
     delay(3000);
+    M5.Display.fillScreen(TFT_BLACK);  // clear the toast; the face owns the screen
     return true;
 }
 
